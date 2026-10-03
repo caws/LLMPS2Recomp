@@ -158,6 +158,15 @@ memory, prior findings, a subagent/workflow synthesis, even a runtime probe's pr
     screen-ID", "this loop iterates table-C", "this callback fires every frame", "a1 is the current
     screen"), check it under gdb: breakpoint the function and read the real args/registers/guest memory,
     or watch the address it supposedly writes. Make gdb a routine step in investigation, not a fallback.
+  - **Before concluding a hardware-subsystem override is stuck or "options are exhausted," consult
+    PCSX2's actual reference implementation** ([resources.md](resources.md)) — not just the bare spec
+    or a table pulled from FFmpeg/similar. This bit us: the IPU MPEG decoder was stuck at
+    436/1024 macroblocks for multiple sessions (AC-VLC table verified byte-perfect, decode logic
+    independently re-verified) because it was missing a per-macroblock structure
+    (`macroblock_address_increment`) that was sitting in PCSX2's `mpeg2sliceIDEC()` the whole time —
+    the *IDEC-specific* function, not the generic `mpeg2_slice()`. Read the actual function PCSX2 uses
+    for the specific command/mode in play (grep by the command name, e.g. `IDEC`/`BDEC`/`FDEC`), not
+    just a table or a related-but-different code path, before treating a subsystem as a dead end.
   - **gdb also resolves what static xref structurally CANNOT.** Address-xref has blind spots: a value
     written through a **helper that receives a pointer argument** (not a direct base-load) is invisible
     to it; a function being a registered call target says nothing about whether it's *reached at

@@ -98,8 +98,11 @@ launch + verify (override-only fast path):
 ```
 # from the engine dir (default cwd); background, ~110s for an override-only change
 nohup scripts/03_build_game.sh <game_dir> --skip-regen --changed-recomp > <game_dir>/tmp/build.log 2>&1 & disown
-# poll: not running AND log says complete
-… until: ! pgrep -f 03_build_game.sh && grep -q "Build complete" <game_dir>/tmp/build.log
+# poll: wait for the completion marker (NOT `pgrep -f 03_build_game.sh` — if the polling command
+# itself is a wrapper shell whose command-line contains that literal string, pgrep matches its own
+# wrapper and the loop never sees the real process exit; this bit us):
+… until: [[ -f <game_dir>/tmp/.build_status ]]
+cat <game_dir>/tmp/.build_status   # 0 = success; nonzero = build failed, check build.log
 # VERIFY the binary is current — the embedded BUILD_TAG must match the source you just edited:
 strings <game_dir>/tmp/ps2EntryRunner | grep -oE 'bld-eur-[a-z0-9-]+'   # then also confirm tag= in run.txt after a run
 ```

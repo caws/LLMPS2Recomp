@@ -40,6 +40,18 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GAME_DIR="$(cd "$GAME_DIR" && pwd)"   # absolute
 GAME="$(basename "$GAME_DIR")"        # per-game toolchain clone lives at tools/<game>/PS2Recomp
 
+# Completion marker: written on EVERY exit path (success, build failure, validation error) via
+# the trap below, containing the exit code. `pgrep -f 03_build_game.sh` is NOT a reliable
+# "is it still running" check — if the poll command itself is a wrapper shell whose command-line
+# contains the literal string "03_build_game.sh" (e.g. `until ! pgrep -f 03_build_game.sh; do ...`),
+# pgrep matches ITS OWN wrapper and the loop never sees the real process exit. Poll for this file
+# instead: `until [[ -f <game_dir>/tmp/.build_status ]]; do sleep 5; done; cat <game_dir>/tmp/.build_status`
+# (0 = success). Removed up front so a stale marker from a previous run can never be mistaken for
+# this run's result.
+mkdir -p "$GAME_DIR/tmp"
+rm -f "$GAME_DIR/tmp/.build_status"
+trap 'echo "$?" > "$GAME_DIR/tmp/.build_status"' EXIT
+
 PS2RECOMP_ROOT="$ROOT_DIR/tools/$GAME/PS2Recomp"
 PS2_RECOMP_BIN="$PS2RECOMP_ROOT/out/build/ps2xRecomp/ps2_recomp"
 RUNTIME_SRC="$PS2RECOMP_ROOT/ps2xRuntime/src/runner"

@@ -8,6 +8,17 @@ override has to reimplement or work around hardware the runtime stubs or gets wr
 as the *spec* and the PCSX2 source as the *reference implementation* — read both before writing the
 override, and cite the file/function you mirrored.
 
+> ★ **BINDING: when a subsystem override hits a wall, re-check PCSX2's source before concluding the
+> options are exhausted.** Don't stop at a generic spec, an external library's tables (FFmpeg, etc.),
+> or a *related* PCSX2 function — find the function PCSX2 uses for the **exact command/mode** in play
+> (e.g. the IPU has separate `mpeg2sliceIDEC()` vs generic `mpeg2_slice()`; grep by the command name).
+> Concrete case: the IPU decoder was stuck at 436/1024 macroblocks across multiple
+> sessions — the AC-VLC table was verified byte-perfect and the decode logic independently
+> re-verified, so it looked exhausted — because PCSX2's `mpeg2sliceIDEC()` (not yet read) contained a
+> per-macroblock structure (`macroblock_modes` + `macroblock_address_increment`) nothing else surfaced.
+> Reading it fixed the decoder in one pass. Treat "I've checked the spec/tables and I'm still stuck" as
+> a sign to go read PCSX2's actual code for that exact path, not as a stopping point.
+
 - **ps2tek** — comprehensive PS2 hardware reference (register maps, DMA channels, and per-subsystem
   behavior/quirks for the EE, IOP, GS, GIF/VIF, IPU, SPU2, CDVD, etc.):
   https://psi-rockin.github.io/ps2tek
