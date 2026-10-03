@@ -38,8 +38,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [[ -n "$GAME_DIR" ]] || { echo "ERROR: no <game_dir> given. Usage: $0 <game_dir> [flags]"; exit 1; }
 [[ -d "$GAME_DIR" ]] || { echo "ERROR: game dir not found: $GAME_DIR"; exit 1; }
 GAME_DIR="$(cd "$GAME_DIR" && pwd)"   # absolute
+GAME="$(basename "$GAME_DIR")"        # per-game toolchain clone lives at tools/<game>/PS2Recomp
 
-PS2RECOMP_ROOT="$ROOT_DIR/tools/PS2Recomp"
+PS2RECOMP_ROOT="$ROOT_DIR/tools/$GAME/PS2Recomp"
 PS2_RECOMP_BIN="$PS2RECOMP_ROOT/out/build/ps2xRecomp/ps2_recomp"
 RUNTIME_SRC="$PS2RECOMP_ROOT/ps2xRuntime/src/runner"
 RUNTIME_INCLUDE="$PS2RECOMP_ROOT/ps2xRuntime/include"

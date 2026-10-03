@@ -1,8 +1,10 @@
 # PS2Recomp engine — stateless. Games live in separate per-game repos that this
 # engine is pointed at; nothing game-specific is tracked here.
 
-# Toolchain (cloned + built by scripts/01_setup.sh)
-/tools/PS2Recomp
+# Toolchain: per-game PS2Recomp clones live under tools/<game>/PS2Recomp (cloned +
+# built by scripts/01_setup.sh <game_dir>). Each game gets its own clone so builds
+# never collide and the clone can be re-pulled/re-cloned per game.
+/tools/*/
 /tools/ghidra*
 
 # Scratch (build logs, run logs)

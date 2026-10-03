@@ -30,9 +30,10 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
 
 ## Hard constraints (do not violate)
 
-- **Never modify PS2Recomp's tracked source** under `tools/PS2Recomp/` — it's a separate
-  git repo. In particular `tools/PS2Recomp/ps2xRuntime/src/runner/` is **wiped and
-  regenerated on every build**; never hand-edit it.
+- **Never modify PS2Recomp's tracked source** under `tools/<game>/PS2Recomp/` — it's a
+  separate git repo (cloned per game). In particular
+  `tools/<game>/PS2Recomp/ps2xRuntime/src/runner/` is **wiped and regenerated on every
+  build**; never hand-edit it.
 - **All game-specific behavior goes through override hooks** in the game repo's
   `src/register_overrides.cpp` only — `PS2_REGISTER_GAME_OVERRIDE(...)` +
   `runtime.registerFunction(addr, lambda)`. Never patch generated runner files directly.
@@ -49,14 +50,17 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
 
 ## Engine layout
 
-- `scripts/01_setup.sh` — clone + build `ps2_recomp` (gcc-13, SSE4.1).
+- `scripts/01_setup.sh <game_dir>` — clone + build `ps2_recomp` (gcc-13, SSE4.1) into that
+  game's own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`).
 - `scripts/03_build_game.sh <game_dir> [flags]` — regen → install → cmake build.
 - `scripts/04_run_game.sh <game_dir>` — run the last-built runner (ELF read from config).
 - `scripts/05_screenshot.sh [--launch] <game_dir> [count] [interval]` — burst-screenshot the **game
   window only** (crops the composited root by the window geometry; `import -window <id>` is black for
   this GL window). Textures FLICKER, so it takes a burst and flags frames with content by mean
   brightness (file size is NOT reliable — a small blob on black compresses as tiny as pure black).
-- `tools/PS2Recomp/` — the toolchain + runtime (separate repo, read-only to us).
+- `tools/<game>/PS2Recomp/` — that game's own toolchain + runtime clone (separate repo,
+  read-only to us; cloned per game so builds never collide and each can be re-pulled
+  independently). The example game's clone is `tools/rotk_decomp/PS2Recomp/`.
 
 Everything per-game (ELF, config, functions.csv, overrides, generated output) is derived
 from `<game_dir>` and its `recomp/config.toml`; nothing about a game is hardcoded here.
