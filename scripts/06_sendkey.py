@@ -24,7 +24,7 @@ GOTCHAS:
 import sys
 import time
 
-from Xlib import X, XK, display
+from Xlib import X, XK, display, protocol
 from Xlib.ext import xtest
 
 WIN_TITLE_MATCH = "PS2-Recomp"
@@ -47,6 +47,56 @@ def find_win(win):
     return None
 
 
+def activate(d, win):
+    """Focus the game window and VERIFY it took.
+
+    set_input_focus() alone loses to the window manager's focus-stealing prevention: the WM
+    hands focus straight back to whatever the user is typing in, XTEST keys go there, and the
+    game reads keyDown=0 forever. That misreads as "input doesn't work" -- it has produced
+    several false negatives. So ask the WM properly, via the EWMH _NET_ACTIVE_WINDOW client
+    message (what `wmctrl -a` sends), and only then force the focus ourselves. Then CHECK:
+    if the window still isn't focused, say so loudly rather than silently injecting into
+    someone else's window.
+    """
+    root = d.screen().root
+    try:
+        net_active = d.intern_atom("_NET_ACTIVE_WINDOW")
+        ev = protocol.event.ClientMessage(
+            window=win, client_type=net_active,
+            data=(32, [2, X.CurrentTime, 0, 0, 0]),   # source indication 2 = pager
+        )
+        mask = X.SubstructureRedirectMask | X.SubstructureNotifyMask
+        root.send_event(ev, event_mask=mask)
+        d.sync()
+        time.sleep(0.3)
+    except Exception as exc:                     # no EWMH WM -> fall through to the raw path
+        print("note: _NET_ACTIVE_WINDOW failed (%s)" % exc)
+
+    win.set_input_focus(X.RevertToParent, X.CurrentTime)
+    win.configure(stack_mode=X.Above)
+    # Many WMs here are focus-follows-mouse: XSetInputFocus is instantly reverted to whatever
+    # window the pointer sits over, so XTEST keys land elsewhere and the game reads keyDown=0
+    # (confirmed: focus verified on the game window, yet the key never arrived). Warp the
+    # pointer into the game window so pointer-based focus AGREES with the focus we just set.
+    try:
+        geo = win.get_geometry()
+        win.warp_pointer(geo.width // 2, geo.height // 2)
+    except Exception as exc:
+        print("note: warp_pointer failed (%s)" % exc)
+    d.sync()
+    time.sleep(0.5)
+
+    focused = d.get_input_focus().focus
+    fid = getattr(focused, "id", 0)
+    if fid != win.id:
+        # Not fatal: the focused window may be a child of ours. Warn with both ids so a
+        # "the key never arrived" result is never mistaken for a game bug.
+        print("WARNING: focus is 0x%x, not the game window 0x%x -- keys may not arrive"
+              % (fid, win.id))
+    else:
+        print("focus confirmed on 0x%x" % win.id)
+
+
 def main():
     keyname = sys.argv[1] if len(sys.argv) > 1 else "Down"
     hold = float(sys.argv[2]) if len(sys.argv) > 2 else 3.0
@@ -58,10 +108,7 @@ def main():
         return 1
     print("window id=0x%x name=%r" % (win.id, win.get_wm_name()))
 
-    win.set_input_focus(X.RevertToParent, X.CurrentTime)
-    win.configure(stack_mode=X.Above)
-    d.sync()
-    time.sleep(0.5)
+    activate(d, win)
 
     keysym = XK.string_to_keysym(keyname)
     keycode = d.keysym_to_keycode(keysym)

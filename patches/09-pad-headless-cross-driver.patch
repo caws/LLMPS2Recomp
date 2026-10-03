@@ -1,0 +1,62 @@
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..d49ff1c 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,5 +1,7 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ namespace
+@@ -119,7 +121,49 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_SELECT);
+     }
+ 
++    // PS2X_PAD_CROSS_AT=<n> (default 0 = off): headless CROSS driver. XTEST key injection is
++    // hopelessly racy on a live desktop (focus is stolen by the real user / other windows, so
++    // the key silently never reaches raylib -- it has produced repeated false "input doesn't
++    // work" results). This forces the CROSS bit pressed for PS2X_PAD_CROSS_LEN readState() calls
++    // (default 100, ~3s) starting at call #N, then releases -- a clean press->release edge the
++    // menu can act on -- with NO dependency on window focus. Default-OFF so normal runs are
++    // untouched. (Diagnostic driving lever; keep it out of shipped behavior.)
++    {
++        static const int s_crossAt  = [](){ const char *e = std::getenv("PS2X_PAD_CROSS_AT");  return e ? std::atoi(e) : 0; }();
++        static const int s_crossLen = [](){ const char *e = std::getenv("PS2X_PAD_CROSS_LEN"); return e ? std::atoi(e) : 100; }();
++        if (s_crossAt > 0)
++        {
++            static unsigned s_padCalls = 0;
++            const unsigned c = ++s_padCalls;
++            if ((int)c >= s_crossAt && (int)c < s_crossAt + s_crossLen)
++            {
++                btns &= ~PAD_CROSS;   // active-low: clear = pressed
++                static bool s_announced = false;
++                if (!s_announced) { s_announced = true;
++                    std::fprintf(stderr, "[pad:force] CROSS held from call #%u for %d calls\n", c, s_crossLen); }
++            }
++        }
++    }
++
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
++
++    // PS2X_PAD2_LOG=1: trace what the host sampler actually sees (diagnosing
++    // "injected keys never reach the pad buffers"). Heartbeat every ~120 calls
++    // plus an immediate line on any non-idle button mask.
++    {
++        static const bool s_log = [](){ const char *e = std::getenv("PS2X_PAD2_LOG"); return e && e[0] == '1'; }();
++        if (s_log)
++        {
++            static unsigned s_calls = 0;
++            ++s_calls;
++            if (btns != 0xFFFFu)
++                std::fprintf(stderr, "[pad:sample] #%u btns=0x%04x gamepad=%d keyDown(down)=%d\n",
++                             s_calls, btns, (int)useGamepad, (int)IsKeyDown(KEY_DOWN));
++            else if ((s_calls % 120u) == 0u)
++                std::fprintf(stderr, "[pad:sample] #%u idle gamepad=%d keyDown(down)=%d keyDown(x)=%d\n",
++                             s_calls, (int)useGamepad, (int)IsKeyDown(KEY_DOWN), (int)IsKeyDown(KEY_X));
++        }
++    }
+     return true;
+ }
