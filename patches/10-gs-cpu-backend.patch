@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..73b85a8 100644
+index 9c39ae2..85a0d96 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,6 +10,7 @@
@@ -10,7 +10,110 @@ index 9c39ae2..73b85a8 100644
  #include <cstring>
  #include <fstream>
  #include <iostream>
-@@ -531,8 +532,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -468,12 +469,102 @@ namespace
+     }
+ }
+ 
++// ---- Off-thread rasterization (PS2X_GS_THREAD, default OFF — cont.161 structural
++// experiment). Profiling measured GS rasterization at 24-40% of EE-thread time by scene,
++// all reached synchronously under the VU1 XGKICK drain. With the flag ON, Submit/
++// BeginTransfer/UploadImage enqueue self-contained copies to a worker thread (strict
++// FIFO, so draw->upload->draw ordering is preserved), and every read-side entry point
++// (ReadVram/WriteVram/Snapshot/transfer state/local-to-host/Present/Clear) drains the
++// queue first. Sync()/Flush() drain — the frontend already calls Flush+Sync(Finish)
++// BEFORE latching the CSR FINISH bit, so guest-visible completion timing stays faithful
++// (the interface was designed for async backends: "GPU backends may wait on fences
++// here"). Backpressure: bounded items + upload bytes, producer blocks when full.
++static const bool s_gsThread = []
++{ const char *e = std::getenv("PS2X_GS_THREAD"); return e && e[0] && e[0] != '0'; }();
++static constexpr size_t kGsQueueMaxItems = 65536;
++static constexpr size_t kGsQueueMaxUploadBytes = 96u * 1024u * 1024u;
++
++void GSCpuBackend::workerLoop()
++{
++    for (;;)
++    {
++        WorkItem item;
++        {
++            std::unique_lock<std::mutex> lk(m_queueMutex);
++            m_queueCv.wait(lk, [&] { return m_workerStop || !m_queue.empty(); });
++            if (m_workerStop && m_queue.empty())
++                return;
++            item = std::move(m_queue.front());
++            m_queue.pop_front();
++            if (item.kind == WorkItem::Kind::Upload)
++                m_queueUploadBytes -= item.bytes.size();
++            m_workerBusy = true;
++        }
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            switch (item.kind)
++            {
++            case WorkItem::Kind::Draw:
++                if (m_vram && item.batch.vertexCount != 0u)
++                    DrawPrimitive(item.batch);
++                break;
++            case WorkItem::Kind::Transfer:
++                BeginTransferUnlocked(item.transfer);
++                break;
++            case WorkItem::Kind::Upload:
++                UploadImageUnlocked(item.bytes.data(), static_cast<uint32_t>(item.bytes.size()));
++                break;
++            }
++        }
++        {
++            std::lock_guard<std::mutex> lk(m_queueMutex);
++            m_workerBusy = false;
++            m_queueIdleCv.notify_all();
++        }
++    }
++}
++
++void GSCpuBackend::enqueueWork(WorkItem &&item)
++{
++    std::unique_lock<std::mutex> lk(m_queueMutex);
++    m_queueIdleCv.wait(lk, [&]
++                       { return m_queue.size() < kGsQueueMaxItems &&
++                                m_queueUploadBytes < kGsQueueMaxUploadBytes; });
++    if (item.kind == WorkItem::Kind::Upload)
++        m_queueUploadBytes += item.bytes.size();
++    m_queue.push_back(std::move(item));
++    m_queueCv.notify_one();
++}
++
++void GSCpuBackend::drainQueue() const
++{
++    if (!s_gsThread)
++        return;
++    std::unique_lock<std::mutex> lk(m_queueMutex);
++    m_queueIdleCv.wait(lk, [&] { return m_queue.empty() && !m_workerBusy; });
++}
++
++GSCpuBackend::~GSCpuBackend()
++{
++    if (m_worker.joinable())
++    {
++        {
++            std::lock_guard<std::mutex> lk(m_queueMutex);
++            m_workerStop = true;
++        }
++        m_queueCv.notify_all();
++        m_worker.join();
++    }
++}
++
+ GSCpuBackend::GSCpuBackend()
+ {
+     using namespace GSMem;
+     static std::once_flag lookupTablesOnce;
+     std::call_once(lookupTablesOnce, []()
+                    { InitLookupTables(); });
++    if (s_gsThread)
++        m_worker = std::thread(&GSCpuBackend::workerLoop, this);
+     for (size_t i = 0; i < kPsmHandlerCount; ++i)
+     {
+         switch (i)
+@@ -531,8 +622,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -27,7 +130,96 @@ index 9c39ae2..73b85a8 100644
              break;
          }
      }
-@@ -635,10 +642,238 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+@@ -541,6 +638,7 @@ GSCpuBackend::GSCpuBackend()
+ 
+ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     m_vram = vram;
+     m_vramSize = vramSize;
+@@ -549,6 +647,7 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ 
+ void GSCpuBackend::Reset()
+ {
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     ResetUnlocked();
+ }
+@@ -565,6 +664,16 @@ void GSCpuBackend::ResetUnlocked()
+ 
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    if (s_gsThread)
++    {
++        if (batch.vertexCount == 0u)
++            return;
++        WorkItem item;
++        item.kind = WorkItem::Kind::Draw;
++        item.batch = batch;
++        enqueueWork(std::move(item));
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
+@@ -573,22 +682,25 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ 
+ void GSCpuBackend::Flush()
+ {
+-    // CPU backend is immediate. GPU backends may submit command buffers here.
++    // Synchronous backend: immediate. Worker backend: wait for the queue to retire so
++    // the frontend's Flush+Sync(Finish)->CSR sequence stays guest-faithful.
++    drainQueue();
+ }
+ 
+ void GSCpuBackend::TextureFlush()
+ {
+-    // CPU texture reads are coherent with local memory. Future cached/GPU
+-    // backends use this boundary to invalidate texture views.
++    // CPU texture reads are coherent with local memory, and the worker queue is strict
++    // FIFO (an upload queued before a draw executes before it), so no drain is needed.
+ }
+ 
+ void GSCpuBackend::Sync(GSSyncReason)
+ {
+-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
++    drainQueue();
+ }
+ 
+ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     return ReadVramUnlocked(psm, base, bw, x, y);
+ }
+@@ -602,6 +714,9 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
++    // Ordered wrt queued work: drain, then write (single guest producer, so nothing can
++    // slip in between).
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     WriteVramUnlocked(psm, base, bw, x, y, value);
+ }
+@@ -615,6 +730,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+ 
+ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || m_vramSize == 0u)
+     {
+@@ -627,6 +743,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ 
+ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+ {
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     GSTransferSnapshot result = m_transferState;
+     result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
+@@ -635,10 +752,238 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
      return result;
  }
  
@@ -266,7 +458,7 @@ index 9c39ae2..73b85a8 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,6 +980,21 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,6 +1090,21 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -288,7 +480,7 @@ index 9c39ae2..73b85a8 100644
      switch (state.prim.type)
      {
      case GS_PRIM_SPRITE:
-@@ -792,11 +1042,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +1152,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -303,7 +495,7 @@ index 9c39ae2..73b85a8 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -817,7 +1066,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -817,7 +1176,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      u32 fbrgba = 0;
      if (frmw)
      {
@@ -312,7 +504,7 @@ index 9c39ae2..73b85a8 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +1096,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +1206,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -326,7 +518,7 @@ index 9c39ae2..73b85a8 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +1179,12 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +1289,12 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -341,7 +533,7 @@ index 9c39ae2..73b85a8 100644
      }
  }
  
-@@ -947,6 +1196,12 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,6 +1306,12 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -354,7 +546,7 @@ index 9c39ae2..73b85a8 100644
      const uint32_t clutIndex = resolveClutIndex(index, cpsm, csm, csa, sourcePsm);
      const uint32_t clutWidth = (state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
      const uint32_t clutX = static_cast<uint32_t>(state.texclut.cou) + (clutIndex & 0x0Fu);
-@@ -969,26 +1224,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,26 +1334,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -416,7 +608,7 @@ index 9c39ae2..73b85a8 100644
      }
      else
      {
-@@ -1002,7 +1283,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +1393,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -425,7 +617,7 @@ index 9c39ae2..73b85a8 100644
  
          switch (tex.psm)
          {
-@@ -1024,7 +1305,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +1415,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -440,7 +632,7 @@ index 9c39ae2..73b85a8 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +1512,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,6 +1622,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -481,7 +673,7 @@ index 9c39ae2..73b85a8 100644
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +1602,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +1712,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -490,7 +682,7 @@ index 9c39ae2..73b85a8 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +1620,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +1730,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -523,7 +715,51 @@ index 9c39ae2..73b85a8 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1406,6 +1753,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1376,7 +1833,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ 
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
++    if (s_gsThread)
++    {
++        WorkItem item;
++        item.kind = WorkItem::Kind::Transfer;
++        item.transfer = command;
++        enqueueWork(std::move(item));
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
++    BeginTransferUnlocked(command);
++}
++
++void GSCpuBackend::BeginTransferUnlocked(const GSTransferCommand &command)
++{
+     m_transfer = command;
+     m_transferState.x = command.trxpos.dsax;
+     m_transferState.y = command.trxpos.dsay;
+@@ -1393,7 +1863,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ 
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
++    if (s_gsThread)
++    {
++        if (!data || sizeBytes == 0u)
++            return;
++        WorkItem item;
++        item.kind = WorkItem::Kind::Upload;
++        item.bytes.assign(data, data + sizeBytes);
++        enqueueWork(std::move(item));
++        return;
++    }
+     std::lock_guard<std::mutex> lock(m_mutex);
++    UploadImageUnlocked(data, sizeBytes);
++}
++
++void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes)
++{
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -1406,6 +1891,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -567,7 +803,25 @@ index 9c39ae2..73b85a8 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1812,6 +2196,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1610,6 +2132,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+ 
+ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
+         return 0u;
+@@ -1622,6 +2145,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ 
+ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
++    // The bool result feeds the caller's fallback decision, so this cannot be deferred:
++    // drain (order wrt queued draws) and execute inline. Clears are rare.
++    drainQueue();
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+@@ -1812,6 +2338,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;

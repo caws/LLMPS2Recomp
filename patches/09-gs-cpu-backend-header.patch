@@ -1,8 +1,49 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..5a57dcf 100644
+index 71e8032..0a63c29 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-@@ -42,7 +42,7 @@ private:
+@@ -3,14 +3,18 @@
+ #include "runtime/gs/gs_backend.h"
+ 
+ #include <array>
++#include <condition_variable>
++#include <deque>
+ #include <functional>
+ #include <mutex>
++#include <thread>
+ #include <vector>
+ 
+ class GSCpuBackend final : public GSRasterBackend
+ {
+ public:
+     GSCpuBackend();
++    ~GSCpuBackend() override;
+ 
+     void Initialize(uint8_t *vram, uint32_t vramSize) override;
+     void Reset() override;
+@@ -36,13 +40,29 @@ private:
+     void ResetUnlocked();
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
++    void BeginTransferUnlocked(const GSTransferCommand &command);
++    void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
++
++    // Off-thread rasterization (PS2X_GS_THREAD, default OFF): draw/transfer/upload
++    // commands enqueue to a worker; read-side entry points drain first. All queue items
++    // are self-contained copies.
++    struct WorkItem
++    {
++        enum class Kind : uint8_t { Draw, Transfer, Upload } kind = Kind::Draw;
++        GSPrimitiveBatch batch{};
++        GSTransferCommand transfer{};
++        std::vector<uint8_t> bytes;
++    };
++    void workerLoop();
++    void enqueueWork(WorkItem &&item);
++    void drainQueue() const;
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+     void DrawSprite(const GSPrimitiveBatch &batch);
      void DrawTriangle(const GSPrimitiveBatch &batch);
      void DrawLine(const GSPrimitiveBatch &batch);
      void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
@@ -11,7 +52,7 @@ index 71e8032..5a57dcf 100644
      uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
  
      void PerformLocalToLocalTransfer();
-@@ -58,8 +58,26 @@ private:
+@@ -58,8 +78,26 @@ private:
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
  
@@ -40,7 +81,7 @@ index 71e8032..5a57dcf 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,6 +85,7 @@ private:
+@@ -67,9 +105,19 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
@@ -48,3 +89,15 @@ index 71e8032..5a57dcf 100644
  
      GSTransferCommand m_transfer{};
      GSTransferSnapshot m_transferState{};
+     std::vector<uint8_t> m_localToHostBuffer;
+     size_t m_localToHostReadPos = 0;
++
++    mutable std::mutex m_queueMutex;
++    mutable std::condition_variable m_queueCv;     // wakes the worker
++    mutable std::condition_variable m_queueIdleCv; // wakes drainers/backpressured producers
++    std::deque<WorkItem> m_queue;
++    size_t m_queueUploadBytes = 0;
++    bool m_workerBusy = false;
++    bool m_workerStop = false;
++    std::thread m_worker;
+ };
