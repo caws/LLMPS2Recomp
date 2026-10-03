@@ -59,6 +59,12 @@ mass-rewrite the inputs.**
   schema (incl. `[patches].instructions` and `skip`=startup-code), the game-override-hook
   API, the runtime memory/dispatch model, and the stripped-game playbook — annotated with how
   each maps to our setup. Upstream's *intended* behavior; secondary to our own ground truth.
+- **[resources.md](resources.md)** — external PS2 references: **ps2tek** (hardware spec) and the
+  **PCSX2 source** (the reference implementation for *how* a subsystem decodes/behaves). When an
+  override must reimplement hardware the runtime stubs (e.g. IPU `ipum` texture decode, a DMA
+  quirk), use these to understand the architecture and mirror PCSX2's proven implementation
+  rather than guessing — cite the file/function you mirrored. Still a hypothesis until verified
+  against our generated C++ + disasm + gdb.
 
 ## Hard constraints (apply everywhere)
 

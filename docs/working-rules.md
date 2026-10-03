@@ -51,6 +51,12 @@ and the disasm, then gdb, before asserting or acting.
   — it shows done/phase/≈% + the cc1plus monster/OOM warning that flags an over-bound unit.
 - **Background builds, `timeout` runs.** Builds take many minutes (launch in background, poll the
   log); a spinning runner emits hundreds of MB/s, so always run under `timeout` to a file.
+- **Consult the external references when reimplementing hardware.** Whenever an override has to
+  reimplement or work around hardware the runtime stubs or gets wrong (IPU/GS/VIF/GIF/DMAC/SPU2/
+  SIF/CDVD/…), keep [resources.md](resources.md) in mind: read **ps2tek** for the spec and **mirror
+  the PCSX2 source** as the reference implementation rather than guessing or re-deriving. Cite the
+  file/function you mirrored, and still verify it against our generated C++ + disasm + gdb (it's a
+  strong hypothesis, not gospel — the game's own data/flow is the final arbiter).
 
 ## The bug/fix taxonomy (quick index)
 

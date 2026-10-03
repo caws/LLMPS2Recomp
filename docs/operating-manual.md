@@ -74,6 +74,12 @@ Boot reaches a point and stops — a crash, a spin, a silent hang, a missing-fun
   bursts frames and flags content by mean brightness. Use it to confirm real visible progress, not
   just log advancement.
 
+- **External references** ([resources.md](resources.md)): **ps2tek** (PS2 hardware spec) and the
+  **PCSX2 source** (the reference implementation for *how* a subsystem decodes/behaves). Reach for
+  these when an override must reimplement hardware the runtime stubs (IPU `ipum` texture decode, a
+  DMA quirk, a register side-effect): read ps2tek for the spec and mirror PCSX2's proven code rather
+  than guessing — then verify against our ground truth (§4). Cite the file/function you mirrored.
+
 Pick the cheapest tool that answers the question. A single-fact lookup is a `funcs.py`/grep, not a
 workflow.
 
