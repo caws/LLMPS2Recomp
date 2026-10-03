@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..a73b7bd
+index 0000000..869b0b4
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,249 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -237,6 +237,13 @@ index 0000000..a73b7bd
 +    // primitive isolated, the only way to say WHY it differs is to compare the actual
 +    // pixels, which needs the GPU's bytes on the host.
 +    void MirrorReadback(uint32_t byteOffset, uint32_t byteLen, std::vector<uint8_t> &out);
++
++    // Perf mode (cont.174): time each raster dispatch with a GL timer query so the GPU's
++    // own execution time can be compared against the CPU rasterizer's, WITHOUT flipping
++    // authority. EnablePerfTiming must be called before any raster job.
++    void EnablePerfTiming();
++    void PerfStats(unsigned long long &gpuNs, unsigned long long &prims,
++                   unsigned long &dispatches) const;
 +
 +    // Phase-2a tallies, printed by the caller alongside the other mirror counters.
 +    void RasterStats(unsigned long &prims, unsigned long &verifies,

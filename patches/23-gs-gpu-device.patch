@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
 new file mode 100644
-index 0000000..2ee1311
+index 0000000..8fe9efa
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
-@@ -0,0 +1,2139 @@
+@@ -0,0 +1,2185 @@
 +#include "runtime/gs/gs_gpu_device.h"
 +#include "runtime/gs/ps2_gs_memory.h"
 +
@@ -11,6 +11,7 @@ index 0000000..2ee1311
 +#include <EGL/eglext.h>
 +
 +#include <algorithm>
++#include <chrono>
 +#include <condition_variable>
 +#include <cstdio>
 +#include <cstring>
@@ -61,6 +62,8 @@ index 0000000..2ee1311
 +    constexpr GLenum GL_LINK_STATUS = 0x8B82;
 +    constexpr GLbitfield GL_SHADER_STORAGE_BARRIER_BIT = 0x00002000;
 +    constexpr GLbitfield GL_BUFFER_UPDATE_BARRIER_BIT = 0x00000200;
++    constexpr GLenum GL_TIME_ELAPSED = 0x88BF;
++    constexpr GLenum GL_QUERY_RESULT = 0x8866;
 +    constexpr GLenum GL_RENDERER = 0x1F01;
 +    constexpr GLenum GL_VERSION = 0x1F02;
 +
@@ -91,6 +94,10 @@ index 0000000..2ee1311
 +        void (*DispatchCompute)(GLuint, GLuint, GLuint) = nullptr;
 +        void (*MemoryBarrier)(GLbitfield) = nullptr;
 +        void (*Finish)() = nullptr;
++        void (*GenQueries)(GLsizei, GLuint *) = nullptr;
++        void (*BeginQuery)(GLenum, GLuint) = nullptr;
++        void (*EndQuery)(GLenum) = nullptr;
++        void (*GetQueryObjectui64v)(GLuint, GLenum, uint64_t *) = nullptr;
 +    };
 +
 +    template <typename Fn>
@@ -1227,6 +1234,10 @@ index 0000000..2ee1311
 +    // for the single-primitive gate.
 +    GsGpuState lastState{};
 +    GsGpuGeom lastGeom{};
++    GLuint timeQuery = 0;
++    bool perfTiming = false;
++    unsigned long long gpuNs = 0, gpuPrims = 0;
++    unsigned long gpuDispatches = 0;
 +    unsigned long rasterBatches = 0;
 +    unsigned long long rasterBatchPrims = 0;
 +    unsigned long rasterPrims = 0, rasterVerifies = 0, rasterMismRanges = 0;
@@ -1426,6 +1437,10 @@ index 0000000..2ee1311
 +        ok &= loadGlFn(gl.DispatchCompute, "glDispatchCompute");
 +        ok &= loadGlFn(gl.MemoryBarrier, "glMemoryBarrier");
 +        ok &= loadGlFn(gl.Finish, "glFinish");
++        ok &= loadGlFn(gl.GenQueries, "glGenQueries");
++        ok &= loadGlFn(gl.BeginQuery, "glBeginQuery");
++        ok &= loadGlFn(gl.EndQuery, "glEndQuery");
++        ok &= loadGlFn(gl.GetQueryObjectui64v, "glGetQueryObjectui64v");
 +        if (!ok)
 +            return fail("eglGetProcAddress(GL 4.3 core fn)");
 +
@@ -1718,6 +1733,15 @@ index 0000000..2ee1311
 +    {
 +        if (!ensureRaster() || b.prims.empty() || b.states.empty())
 +            return;
++        // Perf mode times the dispatch by WALL CLOCK around an explicit glFinish. A
++        // GL_TIME_ELAPSED query was tried first and reported ~200ns per dispatch -- i.e.
++        // essentially nothing for millions of primitives, which is not believable, so it is
++        // not trusted. Finish forces the work to actually complete before the clock stops.
++        // This serializes the device thread, which is fine for a measurement mode and is
++        // why it is not the default.
++        const bool timing = perfTiming;
++        const auto t0 = timing ? std::chrono::steady_clock::now()
++                               : std::chrono::steady_clock::time_point{};
 +        auto upload = [&](GLuint buf, const void *data, size_t bytes)
 +        {
 +            gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
@@ -1755,6 +1779,15 @@ index 0000000..2ee1311
 +            gl.DispatchCompute(static_cast<GLuint>(b.tileList.size()), 1u, 1u);
 +        }
 +        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        if (timing)
++        {
++            gl.Finish(); // the dispatch must be DONE, not merely submitted
++            gpuNs += static_cast<unsigned long long>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    std::chrono::steady_clock::now() - t0).count());
++            ++gpuDispatches;
++            gpuPrims += b.prims.size();
++        }
 +        lastGeom = b.prims.back();
 +        lastState = b.states[lastGeom.stateIndex < b.states.size() ? lastGeom.stateIndex : 0];
 +        ++rasterBatches;
@@ -2106,6 +2139,19 @@ index 0000000..2ee1311
 +    j.raw = std::move(expected);
 +    j.tag = tag;
 +    m_impl->enqueue(std::move(j));
++}
++
++void GsGpuPresentDevice::EnablePerfTiming()
++{
++    m_impl->perfTiming = true; // set before the device thread takes any raster job
++}
++
++void GsGpuPresentDevice::PerfStats(unsigned long long &gpuNs, unsigned long long &prims,
++                                   unsigned long &dispatches) const
++{
++    gpuNs = m_impl->gpuNs;
++    prims = m_impl->gpuPrims;
++    dispatches = m_impl->gpuDispatches;
 +}
 +
 +void GsGpuPresentDevice::RasterStats(unsigned long &prims, unsigned long &verifies,
