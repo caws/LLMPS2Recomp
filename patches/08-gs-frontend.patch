@@ -1,0 +1,17 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index fd5a90d..7a3d73a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -725,8 +725,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+             if ((nloop * nreg) & 1)
+                 offset += 8;
+         }
+-        else if (flg == GIF_FMT_IMAGE)
+-        {
++        else // IMAGE (flg=2) or flg=3 "Disable" == IMAGE2: BOTH consume nloop qwords
++        {    // (ps2tek; PCSX2 GIFPath shares one case for GIF_FLG_IMAGE/IMAGE2). Treating
++             // flg=3 as payload-less desyncs the parser: the data qwords get re-read as
++             // GIF tags -> garbage FRAME/scissor writes (the cont.156 level corruption).
+             uint32_t imageBytes = nloop * 16;
+             if (offset + imageBytes > sizeBytes)
+                 imageBytes = sizeBytes - offset;
