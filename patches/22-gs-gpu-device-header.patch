@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..7315955
+index 0000000..763f20b
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,201 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -110,6 +110,17 @@ index 0000000..7315955
 +    uint32_t texW = 1, texH = 1, linear = 0;
 +    uint32_t wms = 0, wmt = 0, minU = 0, maxU = 0, minV = 0, maxV = 0;
 +    uint32_t ta0 = 0, ta1 = 0, aem = 0;
++
++    // --- SPRITE path (primType == GS_PRIM_SPRITE). DrawSprite is not a degenerate
++    // triangle: colour, Z and fog are taken FLAT from v1 (it ignores IIP entirely), Z is
++    // a plain truncation of v1.z with none of the triangle path's +0.5, and UV comes from
++    // a screen-space lerp between two corners rather than barycentrics. su/sv are the two
++    // corners already in TEXEL units (host-resolved: `v.u >> 4` for FST, `(v.s/q)*texW`
++    // otherwise), and sprites never mipmap.
++    uint32_t spriteZ = 0;
++    uint32_t unclipX0 = 0, unclipY0 = 0;
++    float spriteW = 1.0f, spriteH = 1.0f;
++    float su0 = 0, sv0 = 0, su1 = 0, sv1 = 0;
 +
 +    // CLUT shadow (PS2X_GS_CLUTSHADOW): the uploaded 16-entry payload for this cbp, so the
 +    // shader can reproduce LookupCLUT's RGB-zeroed-entry substitution exactly.

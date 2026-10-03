@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
 new file mode 100644
-index 0000000..263783a
+index 0000000..f071ec2
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
-@@ -0,0 +1,1847 @@
+@@ -0,0 +1,1965 @@
 +#include "runtime/gs/gs_gpu_device.h"
 +#include "runtime/gs/ps2_gs_memory.h"
 +
@@ -484,6 +484,10 @@ index 0000000..263783a
 +    uint texW, texH, linear;
 +    uint wms, wmt, minU, maxU, minV, maxV;
 +    uint ta0, ta1, aem;
++    uint spriteZ;
++    uint unclipX0, unclipY0;
++    float spriteW, spriteH;
++    float su0, sv0, su1, sv1;
 +    uint clutShadowHave;
 +    uint clutShadow[16];
 +} P;
@@ -679,6 +683,14 @@ index 0000000..263783a
 +    return applyTexa(0u, raw); // undefined psm decodes as CT32
 +}
 +
++// GLSL only guarantees ~2.5 ULP for float division, but the CPU oracle divides with
++// correctly-rounded IEEE. Rounding a correctly-rounded fp64 quotient to float reproduces
++// the float divide exactly (double rounding is innocuous for division: 53 >= 2*24+2).
++float exactDiv(float a, float b)
++{
++    return float(double(a) / double(b));
++}
++
 +uint lerpChan(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
 +{
 +    // `precise` is load-bearing, not decoration: GLSL lets an implementation contract
@@ -704,7 +716,7 @@ index 0000000..263783a
 +    else
 +    {
 +        float aq = (abs(q) > 1.0e-8) ? q : 1.0;
-+        float invQ = float(1.0lf / double(aq)); // fp64 divide is IEEE; float divide is not
++        float invQ = exactDiv(1.0, aq);
 +        texUf = s * invQ * float(P.texW);
 +        texVf = t * invQ * float(P.texH);
 +        // (both already `precise` by declaration -- see lerpChan's note)
@@ -750,12 +762,175 @@ index 0000000..263783a
 +    return 0;
 +}
 +
++// GSCpuBackend::WritePixel -- shared by the triangle and sprite paths. The caller has
++// already resolved the pixel's colour, its fog value (interpolated for a triangle, flat
++// from v1 for a sprite) and its integer Z (rounded +0.5 for a triangle, truncated for a
++// sprite), because those three are the only places the two primitive types differ once
++// coverage is decided.
++void writePixel(uint px_i, uint py_i, uint r, uint g, uint b, uint a, uint fog, uint zval)
++{
++    if (px_i < P.scissorX0 || px_i > P.scissorX1 || py_i < P.scissorY0 || py_i > P.scissorY1)
++        return;
++
++    if (P.fge != 0u)
++    {
++        uint inv = 255u - fog;
++        r = (((fog * r) >> 8u) + ((inv * P.fogR) >> 8u)) & 0xFFu;
++        g = (((fog * g) >> 8u) + ((inv * P.fogG) >> 8u)) & 0xFFu;
++        b = (((fog * b) >> 8u) + ((inv * P.fogB) >> 8u)) & 0xFFu;
++    }
++
++    // classifyAlphaTest
++    bool writeRgb = true, writeAlpha = true, writeDepth = true;
++    if (!passesAlphaTest(a))
++    {
++        if (P.afail == 1u)      { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
++        else if (P.afail == 2u) { writeRgb = false; writeAlpha = false; writeDepth = true;  }
++        else if (P.afail == 3u)
++        {
++            if (P.fpsm == 0u)   { writeRgb = true;  writeAlpha = false; writeDepth = false; }
++            else                { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
++        }
++        else                    { writeRgb = false; writeAlpha = false; writeDepth = false; }
++    }
++    bool writesFb = writeRgb || writeAlpha;
++    if (!writesFb && !writeDepth)
++        return;
++
++    bool preserveDstAlpha = writeRgb && !writeAlpha && P.fpsm == 0u;
++    bool frmw = writesFb && ((P.fbmsk != 0u) || P.abe != 0u || preserveDstAlpha);
++    uint fbrgba = 0u;
++    if (frmw)
++    {
++        uint raw = readVram(P.fpsm, P.fbp, P.fbw, px_i, py_i);
++        fbrgba = raw;
++        if (P.fpsm == 2u || P.fpsm == 10u)
++            fbrgba = rgba5551to8888(raw);
++        else if (P.fpsm == 1u)
++            fbrgba = raw | 0x80000000u; // the GS supplies 0x80 dest alpha for RGB24
++    }
++
++    bool zpass = false;
++    if (P.ztst == 1u)
++        zpass = true;
++    else if (P.ztst == 2u || P.ztst == 3u)
++    {
++        uint stored = readVram(P.zpsm, P.zbp, P.fbw, px_i, py_i);
++        zpass = (P.ztst == 2u) ? (zval >= stored) : (zval > stored);
++    }
++    if (!zpass)
++        return;
++
++    if (writesFb)
++    {
++        if (P.abe != 0u)
++        {
++            int dr = int(fbrgba & 0xFFu), dg = int((fbrgba >> 8u) & 0xFFu);
++            int db = int((fbrgba >> 16u) & 0xFFu), da = int((fbrgba >> 24u) & 0xFFu);
++            int cAlpha = (P.blendC == 0u) ? int(a) : ((P.blendC == 1u) ? da : int(P.blendFix));
++            int sr = int(r), sg = int(g), sb = int(b);
++            r = uint(clamp(((pickRGB(P.blendA, sr, dr) - pickRGB(P.blendB, sr, dr)) * cAlpha >> 7) + pickRGB(P.blendD, sr, dr), 0, 255));
++            g = uint(clamp(((pickRGB(P.blendA, sg, dg) - pickRGB(P.blendB, sg, dg)) * cAlpha >> 7) + pickRGB(P.blendD, sg, dg), 0, 255));
++            b = uint(clamp(((pickRGB(P.blendA, sb, db) - pickRGB(P.blendB, sb, db)) * cAlpha >> 7) + pickRGB(P.blendD, sb, db), 0, 255));
++        }
++        if (writeAlpha && (P.fba & 1u) != 0u && P.fpsm != 1u)
++            a |= 0x80u;
++        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
++        if (P.fbmsk != 0u)
++            pixel = (pixel & ~P.fbmsk) | (fbrgba & P.fbmsk);
++        if (preserveDstAlpha)
++            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
++        if (P.fpsm == 2u || P.fpsm == 10u)
++        {
++            uint pr = ((pixel      ) & 0xFFu) >> 3u;
++            uint pg = ((pixel >>  8) & 0xFFu) >> 3u;
++            uint pb = ((pixel >> 16) & 0xFFu) >> 3u;
++            uint pa = ((pixel >> 24) & 0xFFu) >> 7u;
++            pixel = pr | (pg << 5u) | (pb << 10u) | (pa << 15u);
++        }
++        writeVramPsm(P.fpsm, P.fbp, P.fbw, px_i, py_i, pixel);
++    }
++
++    if (writeDepth && P.zmsk == 0u)
++        writeVramPsm(P.zpsm, P.zbp, P.fbw, px_i, py_i, zval);
++}
++
++
 +void main()
 +{
 +    uint px_i = P.minX + gl_GlobalInvocationID.x;
 +    uint py_i = P.minY + gl_GlobalInvocationID.y;
 +    if (px_i > P.maxX || py_i > P.maxY)
 +        return;
++
++    // ---- SPRITE (DrawSprite): axis-aligned, flat shaded, screen-space UV lerp ----
++    // The host already clamped minX/minY/maxX/maxY to the scissor-intersected rect and
++    // rejected a fully-off-screen sprite, so every invocation here is covered.
++    if (P.primType == 6u)
++    {
++        uint sr, sg, sb, sa;
++        sr = P.rgba1 & 0xFFu;
++        sg = (P.rgba1 >> 8u) & 0xFFu;
++        sb = (P.rgba1 >> 16u) & 0xFFu;
++        sa = (P.rgba1 >> 24u) & 0xFFu;
++        if (P.tme != 0u)
++        {
++            precise float tx = exactDiv(float(px_i - P.unclipX0) + 0.5, P.spriteW);
++            precise float ty = exactDiv(float(py_i - P.unclipY0) + 0.5, P.spriteH);
++            precise float texUf = P.su0 + (P.su1 - P.su0) * tx;
++            precise float texVf = P.sv0 + (P.sv1 - P.sv0) * ty;
++            float is = 0.0, it = 0.0, iq = 1.0;
++            uint iu = 0u, iv = 0u;
++            if (P.fst != 0u)
++            {
++                // DrawSprite re-quantizes to 4.4 fixed point and hands SampleTexture a UV,
++                // which divides by 16 again -- replicate the round trip, not a shortcut.
++                iu = uint(clamp(int(texUf * 16.0 + 0.5), 0, 0xFFFF));
++                iv = uint(clamp(int(texVf * 16.0 + 0.5), 0, 0xFFFF));
++            }
++            else
++            {
++                // ...and in the non-FST case it divides by the texture size, which
++                // SampleTexture then multiplies back. Not identity in float: do both.
++                is = exactDiv(texUf, float(P.texW));
++                it = exactDiv(texVf, float(P.texH));
++            }
++            uint texel = sampleTexture(is, it, iq, iu, iv);
++            uint tr = texel & 0xFFu, tg = (texel >> 8u) & 0xFFu;
++            uint tb = (texel >> 16u) & 0xFFu, ta = (texel >> 24u) & 0xFFu;
++            bool hasAlpha = P.tcc != 0u;
++            uint nr, ng, nb, na;
++            if (P.tfx == 0u)
++            {
++                nr = uint(clamp(int((tr * sr) >> 7u), 0, 255));
++                ng = uint(clamp(int((tg * sg) >> 7u), 0, 255));
++                nb = uint(clamp(int((tb * sb) >> 7u), 0, 255));
++                na = hasAlpha ? uint(clamp(int((ta * sa) >> 7u), 0, 255)) : sa;
++            }
++            else if (P.tfx == 1u)
++            {
++                nr = tr; ng = tg; nb = tb; na = hasAlpha ? ta : sa;
++            }
++            else if (P.tfx == 2u)
++            {
++                nr = uint(clamp(int(((tr * sr) >> 7u) + sa), 0, 255));
++                ng = uint(clamp(int(((tg * sg) >> 7u) + sa), 0, 255));
++                nb = uint(clamp(int(((tb * sb) >> 7u) + sa), 0, 255));
++                na = hasAlpha ? uint(clamp(int(ta + sa), 0, 255)) : sa;
++            }
++            else
++            {
++                nr = uint(clamp(int(((tr * sr) >> 7u) + sa), 0, 255));
++                ng = uint(clamp(int(((tg * sg) >> 7u) + sa), 0, 255));
++                nb = uint(clamp(int(((tb * sb) >> 7u) + sa), 0, 255));
++                na = hasAlpha ? ta : sa;
++            }
++            sr = nr; sg = ng; sb = nb; sa = na;
++        }
++        // Flat Z and fog from v1; note DrawSprite truncates v1.z with no +0.5 rounding.
++        writePixel(px_i, py_i, sr, sg, sb, sa, P.fog1, P.spriteZ);
++        return;
++    }
 +
 +    float px = float(px_i) + 0.5;
 +    float py = float(py_i) + 0.5;
@@ -845,94 +1020,15 @@ index 0000000..263783a
 +        r = nr; g = ng; b = nb; a = na;
 +    }
 +
-+    // --- WritePixel ---
-+    if (px_i < P.scissorX0 || px_i > P.scissorX1 || py_i < P.scissorY0 || py_i > P.scissorY1)
-+        return;
-+
++    // Fog is interpolated per pixel for a triangle (a sprite takes v1's flat value), and
++    // Z carries the +0.5 rounding DrawTriangle applies at its WritePixel call site.
++    uint fogv = 0u;
 +    if (P.fge != 0u)
 +    {
 +        precise float ifog = float(P.fog0) * w0 + float(P.fog1) * w1 + float(P.fog2) * w2;
-+        uint fog = uint(clamp(int(ifog), 0, 255));
-+        uint inv = 255u - fog;
-+        r = (((fog * r) >> 8u) + ((inv * P.fogR) >> 8u)) & 0xFFu;
-+        g = (((fog * g) >> 8u) + ((inv * P.fogG) >> 8u)) & 0xFFu;
-+        b = (((fog * b) >> 8u) + ((inv * P.fogB) >> 8u)) & 0xFFu;
++        fogv = uint(clamp(int(ifog), 0, 255));
 +    }
-+
-+    // classifyAlphaTest
-+    bool writeRgb = true, writeAlpha = true, writeDepth = true;
-+    if (!passesAlphaTest(a))
-+    {
-+        if (P.afail == 1u)      { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
-+        else if (P.afail == 2u) { writeRgb = false; writeAlpha = false; writeDepth = true;  }
-+        else if (P.afail == 3u)
-+        {
-+            if (P.fpsm == 0u)   { writeRgb = true;  writeAlpha = false; writeDepth = false; }
-+            else                { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
-+        }
-+        else                    { writeRgb = false; writeAlpha = false; writeDepth = false; }
-+    }
-+    bool writesFb = writeRgb || writeAlpha;
-+    if (!writesFb && !writeDepth)
-+        return;
-+
-+    bool preserveDstAlpha = writeRgb && !writeAlpha && P.fpsm == 0u;
-+    bool frmw = writesFb && ((P.fbmsk != 0u) || P.abe != 0u || preserveDstAlpha);
-+    uint fbrgba = 0u;
-+    if (frmw)
-+    {
-+        uint raw = readVram(P.fpsm, P.fbp, P.fbw, px_i, py_i);
-+        fbrgba = raw;
-+        if (P.fpsm == 2u || P.fpsm == 10u)
-+            fbrgba = rgba5551to8888(raw);
-+        else if (P.fpsm == 1u)
-+            fbrgba = raw | 0x80000000u; // the GS supplies 0x80 dest alpha for RGB24
-+    }
-+
-+    bool zpass = false;
-+    if (P.ztst == 1u)
-+        zpass = true;
-+    else if (P.ztst == 2u || P.ztst == 3u)
-+    {
-+        uint zval = uint(zd + 0.5lf);
-+        uint stored = readVram(P.zpsm, P.zbp, P.fbw, px_i, py_i);
-+        zpass = (P.ztst == 2u) ? (zval >= stored) : (zval > stored);
-+    }
-+    if (!zpass)
-+        return;
-+
-+    if (writesFb)
-+    {
-+        if (P.abe != 0u)
-+        {
-+            int dr = int(fbrgba & 0xFFu), dg = int((fbrgba >> 8u) & 0xFFu);
-+            int db = int((fbrgba >> 16u) & 0xFFu), da = int((fbrgba >> 24u) & 0xFFu);
-+            int cAlpha = (P.blendC == 0u) ? int(a) : ((P.blendC == 1u) ? da : int(P.blendFix));
-+            int sr = int(r), sg = int(g), sb = int(b);
-+            r = uint(clamp(((pickRGB(P.blendA, sr, dr) - pickRGB(P.blendB, sr, dr)) * cAlpha >> 7) + pickRGB(P.blendD, sr, dr), 0, 255));
-+            g = uint(clamp(((pickRGB(P.blendA, sg, dg) - pickRGB(P.blendB, sg, dg)) * cAlpha >> 7) + pickRGB(P.blendD, sg, dg), 0, 255));
-+            b = uint(clamp(((pickRGB(P.blendA, sb, db) - pickRGB(P.blendB, sb, db)) * cAlpha >> 7) + pickRGB(P.blendD, sb, db), 0, 255));
-+        }
-+        if (writeAlpha && (P.fba & 1u) != 0u && P.fpsm != 1u)
-+            a |= 0x80u;
-+        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
-+        if (P.fbmsk != 0u)
-+            pixel = (pixel & ~P.fbmsk) | (fbrgba & P.fbmsk);
-+        if (preserveDstAlpha)
-+            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
-+        if (P.fpsm == 2u || P.fpsm == 10u)
-+        {
-+            uint pr = ((pixel      ) & 0xFFu) >> 3u;
-+            uint pg = ((pixel >>  8) & 0xFFu) >> 3u;
-+            uint pb = ((pixel >> 16) & 0xFFu) >> 3u;
-+            uint pa = ((pixel >> 24) & 0xFFu) >> 7u;
-+            pixel = pr | (pg << 5u) | (pb << 10u) | (pa << 15u);
-+        }
-+        writeVramPsm(P.fpsm, P.fbp, P.fbw, px_i, py_i, pixel);
-+    }
-+
-+    if (writeDepth && P.zmsk == 0u)
-+        writeVramPsm(P.zpsm, P.zbp, P.fbw, px_i, py_i, uint(zd + 0.5lf));
++    writePixel(px_i, py_i, r, g, b, a, fogv, uint(zd + 0.5lf));
 +}
 +)GLSL";
 +
@@ -1052,6 +1148,9 @@ index 0000000..263783a
 +    // Phase-2a raster state (lazily created with the first raster job).
 +    GLuint rasterProgram = 0;
 +    GLuint primBuf = 0;
++    // The FIFO puts a VerifyRange immediately behind the RasterPrim it checks, so the last
++    // rastered prim IS the one being verified -- enough to name a divergence precisely.
++    GsGpuPrim lastPrim{};
 +    unsigned long rasterPrims = 0, rasterVerifies = 0, rasterMismRanges = 0;
 +    unsigned long long rasterMismWords = 0;
 +
@@ -1525,6 +1624,7 @@ index 0000000..263783a
 +        const uint32_t h = prim.maxY - prim.minY + 1u;
 +        gl.DispatchCompute((w + 7u) / 8u, (h + 7u) / 8u, 1u);
 +        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        lastPrim = prim;
 +        ++rasterPrims;
 +    }
 +
@@ -1564,11 +1664,29 @@ index 0000000..263783a
 +            ++rasterMismRanges;
 +            rasterMismWords += res[0];
 +            if (rasterMismRanges <= 16u || (rasterMismRanges % 4096u) == 0u)
++            {
++                const GsGpuPrim &q = lastPrim;
 +                std::fprintf(stderr,
 +                             "[gsgpu:raster] MISMATCH #%lu tag=%016llx off=0x%06x words=%u: "
-+                             "%u differ, first i=%u gpu=%08x cpu=%08x\n",
++                             "%u differ, first i=%u gpu=%08x cpu=%08x\n"
++                             "[gsgpu:raster]   prim type=%u rect=(%u,%u)-(%u,%u) "
++                             "frame{fbp=%u fbw=%u psm=0x%x msk=%08x} z{zbp=%u psm=0x%x msk=%u} "
++                             "tex{tbp=%u tbw=%u psm=0x%x tw=%u th=%u lin=%u tfx=%u tcc=%u "
++                             "cbp=%u cpsm=0x%x csa=%u} texa{ta0=%u ta1=%u aem=%u} "
++                             "test{ate=%u atst=%u aref=%u afail=%u ztst=%u} "
++                             "blend{%u%u%u%u fix=%u abe=%u} sprite{unclip=(%u,%u) wh=%.1fx%.1f "
++                             "uv=(%.2f,%.2f)-(%.2f,%.2f) z=%u}\n",
 +                             rasterMismRanges, static_cast<unsigned long long>(tag),
-+                             offset, words, res[0], res[1], res[2], res[3]);
++                             offset, words, res[0], res[1], res[2], res[3],
++                             q.primType, q.minX, q.minY, q.maxX, q.maxY,
++                             q.fbp, q.fbw, q.fpsm, q.fbmsk, q.zbp, q.zpsm, q.zmsk,
++                             q.tbp, q.tbw, q.tpsm, q.texW, q.texH, q.linear, q.tfx, q.tcc,
++                             q.cbp, q.cpsm, q.csa, q.ta0, q.ta1, q.aem,
++                             q.ate, q.atst, q.aref, q.afail, q.ztst,
++                             q.blendA, q.blendB, q.blendC, q.blendD, q.blendFix, q.abe,
++                             q.unclipX0, q.unclipY0, q.spriteW, q.spriteH,
++                             q.su0, q.sv0, q.su1, q.sv1, q.spriteZ);
++            }
 +        }
 +        const GLenum err = gl.GetError();
 +        if (err != 0u && errorLogs < 8u)

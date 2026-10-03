@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..e3f33bc 100644
+index 71e8032..602e279 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-@@ -3,14 +3,22 @@
+@@ -3,14 +3,23 @@
  #include "runtime/gs/gs_backend.h"
  
  #include <array>
@@ -16,6 +16,7 @@ index 71e8032..e3f33bc 100644
  #include <vector>
  
 +class GsGpuPresentDevice;
++struct GsGpuPrim; // gs_gpu_device.h -- only referenced here, never laid out
 +
  class GSCpuBackend final : public GSRasterBackend
  {
@@ -25,7 +26,7 @@ index 71e8032..e3f33bc 100644
  
      void Initialize(uint8_t *vram, uint32_t vramSize) override;
      void Reset() override;
-@@ -22,6 +30,13 @@ public:
+@@ -22,6 +31,13 @@ public:
      void Flush() override;
      void TextureFlush() override;
      void Sync(GSSyncReason reason) override;
@@ -39,7 +40,7 @@ index 71e8032..e3f33bc 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +51,106 @@ private:
+@@ -36,18 +52,118 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -106,12 +107,24 @@ index 71e8032..e3f33bc 100644
 +    struct RasterVerifyCtx
 +    {
 +        bool active = false;
-+        bool hasZ = false;
++        // The Z range must be SEEDED whenever the depth test READS it (ZTST 2/3), not only
++        // when the draw writes it -- a ZMSK=1 draw still depth-tests against a Z buffer the
++        // mirror would otherwise hold a stale copy of, and the GPU then keeps or discards
++        // different pixels than the oracle. It is VERIFIED only when actually written.
++        bool zSeed = false;
++        bool zWritten = false;
 +        uint32_t frameOff = 0, frameLen = 0;
 +        uint32_t zOff = 0, zLen = 0;
 +        uint64_t tag = 0;
 +    };
 +    bool rasterVerifyBegin(const GSPrimitiveBatch &batch, RasterVerifyCtx &out);
++    // cont.170: DrawSprite is not a degenerate triangle (flat colour/Z/fog from v1, an
++    // axis-aligned rect, screen-space UV lerp), so it gets its own setup; everything that
++    // does not depend on the primitive's SHAPE lives in gs2FillCommonPrimState, and the
++    // seed-then-raster sequence in rasterSeedAndPost, shared by both.
++    bool rasterVerifyBeginSprite(const GSPrimitiveBatch &batch, RasterVerifyCtx &out);
++    void gs2FillCommonPrimState(const GSPrimitiveBatch &batch, GsGpuPrim &p, uint32_t mip);
++    void rasterSeedAndPost(GsGpuPrim &&p, const RasterVerifyCtx &out);
 +    void rasterVerifyEnd(const RasterVerifyCtx &ctx);
 +
 +    // Off-thread rasterization (PS2X_GS_THREAD, default OFF): draw/transfer/upload
@@ -147,7 +160,7 @@ index 71e8032..e3f33bc 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +160,36 @@ private:
+@@ -57,9 +173,36 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -186,7 +199,7 @@ index 71e8032..e3f33bc 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +197,52 @@ private:
+@@ -67,9 +210,52 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
