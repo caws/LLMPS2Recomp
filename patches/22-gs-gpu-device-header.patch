@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..a1df175
+index 0000000..1e7f0d6
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,118 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -36,6 +36,16 @@ index 0000000..a1df175
 +// their kernels land). MirrorVerify compares the mirror against the CPU-authoritative
 +// post-upload bytes ON THE GPU (atomic mismatch counter, 16-byte readback) for sampled
 +// chunks -- the same shadow-verify gate the phase-0 present decode passed.
++//
++// Phase 1b (cont.168, mirror COMPLETENESS): MirrorPatchRaw copies an authoritative CPU
++// VRAM byte range straight into the mirror at the same offset -- bit-exact by
++// construction, with no swizzle kernel to get wrong -- which is how every remaining
++// VRAM-mutating op the swizzle kernel does not cover gets mirrored (non-CT32 uploads
++// such as the T4HL font atlas, local->local blits, framebuffer clears, direct
++// WriteVram). MirrorVerifyFull then compares the WHOLE 4MB mirror against CPU VRAM and
++// reports which 8KB pages diverge -- the completeness gate, and the instrument that
++// names any still-unmirrored writer. Once phase 2's rasterizer writes into the mirror,
++// the same full verify becomes its per-flush shadow gate.
 +
 +// One host->local upload chunk, self-contained (the CPU transfer cursor state is baked
 +// into startPixel; geometry from BITBLTBUF/TRXPOS/TRXREG). For MirrorUpload, payload =
@@ -87,6 +97,26 @@ index 0000000..a1df175
 +    // post-upload values), tallying into [gsgpu:xverify] counters printed periodically.
 +    void MirrorUpload(GsGpuUploadChunk &&chunk);
 +    void MirrorVerify(GsGpuUploadChunk &&chunk);
++
++    // Phase-1b raw range patch (async, same FIFO + backpressure): overwrite [byteOffset,
++    // byteOffset + bytes.size()) of the mirror with authoritative CPU VRAM bytes. The
++    // caller snapshots those bytes AFTER its op completed, while the GS worker is the
++    // only writer, so FIFO order preserves op order. Out-of-range/empty patches drop.
++    // Correct for ANY write pattern -- a conservative superset range is fine, it just
++    // copies more authoritative bytes.
++    void MirrorPatchRaw(uint32_t byteOffset, std::vector<uint8_t> &&bytes);
++
++    // Phase-1b full-mirror shadow verify (SYNCHRONOUS: queued behind every pending mirror
++    // job and the caller waits, so it compares the mirror with all prior posts applied).
++    // vram must be the full 4MB and stable across the call -- invoke it from a drained,
++    // locked backend state. Reports total divergent words, the first divergent offset,
++    // and a per-8KB-page histogram ([gsgpu:mverify]) naming WHICH pages are stale.
++    // drawPageMask (optional, 512 bytes -- one per 8KB GS page, nonzero = the CPU
++    // rasterizer may have written there since the last call): pages it marks are reported
++    // separately, because until phase 2 mirrors draws they are EXPECTED to diverge. What
++    // remains -- stale pages the rasterizer cannot explain -- is the actual gate.
++    void MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
++                          const uint8_t *drawPageMask = nullptr);
 +
 +private:
 +    struct Impl;

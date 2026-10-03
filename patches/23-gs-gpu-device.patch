@@ -1,15 +1,16 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
 new file mode 100644
-index 0000000..8222505
+index 0000000..49a2f88
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
-@@ -0,0 +1,895 @@
+@@ -0,0 +1,1137 @@
 +#include "runtime/gs/gs_gpu_device.h"
 +#include "runtime/gs/ps2_gs_memory.h"
 +
 +#include <EGL/egl.h>
 +#include <EGL/eglext.h>
 +
++#include <algorithm>
 +#include <condition_variable>
 +#include <cstdio>
 +#include <cstring>
@@ -156,6 +157,9 @@ index 0000000..8222505
 +    }};
 +
 +    constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
++    // A GS page is 8KB for EVERY psm (64x32x4 = 64x64x2 = 128x64x1 = 128x128x0.5), so
++    // page granularity is the natural attribution unit for the full-mirror compare.
++    constexpr uint32_t kVramPages = kVramBytes / 8192u;
 +    constexpr uint32_t kHostW = 640u;
 +    constexpr uint32_t kHostH = 512u;
 +    // Flat halfword offsets of each page table in the concatenated table SSBO
@@ -335,6 +339,39 @@ index 0000000..8222505
 +}
 +)GLSL";
 +
++    // Phase-1b full-mirror compare kernel (cont.168): the whole 4MB mirror against a
++    // 4MB upload of CPU-authoritative VRAM, word for word. Besides the total and the
++    // first divergence it tallies a per-8KB-PAGE histogram (2048 words/page, 512 pages,
++    // the GS page granularity) -- the page numbers name which writer is still
++    // unmirrored, which a scalar mismatch count cannot.
++    const char *kFullCompareShader = R"GLSL(#version 430
++layout(local_size_x = 256) in;
++layout(std430, binding = 0) readonly buffer Mirror { uint mir[]; };
++layout(std430, binding = 1) readonly buffer Ref { uint refv[]; };
++layout(std430, binding = 2) buffer Result { uint mism; uint firstIdx; uint firstGot; uint firstExp; };
++layout(std430, binding = 3) buffer Hist { uint pageHist[]; };
++uniform uint uWords;
++
++void main()
++{
++    uint i = gl_GlobalInvocationID.x;
++    if (i >= uWords)
++        return;
++    uint g = mir[i];
++    uint e = refv[i];
++    if (g != e)
++    {
++        atomicAdd(mism, 1u);
++        atomicAdd(pageHist[i >> 11u], 1u);
++        if (atomicCompSwap(firstIdx, 0xFFFFFFFFu, i) == 0xFFFFFFFFu)
++        {
++            firstGot = g;
++            firstExp = e;
++        }
++    }
++}
++)GLSL";
++
 +#ifndef EGL_PLATFORM_SURFACELESS_MESA
 +#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
 +#endif
@@ -390,11 +427,16 @@ index 0000000..8222505
 +        {
 +            Decode,
 +            Upload,
-+            Verify
++            Verify,
++            PatchRaw,
++            VerifyFull
 +        } kind = Kind::Decode;
-+        DecodeDesc decode{};      // Decode only (out/done/result live on the caller's stack)
++        DecodeDesc decode{};      // Decode / VerifyFull (vram+vramSize; out unused for the latter)
 +        GsGpuUploadChunk chunk{}; // Upload/Verify only
-+        bool *done = nullptr;     // Decode only
++        std::vector<uint8_t> raw; // PatchRaw only: authoritative CPU VRAM bytes
++        uint32_t rawOffset = 0;   // PatchRaw only: mirror byte offset
++        const uint8_t *drawPageMask = nullptr; // VerifyFull only (caller-owned, 512 bytes)
++        bool *done = nullptr;     // Decode / VerifyFull (caller-stack completion flags)
 +        bool *result = nullptr;
 +    };
 +    std::deque<Job> jobs;
@@ -429,6 +471,15 @@ index 0000000..8222505
 +    } upLocs, vfLocs;
 +    unsigned long xvChunks = 0, xvMismChunks = 0;
 +    unsigned long long xvWords = 0, xvMismWords = 0;
++    // Phase-1b: full-mirror compare (lazily created -- a second 4MB buffer only exists
++    // once PS2X_GS_GPU_MIRRORVERIFY asks for it).
++    GLuint refBuf = 0;
++    GLuint histBuf = 0;
++    GLuint fullProgram = 0;
++    GLint locFullWords = -1;
++    unsigned long mvRuns = 0;
++    unsigned long prPatches = 0;
++    unsigned long long prBytes = 0;
 +
 +    bool fail(const char *stage)
 +    {
@@ -457,7 +508,7 @@ index 0000000..8222505
 +                    return;
 +                j = std::move(jobs.front());
 +                jobs.pop_front();
-+                pendingBytes -= j.chunk.payload.size() * 4u;
++                pendingBytes -= j.chunk.payload.size() * 4u + j.raw.size();
 +            }
 +            switch (j.kind)
 +            {
@@ -479,6 +530,20 @@ index 0000000..8222505
 +            case Job::Kind::Verify:
 +                verifyOnThread(j.chunk);
 +                break;
++            case Job::Kind::PatchRaw:
++                patchRawOnThread(j.rawOffset, j.raw);
++                break;
++            case Job::Kind::VerifyFull:
++            {
++                const bool r = verifyFullOnThread(j.decode.vram, j.decode.vramSize,
++                                                  j.drawPageMask);
++                std::lock_guard<std::mutex> lk(mx);
++                if (j.result)
++                    *j.result = r;
++                if (j.done)
++                    *j.done = true;
++                break;
++            }
 +            }
 +            cvDone.notify_all(); // decode completion AND queue-space waiters
 +        }
@@ -491,7 +556,7 @@ index 0000000..8222505
 +                                              pendingBytes < kMaxPendingBytes); });
 +        if (stop)
 +            return;
-+        pendingBytes += j.chunk.payload.size() * 4u;
++        pendingBytes += j.chunk.payload.size() * 4u + j.raw.size();
 +        jobs.push_back(std::move(j));
 +        cv.notify_one();
 +    }
@@ -822,6 +887,153 @@ index 0000000..8222505
 +            std::fprintf(stderr, "[gsgpu] GL error 0x%x during xverify\n", err);
 +        }
 +    }
++
++    // Phase-1b: a straight authoritative-bytes copy into the mirror. No kernel, no
++    // swizzle -- the caller already resolved WHAT the CPU wrote by reading VRAM back, so
++    // this cannot diverge from the CPU by construction.
++    void patchRawOnThread(uint32_t offset, const std::vector<uint8_t> &bytes)
++    {
++        if (bytes.empty() || offset >= kVramBytes)
++            return;
++        const uint32_t len = std::min<uint32_t>(static_cast<uint32_t>(bytes.size()),
++                                                kVramBytes - offset);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, mirrorBuf);
++        gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(offset),
++                         static_cast<GLsizeiptr>(len), bytes.data());
++        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        ++prPatches;
++        prBytes += len;
++    }
++
++    bool ensureFullCompare()
++    {
++        if (fullProgram != 0u)
++            return true;
++        fullProgram = buildProgram(kFullCompareShader, "fullcompare");
++        if (!fullProgram)
++            return false;
++        locFullWords = gl.GetUniformLocation(fullProgram, "uWords");
++        gl.GenBuffers(1, &refBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, refBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, kVramBytes, nullptr, GL_DYNAMIC_DRAW);
++        gl.GenBuffers(1, &histBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, histBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, kVramPages * 4u, nullptr, GL_DYNAMIC_DRAW);
++        return gl.GetError() == 0u;
++    }
++
++    // Phase-1b: whole-mirror vs whole-CPU-VRAM compare. It runs after every previously
++    // posted mirror job (strict FIFO), so a divergence here is a REAL gap -- either a
++    // VRAM writer with no mirror path yet, or a kernel that wrote the wrong thing.
++    bool verifyFullOnThread(const uint8_t *vram, uint32_t vramSize, const uint8_t *drawPageMask)
++    {
++        if (!vram || vramSize < kVramBytes || !ensureFullCompare())
++            return false;
++        const uint32_t words = kVramBytes / 4u;
++        const uint32_t init[4] = {0u, 0xFFFFFFFFu, 0u, 0u};
++        const std::vector<uint32_t> zeroHist(kVramPages, 0u);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, refBuf);
++        gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, kVramBytes, vram);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuf);
++        gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 16, init);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, histBuf);
++        gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, kVramPages * 4u, zeroHist.data());
++
++        gl.UseProgram(fullProgram);
++        gl.Uniform1ui(locFullWords, words);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mirrorBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, refBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, resultBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, histBuf);
++        gl.DispatchCompute((words + 255u) / 256u, 1u, 1u);
++        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++
++        uint32_t res[4] = {0u, 0u, 0u, 0u};
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuf);
++        gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 16, res);
++        std::vector<uint32_t> hist(kVramPages, 0u);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, histBuf);
++        gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, kVramPages * 4u, hist.data());
++
++        ++mvRuns;
++        // Split the divergence: pages the CPU rasterizer wrote since the last verify are
++        // EXPECTED to be stale until phase 2 mirrors draws. Everything else is a real gap.
++        unsigned pagesBad = 0, pagesDraw = 0, pagesGap = 0;
++        unsigned long long wordsDraw = 0, wordsGap = 0;
++        for (uint32_t i = 0; i < kVramPages; ++i)
++        {
++            if (hist[i] == 0u)
++                continue;
++            ++pagesBad;
++            if (drawPageMask && drawPageMask[i] != 0u)
++            {
++                ++pagesDraw;
++                wordsDraw += hist[i];
++                hist[i] = 0u; // drop from the range report below: explained, not a gap
++            }
++            else
++            {
++                ++pagesGap;
++                wordsGap += hist[i];
++            }
++        }
++        std::fprintf(stderr,
++                     "[gsgpu:mverify] #%lu words=%u stale-words=%u stale-pages=%u/%u "
++                     "| drawn{pages=%u words=%llu} UNEXPLAINED{pages=%u words=%llu} "
++                     "(patches=%lu patch-bytes=%llu)\n",
++                     mvRuns, words, res[0], pagesBad, kVramPages,
++                     pagesDraw, wordsDraw, pagesGap, wordsGap, prPatches, prBytes);
++        if (wordsGap != 0u)
++        {
++            // Name the stale pages as RANGES (a page maps straight back to a guest
++            // fbp/tbp: page = block/32), so the report identifies the unmirrored writer.
++            // Ranges rather than a top-N list because a top-N is blind to exactly what
++            // matters: a handful of stale TEXTURE pages hiding behind saturated
++            // framebuffer pages would mean a real gap, not just un-mirrored draws.
++            // "+" marks a fully stale range (every word of every page differs).
++            char line[1024];
++            int n = std::snprintf(line, sizeof(line),
++                                  "[gsgpu:mverify]   first word=%u (byte 0x%06x, page %u) "
++                                  "mirror=%08x cpu=%08x | UNEXPLAINED pages:",
++                                  res[1], res[1] * 4u, res[1] >> 11u, res[2], res[3]);
++            constexpr uint32_t kWordsPerPage = 8192u / 4u;
++            unsigned printed = 0;
++            for (uint32_t i = 0; i < kVramPages && n > 0 && n < static_cast<int>(sizeof(line)) - 24;)
++            {
++                if (hist[i] == 0u)
++                {
++                    ++i;
++                    continue;
++                }
++                const uint32_t from = i;
++                bool full = true;
++                while (i < kVramPages && hist[i] != 0u)
++                {
++                    full = full && hist[i] == kWordsPerPage;
++                    ++i;
++                }
++                if (++printed > 16u)
++                {
++                    n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n), " ...");
++                    break;
++                }
++                if (from == i - 1u)
++                    n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n),
++                                       " %u%s", from, full ? "+" : "");
++                else
++                    n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n),
++                                       " %u-%u%s", from, i - 1u, full ? "+" : "");
++            }
++            std::fprintf(stderr, "%s\n", line);
++        }
++        const GLenum err = gl.GetError();
++        if (err != 0u && errorLogs < 8u)
++        {
++            ++errorLogs;
++            std::fprintf(stderr, "[gsgpu] GL error 0x%x during mverify\n", err);
++        }
++        return res[0] == 0u;
++    }
 +};
 +
 +GsGpuPresentDevice::GsGpuPresentDevice() : m_impl(std::make_unique<Impl>()) {}
@@ -898,4 +1110,34 @@ index 0000000..8222505
 +    j.kind = Impl::Job::Kind::Verify;
 +    j.chunk = std::move(chunk);
 +    m_impl->enqueue(std::move(j));
++}
++
++void GsGpuPresentDevice::MirrorPatchRaw(uint32_t byteOffset, std::vector<uint8_t> &&bytes)
++{
++    if (bytes.empty() || !EnsureInitialized())
++        return;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::PatchRaw;
++    j.rawOffset = byteOffset;
++    j.raw = std::move(bytes);
++    m_impl->enqueue(std::move(j));
++}
++
++void GsGpuPresentDevice::MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
++                                          const uint8_t *drawPageMask)
++{
++    if (!vram || !EnsureInitialized())
++        return;
++    Impl &d = *m_impl;
++    bool done = false, result = false;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::VerifyFull;
++    j.decode.vram = vram;
++    j.decode.vramSize = vramSize;
++    j.drawPageMask = drawPageMask;
++    j.done = &done;
++    j.result = &result;
++    d.enqueue(std::move(j));
++    std::unique_lock<std::mutex> lk(d.mx);
++    d.cvDone.wait(lk, [&] { return done || d.stop; });
 +}

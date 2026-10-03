@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..e00e647 100644
+index 9c39ae2..f35f74d 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,9 +10,19 @@
@@ -22,7 +22,7 @@ index 9c39ae2..e00e647 100644
  
  using namespace GSInternal;
  
-@@ -468,12 +478,187 @@ namespace
+@@ -468,12 +478,217 @@ namespace
      }
  }
  
@@ -84,10 +84,17 @@ index 9c39ae2..e00e647 100644
 +// ---- Phase 1 (cont.167): GPU VRAM mirror of host->local uploads ----
 +// PS2X_GS_GPU_XFER (default OFF): post every CT32 upload chunk to the device's
 +// persistent 4MB mirror SSBO (CT32 = 99.9997% of this game's transfers per the run171
-+// census; other formats + badDims descriptors are counted and skipped -- the mirror is
-+// stale there until their kernels land). PS2X_GS_GPU_XFERVERIFY=<N> (default OFF;
-+// implies XFER): every Nth chunk, read the CPU-authoritative post-upload values and
-+// have the device compare its mirror on-GPU ([gsgpu:xverify]); CPU stays authoritative.
++// census) via the swizzle kernel. PS2X_GS_GPU_XFERVERIFY=<N> (default OFF; implies
++// XFER): every Nth chunk, read the CPU-authoritative post-upload values and have the
++// device compare its mirror on-GPU ([gsgpu:xverify]); CPU stays authoritative.
++//
++// cont.168 (phase 1b, mirror COMPLETENESS): the swizzle kernel is no longer the only
++// mirror path. Every other VRAM writer -- non-CT32 uploads (the T4HL font atlas),
++// local->local blits, framebuffer clears, direct WriteVram -- now mirrors through
++// mirrorPatchRect(): read the authoritative bytes back out of CPU VRAM and copy them
++// verbatim into the mirror at the same offset. Slower per byte than a kernel, but these
++// paths are rare AND it is bit-exact by construction (nothing to get wrong), so the only
++// remaining mirror gap is the rasterizer's own pixel writes -- which is phase 2 itself.
 +static const bool s_gsGpuXfer = []
 +{ const char *e = std::getenv("PS2X_GS_GPU_XFER"); return e && e[0] && e[0] != '0'; }();
 +static const int s_gsGpuXferVerify = []
@@ -98,7 +105,30 @@ index 9c39ae2..e00e647 100644
 +    const int n = std::atoi(e);
 +    return n > 0 ? n : 16;
 +}();
-+static unsigned long g_gpuXferSkipped = 0;
++// PS2X_GS_GPU_MIRRORVERIFY=<ms> (default OFF; implies XFER): at most every <ms>
++// milliseconds, at a display flip (drained + locked = a coherent CPU VRAM state), compare
++// the ENTIRE 4MB mirror against CPU VRAM on the GPU and report which 8KB pages are stale
++// ([gsgpu:mverify]). This is the completeness gate for phase 1b and the shadow gate for
++// phase 2: once the rasterizer writes into the mirror, stale-words should go to 0.
++static const int s_gsGpuMirrorVerifyMs = []
++{
++    const char *e = std::getenv("PS2X_GS_GPU_MIRRORVERIFY");
++    if (!e || !e[0] || e[0] == '0')
++        return 0;
++    const int n = std::atoi(e);
++    return n > 0 ? n : 1000;
++}();
++static unsigned long g_gpuXferSkipped = 0; // uploads the swizzle kernel cannot take (raw-patched)
++// True when anything should be feeding the device's VRAM mirror this run.
++static inline bool gs2MirrorWanted()
++{
++    return s_gsGpuXfer || s_gsGpuXferVerify > 0 || s_gsGpuMirrorVerifyMs > 0;
++}
++namespace
++{
++    // Defined further down, beside the counters it prints (mirrorPatchRect's attribution).
++    void gs2PrintMirrorPatch();
++}
 +// PS2X_GS_FONTTRACE (env, default OFF): LOTR menu-text RE (cont.165). Traces (a) every transfer
 +// whose destination is the font-CLUT blocks 12288-12290 with its first payload words, and (b)
 +// every draw that samples a T4HL/T4HH texture with its CLUT at those blocks. Diagnostic for the
@@ -210,7 +240,7 @@ index 9c39ae2..e00e647 100644
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +716,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +746,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -227,7 +257,7 @@ index 9c39ae2..e00e647 100644
              break;
          }
      }
-@@ -541,14 +732,22 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,14 +762,22 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -250,7 +280,7 @@ index 9c39ae2..e00e647 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      ResetUnlocked();
  }
-@@ -561,10 +760,21 @@ void GSCpuBackend::ResetUnlocked()
+@@ -561,10 +790,21 @@ void GSCpuBackend::ResetUnlocked()
      m_transferState.direction = 3u;
      m_localToHostBuffer.clear();
      m_localToHostReadPos = 0u;
@@ -272,7 +302,7 @@ index 9c39ae2..e00e647 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +783,111 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,22 +813,134 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -365,6 +395,29 @@ index 9c39ae2..e00e647 100644
 +        m_presentCopyTickMs.store(now, std::memory_order_release);
 +        g_gs2LastFlipSnapMs.store(now, std::memory_order_release);
 +    }
++#if PS2X_HAS_GS_GPU_DEVICE
++    // cont.168 full-mirror shadow verify (PS2X_GS_GPU_MIRRORVERIFY=<ms>, default OFF).
++    // A drained flip is the one moment CPU VRAM is quiescent and coherent, so it is the
++    // only honest place to compare the whole mirror. The device runs it behind every
++    // pending mirror job and this call waits for the answer, so what it reports is a real
++    // gap: a VRAM writer with no mirror path (today: the rasterizer -- phase 2), never a
++    // race. Rate-limited because it moves 4MB to the GPU per run.
++    if (s_gsGpuMirrorVerifyMs > 0 && m_vram && m_vramSize != 0u)
++    {
++        static uint64_t s_lastMv = 0;
++        const uint64_t nowMv = gs2NowMs();
++        if (nowMv - s_lastMv >= static_cast<uint64_t>(s_gsGpuMirrorVerifyMs))
++        {
++            s_lastMv = nowMv;
++            std::lock_guard<std::mutex> lock(m_mutex);
++            mirrorFlushPokes(); // everything written so far must be IN the mirror first
++            if (GsGpuPresentDevice *dev = gs2GpuDevice())
++                dev->MirrorVerifyFull(m_vram, m_vramSize, m_drawPages.data());
++            m_drawPages.fill(0u); // next window starts with no draws to excuse
++            gs2PrintMirrorPatch(); // which writer fed the mirror since the last report
++        }
++    }
++#endif
 +    if (g_gs2FontTrace)
 +    {
 +        static unsigned long s_nf = 0;
@@ -389,7 +442,7 @@ index 9c39ae2..e00e647 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -602,6 +901,9 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+@@ -602,8 +954,62 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
  
  void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
  {
@@ -398,11 +451,275 @@ index 9c39ae2..e00e647 100644
 +    drainQueue();
      std::lock_guard<std::mutex> lock(m_mutex);
      WriteVramUnlocked(psm, base, bw, x, y, value);
++#if PS2X_HAS_GS_GPU_DEVICE
++    // Host-side pokes (LOTR's movie frame blit, the CLUT guard, font diagnostics) mutate
++    // VRAM outside every transfer path -- mirror them too, or the mirror drifts. They
++    // come one pixel at a time and by the hundred thousand, so accumulate a dirty box
++    // and mirror it as a single rect (see mirrorFlushPokes).
++    if (gs2MirrorWanted())
++    {
++        size_t slot = kPokeBoxes;
++        size_t freeSlot = kPokeBoxes;
++        for (size_t i = 0; i < kPokeBoxes; ++i)
++        {
++            if (!m_pokeBox[i].used)
++            {
++                if (freeSlot == kPokeBoxes)
++                    freeSlot = i;
++                continue;
++            }
++            if (m_pokeBox[i].psm == psm && m_pokeBox[i].bp == base && m_pokeBox[i].bw == bw)
++            {
++                slot = i;
++                break;
++            }
++        }
++        if (slot == kPokeBoxes)
++        {
++            // No live box for this destination: take a free slot, or evict slot 0 (all
++            // slots busy means more than kPokeBoxes destinations are interleaving, which
++            // no observed path does -- evicting is correct, just less efficient).
++            slot = freeSlot;
++            if (slot == kPokeBoxes)
++            {
++                mirrorFlushPokeSlot(0);
++                slot = 0;
++            }
++            m_pokeBox[slot] = PokeBox{psm, base, bw, x, y, x, y, true};
++        }
++        else
++        {
++            PokeBox &b = m_pokeBox[slot];
++            b.x0 = std::min(b.x0, x);
++            b.y0 = std::min(b.y0, y);
++            b.x1 = std::max(b.x1, x);
++            b.y1 = std::max(b.y1, y);
++        }
++        // Bound the box so one stray far-away poke cannot turn the next flush into a
++        // whole-VRAM copy. A movie strip (128x448 = 57k px) stays well under this.
++        const PokeBox &b = m_pokeBox[slot];
++        if (static_cast<uint64_t>(b.x1 - b.x0 + 1u) * (b.y1 - b.y0 + 1u) > 512ull * 1024ull)
++            mirrorFlushPokeSlot(slot);
++    }
++#endif
  }
-@@ -613,8 +915,26 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+ 
+ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+@@ -613,8 +1019,237 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
      m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
  }
  
++#if PS2X_HAS_GS_GPU_DEVICE
++namespace
++{
++    // Page extent in PIXELS per psm -- the same table PixelStorageTraits<>::PageExtent()
++    // encodes (ps2_gs_memory.h). Undefined psm codes fall through to the CT32 layout,
++    // matching the psm-handler table's undefined-slot fallback (PCSX2 GSLocalMemory.cpp).
++    void gs2PageExtent(uint32_t psm, uint32_t &pw, uint32_t &ph)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S:
++            pw = 64u;
++            ph = 64u;
++            break;
++        case GS_PSM_T8:
++            pw = 128u;
++            ph = 64u;
++            break;
++        case GS_PSM_T4:
++            pw = 128u;
++            ph = 128u;
++            break;
++        default:
++            pw = 64u;
++            ph = 32u;
++            break;
++        }
++    }
++
++    // Every psm whose page layout is PageTableC32 with a 32-bit pixel stride. For all of
++    // these, pixel (x,y) resolves to the SAME word address as CT32 at (x,y) -- the
++    // sub-word formats (CT24 keeps the top byte, T8H/T4HL/T4HH occupy bit fields of it)
++    // differ only in which bits of that word they touch. So reading the finished word
++    // back as CT32 and re-writing it as CT32 reproduces the CPU result exactly, which
++    // lets the existing CT32 swizzle kernel mirror all of them.
++    bool gs2IsC32Layout(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT32:
++        case GS_PSM_CT24:
++        case GS_PSM_Z32:
++        case GS_PSM_Z24:
++        case GS_PSM_T8H:
++        case GS_PSM_T4HL:
++        case GS_PSM_T4HH:
++            return true;
++        default:
++            // Undefined psm codes decode as CT32 (the psm-handler table's fallback), and
++            // that is exactly the C32 layout.
++            return psm != GS_PSM_CT16 && psm != GS_PSM_CT16S && psm != GS_PSM_Z16 &&
++                   psm != GS_PSM_Z16S && psm != GS_PSM_T8 && psm != GS_PSM_T4;
++        }
++    }
++
++    // mirrorPatchRect attribution ([gsgpu:mpatch]): which VRAM writer is feeding the
++    // mirror, and at what cost. Written only from the GS worker / drained callers.
++    struct Gs2MirrorPatchStats
++    {
++        unsigned long n = 0;
++        unsigned long long words = 0;
++        unsigned long rawN = 0;
++        unsigned long long rawBytes = 0;
++    };
++    Gs2MirrorPatchStats g_mpStats[4]; // indexed by GSCpuBackend::MirrorPatchSource
++    const char *const kMpSourceName[4] = {"upload", "l2l", "clear", "poke"};
++
++    void gs2PrintMirrorPatch()
++    {
++        std::fprintf(stderr, "[gsgpu:mpatch]");
++        for (int i = 0; i < 4; ++i)
++            std::fprintf(stderr, " %s{n=%lu kernel-words=%llu raw=%lu raw-bytes=%llu}",
++                         kMpSourceName[i], g_mpStats[i].n, g_mpStats[i].words,
++                         g_mpStats[i].rawN, g_mpStats[i].rawBytes);
++        std::fprintf(stderr, "\n");
++    }
++} // namespace
++
++// Mirror the authoritative CPU bytes for a just-written rect (cont.168, phase 1b).
++//
++// Two routes. For the C32-layout psm family the destination words are read back as CT32
++// and pushed through the phase-1 swizzle KERNEL -- exact, and it moves 4 bytes per pixel
++// actually written. Everything else falls back to a whole-8KB-PAGE raw copy: PageId() is
++// monotonic in x and y, so the rect's pages span [page(x0,y0), page(x1,y1)], and a pixel
++// address can spill up to two pages past its own page when bp is not page-aligned
++// (Address() adds (bp%32 + BlockId)*PixelsPerBlock, at most 63/32 of a page) -- hence the
++// +2 page tail. Over-copying is harmless (every byte copied is authoritative), but at 3
++// pages minimum it is far too coarse for small rects, which is why the kernel route
++// exists: run175a measured 266k page-copies/s (6.5 GB/s) with raw as the only route.
++void GSCpuBackend::markDrawPages(uint32_t psm, uint32_t bp, uint32_t bw,
++                                 uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++{
++    if (x1 < x0 || y1 < y0)
++        return;
++    uint32_t pw = 64u, ph = 32u;
++    gs2PageExtent(psm & 0x3Fu, pw, ph);
++    const uint32_t stride = (std::max<uint32_t>(bw, 1u) * 64u) / pw;
++    const uint64_t basePage = bp / 32u;
++    const uint64_t first = basePage + static_cast<uint64_t>(y0 / ph) * stride + (x0 / pw);
++    // +2: same intra-page block spill as mirrorPatchRect (a non-page-aligned bp pushes
++    // pixel addresses up to two pages past their own page).
++    const uint64_t last = basePage + static_cast<uint64_t>(y1 / ph) * stride + (x1 / pw) + 2u;
++    for (uint64_t p = first; p <= last; ++p)
++        m_drawPages[static_cast<size_t>(p % m_drawPages.size())] = 1u; // guest pages wrap at 4MB
++}
++
++void GSCpuBackend::mirrorFlushPokeSlot(size_t i)
++{
++    if (i >= kPokeBoxes || !m_pokeBox[i].used)
++        return;
++    const PokeBox b = m_pokeBox[i];
++    m_pokeBox[i].used = false; // cleared FIRST: mirrorPatchRect(Poke) must not re-enter
++    mirrorPatchRect(b.psm, b.bp, b.bw, b.x0, b.y0, b.x1, b.y1, MirrorPatchSource::Poke);
++}
++
++void GSCpuBackend::mirrorFlushPokes()
++{
++    for (size_t i = 0; i < kPokeBoxes; ++i)
++        mirrorFlushPokeSlot(i);
++}
++
++void GSCpuBackend::mirrorPatchRect(uint32_t psm, uint32_t bp, uint32_t bw,
++                                   uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
++                                   MirrorPatchSource src)
++{
++    GsGpuPresentDevice *dev = gs2GpuDevice();
++    if (!dev || !m_vram || m_vramSize == 0u || x1 < x0 || y1 < y0)
++        return;
++    // Device FIFO order must equal VRAM write order: any other mirror op has to land
++    // behind the pokes that preceded it.
++    if (src != MirrorPatchSource::Poke)
++        mirrorFlushPokes();
++    auto &st = g_mpStats[static_cast<int>(src) & 3];
++    ++st.n;
++
++    const uint32_t rectW = x1 - x0 + 1u;
++    const uint32_t rectH = y1 - y0 + 1u;
++    const uint64_t pixels = static_cast<uint64_t>(rectW) * rectH;
++    // Above this the page copy is the cheaper transport (a full-screen clear touches
++    // ~140 pages either way, and the per-pixel readback is pure overhead).
++    constexpr uint64_t kKernelPixelCap = 64u * 1024u;
++    if (gs2IsC32Layout(psm & 0x3Fu) && pixels != 0u && pixels <= kKernelPixelCap)
++    {
++        GsGpuUploadChunk c;
++        c.dbp = bp;
++        c.dbw = std::max<uint32_t>(bw, 1u);
++        c.dsax = x0;
++        c.dsay = y0;
++        c.rrw = rectW;
++        c.startPixel = 0u;
++        c.payload.resize(static_cast<size_t>(pixels));
++        for (uint64_t i = 0; i < pixels; ++i)
++            c.payload[static_cast<size_t>(i)] =
++                ReadVramUnlocked(GS_PSM_CT32, bp, c.dbw,
++                                 x0 + static_cast<uint32_t>(i % rectW),
++                                 y0 + static_cast<uint32_t>(i / rectW));
++        st.words += pixels;
++        dev->MirrorUpload(std::move(c));
++        return;
++    }
++
++    uint32_t pw = 64u, ph = 32u;
++    gs2PageExtent(psm & 0x3Fu, pw, ph);
++    const uint32_t stride = (std::max<uint32_t>(bw, 1u) * 64u) / pw;
++    const uint64_t basePage = bp / 32u;
++    const uint64_t firstPage = basePage + static_cast<uint64_t>(y0 / ph) * stride + (x0 / pw);
++    const uint64_t lastPage = basePage + static_cast<uint64_t>(y1 / ph) * stride + (x1 / pw) + 2u;
++
++    const uint64_t start = firstPage * 8192ull;
++    const uint64_t end = (lastPage + 1ull) * 8192ull;
++    if (start >= end)
++        return;
++    // Guest addresses wrap at 4MB (PixelStorageTraits<>::Write masks with MEMORY_SIZE-1),
++    // so a range running off the top continues at 0. Patch it as two spans.
++    auto patch = [&](uint64_t from, uint64_t to)
++    {
++        if (from >= to)
++            return;
++        const uint32_t off = static_cast<uint32_t>(from);
++        const uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(to, m_vramSize) - from);
++        if (off >= m_vramSize || len == 0u)
++            return;
++        ++st.rawN;
++        st.rawBytes += len;
++        dev->MirrorPatchRaw(off, std::vector<uint8_t>(m_vram + off, m_vram + off + len));
++    };
++    if (end <= m_vramSize)
++    {
++        patch(start, end);
++        return;
++    }
++    if (start >= m_vramSize || (end - start) >= m_vramSize)
++    {
++        // Wrapped past itself (or started out of range): the whole mirror is the only
++        // conservative answer. Rare enough to be worth counting if it ever shows up.
++        static unsigned long s_whole = 0;
++        if ((++s_whole % 1024u) == 1u)
++            std::fprintf(stderr, "[gsgpu:patch] whole-VRAM patch #%lu (psm=0x%x bp=%u bw=%u "
++                                 "rect=%u,%u..%u,%u)\n",
++                         s_whole, psm, bp, bw, x0, y0, x1, y1);
++        patch(0u, m_vramSize);
++        return;
++    }
++    patch(start, m_vramSize);
++    patch(0u, end - m_vramSize);
++}
++#endif
++
 +void GSCpuBackend::SnapshotVramNoDrain(std::vector<uint8_t> &out) const
 +{
 +    // Presentation-path snapshot: consistent (worker holds m_mutex per item) but not
@@ -426,7 +743,7 @@ index 9c39ae2..e00e647 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || m_vramSize == 0u)
      {
-@@ -627,6 +947,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+@@ -627,6 +1262,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
  
  GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
  {
@@ -434,7 +751,7 @@ index 9c39ae2..e00e647 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      GSTransferSnapshot result = m_transferState;
      result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
-@@ -635,10 +956,424 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+@@ -635,10 +1271,424 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
      return result;
  }
  
@@ -859,7 +1176,7 @@ index 9c39ae2..e00e647 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,6 +1480,59 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,6 +1795,96 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -877,6 +1194,43 @@ index 9c39ae2..e00e647 100644
 +    m_draw.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
 +    m_draw.fbw = std::max<u32>(ctx.frame.fbw, 1u);
 +    m_draw.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++
++#if PS2X_HAS_GS_GPU_DEVICE
++    // cont.168: record the VRAM pages this draw could write, so the full-mirror verify can
++    // report stale pages the RASTERIZER cannot explain. Without it "stale = draw output"
++    // is only an inference; with it, a stale page outside this set is proof of a real
++    // mirror gap. Scissor-clipped primitive bbox, so it is conservative in area but never
++    // misses a written page. Only armed with PS2X_GS_GPU_MIRRORVERIFY.
++    if (s_gsGpuMirrorVerifyMs > 0 && batch.vertexCount != 0u)
++    {
++        const int ofx = ctx.xyoffset.ofx >> 4;
++        const int ofy = ctx.xyoffset.ofy >> 4;
++        int minX = INT32_MAX, minY = INT32_MAX, maxX = INT32_MIN, maxY = INT32_MIN;
++        for (uint8_t i = 0; i < batch.vertexCount && i < batch.vertices.size(); ++i)
++        {
++            const int vx = static_cast<int>(batch.vertices[i].x) - ofx;
++            const int vy = static_cast<int>(batch.vertices[i].y) - ofy;
++            minX = std::min(minX, vx);
++            minY = std::min(minY, vy);
++            maxX = std::max(maxX, vx);
++            maxY = std::max(maxY, vy);
++        }
++        minX = std::max(minX, static_cast<int>(ctx.scissor.x0));
++        minY = std::max(minY, static_cast<int>(ctx.scissor.y0));
++        maxX = std::min(maxX, static_cast<int>(ctx.scissor.x1));
++        maxY = std::min(maxY, static_cast<int>(ctx.scissor.y1));
++        if (minX <= maxX && minY <= maxY)
++        {
++            markDrawPages(ctx.frame.psm, m_draw.fbp, m_draw.fbw,
++                          static_cast<uint32_t>(minX), static_cast<uint32_t>(minY),
++                          static_cast<uint32_t>(maxX), static_cast<uint32_t>(maxY));
++            if (!ctx.zbuf.zmask)
++                markDrawPages(ctx.zbuf.psm, m_draw.zbp, m_draw.fbw,
++                              static_cast<uint32_t>(minX), static_cast<uint32_t>(minY),
++                              static_cast<uint32_t>(maxX), static_cast<uint32_t>(maxY));
++        }
++    }
++#endif
 +
 +    // PS2X_GS_FONTTRACE: evaluate the sampling chain in-situ for a font glyph draw -- the raw
 +    // palette index read from the atlas at the glyph's UV midpoint, the final combined texel
@@ -919,7 +1273,7 @@ index 9c39ae2..e00e647 100644
      switch (state.prim.type)
      {
      case GS_PRIM_SPRITE:
-@@ -762,15 +1550,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -762,15 +1902,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
      case GS_PRIM_POINT:
      {
          const GSVertex &v = batch.vertices[0];
@@ -947,7 +1301,7 @@ index 9c39ae2..e00e647 100644
  }
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
-@@ -792,11 +1589,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +1941,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -962,7 +1316,7 @@ index 9c39ae2..e00e647 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -817,7 +1613,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -817,7 +1965,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      u32 fbrgba = 0;
      if (frmw)
      {
@@ -971,7 +1325,7 @@ index 9c39ae2..e00e647 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +1643,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +1995,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -985,7 +1339,7 @@ index 9c39ae2..e00e647 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +1726,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +2078,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -1019,7 +1373,7 @@ index 9c39ae2..e00e647 100644
      }
  }
  
-@@ -947,15 +1762,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +2114,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -1068,7 +1422,7 @@ index 9c39ae2..e00e647 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,26 +1813,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,26 +2165,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -1130,7 +1484,7 @@ index 9c39ae2..e00e647 100644
      }
      else
      {
-@@ -1002,7 +1872,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +2224,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -1139,7 +1493,7 @@ index 9c39ae2..e00e647 100644
  
          switch (tex.psm)
          {
-@@ -1024,7 +1894,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +2246,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -1154,7 +1508,7 @@ index 9c39ae2..e00e647 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +2101,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,6 +2453,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -1195,7 +1549,7 @@ index 9c39ae2..e00e647 100644
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +2191,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +2543,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -1204,7 +1558,7 @@ index 9c39ae2..e00e647 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +2209,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +2561,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -1237,7 +1591,7 @@ index 9c39ae2..e00e647 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1376,7 +2312,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +2664,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -1258,7 +1612,7 @@ index 9c39ae2..e00e647 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +2334,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +2686,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -1280,7 +1634,7 @@ index 9c39ae2..e00e647 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,7 +2357,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,7 +2709,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -1303,7 +1657,7 @@ index 9c39ae2..e00e647 100644
      if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
          return;
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-@@ -1406,6 +2385,118 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +2737,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -1377,19 +1731,28 @@ index 9c39ae2..e00e647 100644
 +    // loop writes exactly min(floor(bytes/4), remaining) pixels for CT32 -- partial
 +    // word tails are dropped, and payload past totalPixels is ignored -- so mirrorCount
 +    // reproduces it.
-+    const bool gpuMirrorWanted = s_gsGpuXfer || s_gsGpuXferVerify > 0;
++    const bool gpuMirrorWanted = gs2MirrorWanted();
 +    uint32_t mirrorStart = 0, mirrorCount = 0;
 +    bool mirrorOn = false;
++    // cont.168: a chunk the swizzle kernel cannot take is no longer dropped -- it is
++    // raw-patched from CPU VRAM after the loop, so record where the cursor started.
++    uint32_t rawStartPixel = 0;
++    bool rawMirror = false;
 +    if (gpuMirrorWanted)
 +    {
++        mirrorFlushPokes(); // this upload must land behind any pending poke box
 +        mirrorOn = dpsm == GS_PSM_CT32 &&
 +                   m_transfer.trxreg.rrw <= 1024u && m_transfer.trxreg.rrh <= 1024u;
 +        if (!mirrorOn)
 +        {
-+            // Unsupported format or a badDims descriptor (malformed rects can wrap two
-+            // pixels onto one masked address, where GPU write order != CPU serial order).
++            // A format with no kernel (the T4HL font atlas is this game's only one) or a
++            // badDims descriptor (malformed rects can wrap two pixels onto one masked
++            // address, where GPU write order != CPU serial order). Both mirror correctly
++            // through the raw path, which copies whatever the CPU actually wrote.
++            rawMirror = true;
++            rawStartPixel = m_transferState.copiedPixels;
 +            if ((++g_gpuXferSkipped % 4096u) == 1u)
-+                std::fprintf(stderr, "[gsgpu:xfer] skipped=%lu (dpsm=0x%x %ux%u)\n",
++                std::fprintf(stderr, "[gsgpu:xfer] no-kernel=%lu -> raw patch (dpsm=0x%x %ux%u)\n",
 +                             g_gpuXferSkipped, dpsm, m_transfer.trxreg.rrw, m_transfer.trxreg.rrh);
 +        }
 +        else
@@ -1417,12 +1780,36 @@ index 9c39ae2..e00e647 100644
 +            }
 +        }
 +    }
++    // Raw-patch on EVERY exit path: the write loop returns early on a short payload tail
++    // (`sizeBytes - offset < bpp`), and a chunk that wrote 100 pixels then returned still
++    // has to reach the mirror. A destructor is the only thing those returns cannot skip.
++    struct RawMirrorGuard
++    {
++        GSCpuBackend *self;
++        const GSTransferSnapshot *state;
++        bool armed;
++        uint32_t psm, bp, bw, dsax, dsay, rrw, startPixel;
++        ~RawMirrorGuard()
++        {
++            if (!armed || rrw == 0u)
++                return;
++            const uint32_t endPixel = state->copiedPixels;
++            if (endPixel <= startPixel)
++                return; // nothing was applied
++            // Conservative: whole rows [startPixel/rrw .. (endPixel-1)/rrw], full width.
++            self->mirrorPatchRect(psm, bp, bw,
++                                  dsax, dsay + startPixel / rrw,
++                                  dsax + rrw - 1u, dsay + (endPixel - 1u) / rrw,
++                                  MirrorPatchSource::Upload);
++        }
++    } rawGuard{this, &m_transferState, rawMirror, dpsm, dbp, dbw,
++               dsax, m_transfer.trxpos.dsay, rrw, rawStartPixel};
 +#endif
 +
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1496,6 +2587,39 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1496,6 +2972,39 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
              return;
          }
      }
@@ -1462,7 +1849,30 @@ index 9c39ae2..e00e647 100644
  }
  
  void GSCpuBackend::PerformLocalToLocalTransfer()
-@@ -1610,6 +2734,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1536,6 +3045,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+ 
+     m_transferState.copiedPixels = total;
+     m_transferState.direction = 3u;
++
++#if PS2X_HAS_GS_GPU_DEVICE
++    // cont.168: a local->local blit reads and writes VRAM entirely inside the GS, so the
++    // upload kernel never sees it. Mirror the destination rect from the authoritative
++    // bytes the loop just produced. (The dir flags only mirror the walk order within the
++    // same rect, so the rect bounds are direction-independent.)
++    if (gs2MirrorWanted())
++        mirrorPatchRect(m_transfer.bitbltbuf.dpsm,
++                        m_transfer.bitbltbuf.dbp,
++                        std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u),
++                        m_transfer.trxpos.dsax,
++                        m_transfer.trxpos.dsay,
++                        m_transfer.trxpos.dsax + rrw - 1u,
++                        m_transfer.trxpos.dsay + rrh - 1u,
++                        MirrorPatchSource::LocalToLocal);
++#endif
+ }
+ 
+ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +3135,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -1470,7 +1880,7 @@ index 9c39ae2..e00e647 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,6 +2747,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,6 +3148,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -1480,7 +1890,27 @@ index 9c39ae2..e00e647 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || context.frame.fbw == 0u)
          return false;
-@@ -1679,6 +2807,72 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1656,6 +3185,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+                 }
+                 WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
+             }
++#if PS2X_HAS_GS_GPU_DEVICE
++        if (gs2MirrorWanted())
++            mirrorPatchRect(context.frame.psm, fbp, fbw, x0, y0, x1, y1, MirrorPatchSource::Clear);
++#endif
+         return true;
+     }
+ 
+@@ -1674,11 +3207,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+                 }
+                 WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
+             }
++#if PS2X_HAS_GS_GPU_DEVICE
++        if (gs2MirrorWanted())
++            mirrorPatchRect(context.frame.psm, fbp, fbw, x0, y0, x1, y1, MirrorPatchSource::Clear);
++#endif
+         return true;
+     }
      return false;
  }
  
@@ -1553,7 +1983,7 @@ index 9c39ae2..e00e647 100644
  bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         uint32_t width,
                                         uint32_t height,
-@@ -1688,6 +2882,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1688,6 +3291,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         bool frameBaseIsPages,
                                         uint32_t sourceOriginX,
                                         uint32_t sourceOriginY) const
@@ -1600,7 +2030,7 @@ index 9c39ae2..e00e647 100644
  {
      if (!m_vram || m_vramSize == 0u)
          return false;
-@@ -1759,16 +2993,62 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +3402,62 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -1667,7 +2097,7 @@ index 9c39ae2..e00e647 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +3092,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +3501,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;

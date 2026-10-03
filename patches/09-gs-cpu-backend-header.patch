@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..13c39d4 100644
+index 71e8032..9cc7280 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 @@ -3,14 +3,22 @@
@@ -39,12 +39,59 @@ index 71e8032..13c39d4 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +51,38 @@ private:
+@@ -36,18 +51,85 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 +    void BeginTransferUnlocked(const GSTransferCommand &command);
 +    void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
++    // cont.168 (GPU-backend arc phase 1b, mirror completeness): after a VRAM-mutating op
++    // the swizzle upload kernel does not cover (non-CT32 upload, local->local blit, clear,
++    // direct WriteVram), copy the rect's authoritative bytes straight from CPU VRAM into
++    // the device's mirror. Page-granular and deliberately conservative -- over-copying
++    // authoritative bytes cannot be wrong. Call with m_vram stable (locked/drained).
++    // Declared unconditionally (one class definition for every TU); only DEFINED when the
++    // desktop GPU device is compiled in (PS2X_HAS_GS_GPU_DEVICE, a ps2_runtime-private
++    // definition), and only called from inside that same guard.
++    enum class MirrorPatchSource : uint8_t
++    {
++        Upload = 0,      // a host->local chunk the CT32 swizzle kernel could not take
++        LocalToLocal = 1, // a GS-internal blit
++        Clear = 2,       // ClearFramebuffer
++        Poke = 3,        // direct WriteVram (host-side diagnostics)
++    };
++    void mirrorPatchRect(uint32_t psm, uint32_t bp, uint32_t bw,
++                         uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
++                         MirrorPatchSource src);
++    // Direct WriteVram pokes arrive ONE PIXEL AT A TIME and in bulk -- LOTR's movie HLE
++    // blits each decoded FMV frame as ~229k single-pixel pokes (run176a measured 23M in
++    // 100s). Mirroring each one individually is hopeless, so pokes accumulate into dirty
++    // bounding boxes and mirror as whole rects.
++    //
++    // SEVERAL boxes, not one: that blit walks four column strips per row
++    // (bp = 0x3003 + (x/128)*0x400), so the destination key changes every 128 pixels and a
++    // single box would flush 1792x per frame (measured, run177a). One slot per live key
++    // lets all four strips accumulate across the whole frame and flush once each.
++    // Flushed when a slot is evicted, when a box gets large, before any other mirror op
++    // (device FIFO order must equal VRAM write order), and at every drained boundary.
++    // Call with m_mutex held.
++    struct PokeBox
++    {
++        uint32_t psm = 0, bp = 0, bw = 0;
++        uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++        bool used = false;
++    };
++    static constexpr size_t kPokeBoxes = 8;
++    void mirrorFlushPokes();            // all slots
++    void mirrorFlushPokeSlot(size_t i); // one slot
++    PokeBox m_pokeBox[kPokeBoxes]{};
++    // Pages the CPU rasterizer could have written since the last full-mirror verify (one
++    // byte per 8KB GS page). The verify subtracts these, so what it reports as stale is
++    // divergence the rasterizer does NOT explain -- i.e. a real mirror gap. Armed only
++    // under PS2X_GS_GPU_MIRRORVERIFY; touched under m_mutex (DrawPrimitive runs there).
++    void markDrawPages(uint32_t psm, uint32_t bp, uint32_t bw,
++                       uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
++    std::array<uint8_t, 512> m_drawPages{};
 +
 +    // Off-thread rasterization (PS2X_GS_THREAD, default OFF): draw/transfer/upload
 +    // commands enqueue to a worker; read-side entry points drain first. All queue items
@@ -79,7 +126,7 @@ index 71e8032..13c39d4 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +92,36 @@ private:
+@@ -57,9 +139,36 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -118,7 +165,7 @@ index 71e8032..13c39d4 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +129,52 @@ private:
+@@ -67,9 +176,52 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
