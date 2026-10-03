@@ -17,6 +17,8 @@ override, and cite the file/function you mirrored.
     `pcsx2/Vif*`, `pcsx2/Dmac*`, `pcsx2/SPU2/`, `pcsx2/Sif*`, `pcsx2/CDVD/`).
   - Fetch raw files for grepping locally: `curl -sfL
     https://raw.githubusercontent.com/PCSX2/pcsx2/master/pcsx2/<path> -o <file>`.
+- **RetroReversing — PS2** — curated index of PS2 reverse-engineering resources (SDK/libpad/libgs
+  internals, homebrew toolchains, decompilation tooling, hardware docs): https://www.retroreversing.com/ps2
 
 > Ground-truth ranking still applies (see [operating-manual.md](operating-manual.md) §4): these
 > references are a strong *hypothesis* for what the hardware does — verify the load-bearing claim

@@ -47,6 +47,14 @@ and the disasm, then gdb, before asserting or acting.
   override; `--skip-regen` without it forced the rebuild).
 - **One frontier per cycle.** Fix the narrowest thing on the current execution frontier, rebuild,
   advance. Never mass-rewrite `functions.csv` or pile on speculative overrides.
+- **Flags = environment variables, with sensible defaults.** Every override toggle / experiment knob
+  must be controlled by an env var (`std::getenv("LOTR_X")`, cached in a `static const`; use an
+  `envi("LOTR_X", <default>)` helper for ints), with a **default that keeps the build's behavior
+  correct** (gate experiments/diagnostics OFF by default). Do **not** add new `#define LOTR_* 0/1`
+  compile-time flags (the legacy `LOTR_SUPDRIVE`/`LOTR_MENUDRIVE`/`LOTR_HANDOFF_PROBE` style) — env
+  vars are toggleable at runtime so one binary tests many configs without a rebuild, and a sensible
+  default means the shipped behavior is right without editing+rebuilding to flip a flag. Document the
+  var name + default inline where you read it.
 - **Report long builds as a %.** Use [`scripts/build_progress.sh <game_dir>`](../scripts/build_progress.sh)
   — it shows done/phase/≈% + the cc1plus monster/OOM warning that flags an over-bound unit.
 - **Background builds, `timeout` runs.** Builds take many minutes (launch in background, poll the
