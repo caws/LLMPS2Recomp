@@ -59,3 +59,9 @@ generated `tmp/generated/*.cpp` before asserting or acting.
   `gamefiles/MODULES/*.IRX`.
 - "Where is it / what runs" → [debugging.md](debugging.md): log triage, gdb-under-parent,
   one-shot probes, dispatch-logging loop maps.
+- **Validate analysis with gdb — routinely, not as a last resort.** A reading of the disasm/generated
+  C++ is a hypothesis; confirm it live (breakpoint → read real args/registers/guest memory, or watch the
+  address it should write). For "who writes X / what sets screen-ID / who enqueues" — where address-xref
+  is blind to helper-based (pointer-arg) writes — use a **gdb hardware watchpoint** (host = `rdram +
+  (guest & 0x01FFFFFF)`); a watchpoint that never fires is itself proof the write never happens. See
+  operating-manual §4.

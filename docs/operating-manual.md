@@ -125,6 +125,21 @@ probe's printed value — is a **hypothesis to verify against ground truth, not 
   - Reach for it whenever a fix's effect is ambiguous from the log alone, or an investigation's
     conclusion rests on what a thread is *really* executing. `gdb`/`fprintf` perturb timing, so for a
     timing-sensitive race, corroborate with a non-gdb run too.
+  - **Use gdb to VALIDATE your analysis of the code — both the disassembly and the generated C++ — not
+    just to debug.** A reading of disasm/generated code is a hypothesis about what the code *does*; gdb
+    is how you confirm it against live execution. Before building on any non-trivial claim ("this fn sets
+    screen-ID", "this loop iterates table-C", "this callback fires every frame", "a1 is the current
+    screen"), check it under gdb: breakpoint the function and read the real args/registers/guest memory,
+    or watch the address it supposedly writes. Make gdb a routine step in investigation, not a fallback.
+  - **gdb also resolves what static xref structurally CANNOT.** Address-xref has blind spots: a value
+    written through a **helper that receives a pointer argument** (not a direct base-load) is invisible
+    to it; a function being a registered call target says nothing about whether it's *reached at
+    runtime*; "dispatchable" hooks miss same-unit direct calls. For "who writes X / what sets screen-ID /
+    who enqueues the first op", **set a hardware watchpoint on the target guest address** (host addr =
+    `rdram + (guest & 0x01FFFFFF)`; break once on a per-frame fn to capture `rdram`, then `watch`). It
+    catches the real writer's backtrace regardless of how the address was computed — or, if it never
+    fires across a full run, that is itself ground-truth proof the write never happens (gated off
+    upstream). A backtrace at the watchpoint/breakpoint is often worth more than hours of xref.
 
 ## 5. What progress is (and isn't)
 
