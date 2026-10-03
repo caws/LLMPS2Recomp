@@ -43,7 +43,8 @@ Boot reaches a point and stops — a crash, a spin, a silent hang, a missing-fun
 4. **Experiment** — the narrowest change that tests the hypothesis: a one-shot probe override, a
    CSV correction, a targeted HLE. **Bump `BUILD_TAG`** so you can prove the running binary is current.
 5. **Verify** — §4. Confirm the tag in `run.txt`, confirm the frontier *advanced* (or the hypothesis
-   was falsified). A passing build is not a passing result.
+   was falsified) — and when the effect is at all ambiguous, **run under gdb to validate against live
+   state** (the thread cleared the bad spot), not just the log. A passing build is not a passing result.
 6. **Record** — append to the game repo's `docs/progress.md`: what the frontier was, what you tried,
    what the evidence showed, what's next. Then repeat.
 
@@ -97,6 +98,24 @@ probe's printed value — is a **hypothesis to verify against ground truth, not 
 - **Identify before you fix.** A single string, constant, or address often unlocks a
   misidentification (e.g. a function's real purpose). Confirm what a function *is* (its args, what it
   reads/writes, what calls it) before assuming its role from a name or a note.
+- **Validate fixes and investigations by running under gdb.** The run log and a screenshot tell you
+  *that* something changed; **gdb-under-parent** ([debugging.md](debugging.md) §2) tells you *what the
+  guest is actually doing* — the live, authoritative check. Use it to confirm an investigation's model
+  and to validate a fix, not just to debug hangs:
+  - **Confirm a hypothesis on live state.** Backtrace the EE guest thread (the one in `dispatchLoop`)
+    to see the real call chain and blocked-on state; read the actual `R5900Context` registers / guest
+    memory at a target PC. A log line is a claim; the backtrace is the fact.
+  - **Validate a fix against the *cause*, not the symptom.** After a fix, run under gdb and verify the
+    thread is no longer in the bad spot — the spin loop / `WaitSema` / data-as-code site is gone and
+    the boot thread has advanced past it (set a breakpoint or interrupt-and-backtrace at the target).
+    "The log got longer" or "no crash this run" can both happen while the real frontier is unmoved
+    (recover-pc masking, a stub `ret0`, timing). The backtrace shows whether the frontier truly moved.
+  - **Disprove with it too.** If a fix "worked" but gdb shows the guest still parked at the same
+    instruction (or now spinning one frame deeper for the same reason), the fix didn't land — treat
+    that as falsification, the same as a failed empirical run.
+  - Reach for it whenever a fix's effect is ambiguous from the log alone, or an investigation's
+    conclusion rests on what a thread is *really* executing. `gdb`/`fprintf` perturb timing, so for a
+    timing-sensitive race, corroborate with a non-gdb run too.
 
 ## 5. What progress is (and isn't)
 
@@ -166,8 +185,19 @@ doing it inline) is cheaper than a full workflow.
 
 - The game repo's **`docs/progress.md`** is the running journal — update it every cycle (frontier,
   experiment, evidence, next step). `docs/elf.md` holds static per-game facts.
-- **Commit real fixes** in the game repo as they land (never probes/diagnostics/tests; no co-author
-  trailers) — *only when the user has asked you to commit*; otherwise leave them staged for the user.
+- **Commit on validated progress (standing rule).** Whenever code changes in the **game folder**
+  (`recomp/functions.csv`, `src/register_overrides.cpp(.h)`) **and** you have *validated that progress
+  was made* — the frontier advanced toward a real target, confirmed per §5 (a deeper PC / new
+  subsystem / new render / a met checkpoint), ideally cross-checked under gdb per §4 — **commit it**
+  in the game repo. This is a standing authorization (no need to ask each time); it overrides the
+  default "no commit unless asked" for the game folder.
+  - **Validated progress is the gate, not "code changed."** Do NOT commit a probe/diagnostic/experiment,
+    a change that left the frontier unmoved, or one that *regressed* it (e.g. a "fix" that is more
+    correct in theory but makes the game die sooner — that is not validated progress; resolve the
+    regression first). If an experiment didn't pan out, revert or iterate — don't commit it.
+  - **Commit hygiene:** a focused commit per validated step; a message stating what advanced and the
+    evidence; **never** add `Co-Authored-By` / `Claude-Session` trailers. Update `docs/progress.md`
+    in the same commit. Only the game repo — never commit in the engine/`tools/` repos unless asked.
 - Save durable, non-obvious cross-session knowledge to memory (user preferences, project constraints,
   hard-won methodology). Don't save what the repo already records. Mark retractions clearly when a
   prior model is disproven (§4) — a stale "fact" in memory is worse than none.
