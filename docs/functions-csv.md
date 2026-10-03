@@ -104,6 +104,35 @@ and add them with `end` = the `j` + its delay slot + trailing-nop padding (= nex
 These matter: `recover-pc` drops both the tail-call target *and* the args the trampoline set up.
 (A stronger validator would also accept "first unconditional `j` in the body" as an end.)
 
+### `find_missing.py` — the packaged tool (supersedes the inline script above)
+
+`.claude/skills/ps2recomp-fix-next-crash/find_missing.py` (companion to `funcs.py`, same
+`--game` resolution) does all of the above and adds a **proactive** mode so you don't have to
+limp the boot one missing `jalr` at a time:
+
+- `find_missing.py bounds-scan --game DIR [--min HEX --max HEX --max-size N] [--emit]` — walks
+  the code segment treating every `jr ra`/`j` (+delay slot, +trailing nops) as a function end
+  and tests the next word as a start. This catches the cases the run-log and a naive gap-scan
+  miss: **no-prologue leaf functions** and **functions sitting after data inside a gap** (e.g.
+  `0x158570`, a `jalr`-only vtable method preceded by another fn + padding). `--emit` prints
+  ready-to-append `gapfix_<addr>,0xSTART,0xEND,SIZE` rows; bounds are control-flow-end capped at
+  the next CSV/candidate start. Handles `jr ra` stubs and `j` trampolines (accepts a leading `j`
+  as both a start and an end) — no by-hand trampoline pass needed.
+- `find_missing.py gaps --game DIR` — lighter: only the start-of-gap candidates (after pure
+  padding); misses the post-data cases that `bounds-scan` finds.
+- `find_missing.py verify HEX --game DIR` — is an address covered / which entry / is it the start.
+
+**Use it scoped and reviewed.** Restrict to the game-code region (`--min 130000`; below that is
+crt0/kernel/libc the runtime stubs — don't add CSV functions there or you fight the stubs) and
+**`--max-size 600`** to drop large candidates that are almost certainly **data-as-code**
+over-bounds (a "function" that runs hundreds of bytes with no `jr ra` is the §over-bound smell).
+Behaviorally a false-positive small entry is inert (nothing dispatches to it; the bytes are
+unchanged), so a scoped mass-add is safe — the real risk is an over-bound blowing up the build,
+which `--max-size` guards. Always: append → **FULL regen** → confirm the not-found storm shrank
+and the boot advanced. (rotk_decomp: this found ~133 missing fns in 0x130000-0x222000
+in one pass — the vtable-method tail behind the post-loading pc-zero — after the run-log only
+ever revealed them one stalled frontier at a time.)
+
 It's **iterative**: each regen advances the boot, which uncovers the next gap pocket. sccache
 keeps a small gap-batch's rebuild fast (only new/renumbered units miss).
 
