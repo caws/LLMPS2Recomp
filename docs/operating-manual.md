@@ -95,6 +95,15 @@ probe's printed value — is a **hypothesis to verify against ground truth, not 
   When a probe disagrees with the disasm, suspect the probe.
 - **Empirical test beats argument.** When two analyses disagree, the run decides. Prefer a quick
   experiment that *falsifies* one over more static reasoning.
+- **A noisy metric needs MULTIPLE runs before you conclude.** Many signals here are non-deterministic
+  run-to-run — recovered data-as-code counts, how far the boot gets, timing-race outcomes — because the
+  guest's cooperative-yield/preemption interacts with host scheduling. Comparing **single runs** of two
+  configs (e.g. "probes off = 992 events, probes on = 10") can show a difference that is **pure variance**,
+  not a real effect. Before attributing a change to your edit: run **each** config several times and look at
+  the *distribution* (range/spread), not one sample. If the spreads overlap, there's no effect. *(Concrete
+  miss: a "probes are load-bearing" conclusion drawn from one 992-vs-10 pair was retracted once both configs
+  were run ~4× and both ranged 5–1158.)* Pick a metric that's robust to the noise (does the target PC get
+  reached at all? does the screen render?), not a count that drifts.
 - **Identify before you fix.** A single string, constant, or address often unlocks a
   misidentification (e.g. a function's real purpose). Confirm what a function *is* (its args, what it
   reads/writes, what calls it) before assuming its role from a name or a note.
