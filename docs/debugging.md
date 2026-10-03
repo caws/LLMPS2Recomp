@@ -37,6 +37,25 @@ sibling gdb gets `ptrace: Operation not permitted`; a parent gdb can always trac
 child. (A user *could* `sudo sysctl -w kernel.yama.ptrace_scope=0` to allow attach, but
 running-under-gdb needs no sudo and is the standing rule.)
 
+> **▶ HARNESS MECHANICS — how to actually launch gdb from the Claude Code Bash tool (read this first; getting
+> it wrong wastes a whole session):**
+> - **Launch gdb from a FOREGROUND Bash tool** (a normal `Bash` call), detaching with `setsid … &`:
+>   `setsid gdb -batch -x tmp/foo.gdb --args tmp/ps2EntryRunner ./<ELF> > tmp/foo.log 2>&1 &` then poll the
+>   log/output file from *separate* (background-ok) reads. **Do NOT launch gdb in a `run_in_background:true`
+>   Bash task** — that sandbox **blocks `ptrace`**, so gdb dies instantly with an empty log and no runner.
+>   (Reading files / `sleep`-polling in `run_in_background` is fine — only gdb's ptrace is blocked there.)
+> - **Kill the runner/gdb by exact process NAME, never by `-f` command-line pattern:**
+>   `pkill -x ps2EntryRunner` and `pkill -x gdb`. ***NEVER*** `pkill -9 -f "<pattern>"` when `<pattern>`
+>   also appears anywhere in the *current* command. The Bash tool runs each command as
+>   `/bin/bash -c '…eval <your-entire-command>…'`, so the full command text is in that shell's own argv;
+>   `pkill -f` matches command-lines, so e.g. `pkill -f "ps2EntryRunner ./SLES"` (or `-f "probe_foo"`) in the
+>   same command that launches `… tmp/ps2EntryRunner ./SLES… -x tmp/probe_foo.gdb …` **SIGKILLs the executing
+>   shell itself**, aborting before gdb starts (empty log, no runner — the classic "gdb intermittently doesn't
+>   run"). `pkill -x` matches the process *name* (the wrapper is named `bash`), so it never self-kills.
+>   Verify with `pgrep -cx ps2EntryRunner` (0 = no self-match) vs `pgrep -cf ps2EntryRunner` (≥1 = matches you).
+> - gdb works flawlessly run **synchronously** in a foreground tool too (`gdb -batch -x s.gdb --args runner elf
+>   2>&1`) when the script quits fast (e.g. break at a known-early fn, print, `quit`) — use that to sanity-check.
+
 The recipe that works for a hung (0%-CPU / blocked) runner:
 
 ```bash
@@ -49,7 +68,7 @@ GDBPID=$!            # <-- the whole point: capture the REAL gdb pid
 sleep 15             # let it boot + hit the block
 kill -INT "$GDBPID"  # signal GDB (not the inferior) -> gdb stops the child + runs the queued bt
 sleep 7
-kill -9 "$GDBPID" 2>/dev/null; pkill -9 -f 'tmp/ps2EntryRunner' 2>/dev/null
+kill -9 "$GDBPID" 2>/dev/null; pkill -x ps2EntryRunner 2>/dev/null
 grep -E '^#[0-9]+ ' "$OUT"
 ```
 
@@ -158,7 +177,7 @@ EOF
 PS2_GAMEFILES="$G/gamefiles" DISPLAY=:0 gdb -batch -nx -x "$G/tmp/trace.gdb" \
   --args "$G/tmp/ps2EntryRunner" "$G/<ELF>" > "$G/tmp/dispatch.log" 2>&1 &
 GDBPID=$!; sleep 18
-kill -INT "$GDBPID"; sleep 3; kill -9 "$GDBPID" 2>/dev/null; pkill -9 -f 'tmp/ps2EntryRunner'
+kill -INT "$GDBPID"; sleep 3; kill -9 "$GDBPID" 2>/dev/null; pkill -x ps2EntryRunner
 grep '^D ' "$G/tmp/dispatch.log" | awk '{print $2}' | sort | uniq -c | sort -rn | head -30
 ```
 
