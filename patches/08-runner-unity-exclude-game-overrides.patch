@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 2684ee5..5ad47b5 100644
+index 91a23c2..efd9a97 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
-@@ -395,6 +395,32 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+@@ -402,6 +402,32 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
  )
  

@@ -3,7 +3,12 @@ set -euo pipefail
 
 # Set up a PER-GAME PS2Recomp toolchain clone.
 #
-# Usage: 01_setup.sh <game_dir>
+# Usage: 01_setup.sh <game_dir> [--no-patches]
+#
+#   --no-patches  Skip applying patches/*.patch — build BARE upstream PS2Recomp.
+#                 Use to establish a clean-upstream baseline before layering our
+#                 local fixes back on (e.g. after an upstream pull that changed
+#                 the files our patches touch).
 #
 # Each game gets its OWN clone at tools/<game>/PS2Recomp (game = basename of
 # <game_dir>), so builds never collide between games and the clone can be
@@ -12,8 +17,17 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-GAME_DIR="${1:-}"
-[[ -n "$GAME_DIR" ]] || { echo "ERROR: no <game_dir> given. Usage: $0 <game_dir>"; exit 1; }
+GAME_DIR=""
+SKIP_PATCHES=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-patches|--skip-patches) SKIP_PATCHES=1 ;;
+        -*) echo "ERROR: unknown flag: $arg. Usage: $0 <game_dir> [--no-patches]"; exit 1 ;;
+        *)  if [[ -z "$GAME_DIR" ]]; then GAME_DIR="$arg";
+            else echo "ERROR: unexpected extra argument: $arg"; exit 1; fi ;;
+    esac
+done
+[[ -n "$GAME_DIR" ]] || { echo "ERROR: no <game_dir> given. Usage: $0 <game_dir> [--no-patches]"; exit 1; }
 [[ -d "$GAME_DIR" ]] || { echo "ERROR: game dir not found: $GAME_DIR"; exit 1; }
 GAME_DIR="$(cd "$GAME_DIR" && pwd)"
 GAME="$(basename "$GAME_DIR")"
@@ -38,6 +52,9 @@ else
     echo "     for a clean slate: rm -rf \"$PS2RECOMP_DIR\" and re-run this.)"
 fi
 
+if [[ $SKIP_PATCHES -eq 1 ]]; then
+    echo "[2b] SKIPPING local patches (--no-patches): building BARE upstream PS2Recomp."
+else
 echo "[2b] Applying local PS2Recomp patches (patches/*.patch)..."
 # Correctness fixes not yet in upstream PS2Recomp (see patches/README.md). Idempotent:
 # skips patches already applied; warns (does not abort) on ones that no longer apply so
@@ -55,6 +72,7 @@ for p in "$ROOT_DIR"/patches/*.patch; do
     fi
 done
 shopt -u nullglob
+fi
 
 echo "[3/4] Configuring PS2Recomp..."
 cmake -B "$PS2RECOMP_DIR/out/build" -S "$PS2RECOMP_DIR" \
