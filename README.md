@@ -99,7 +99,13 @@ Game-specific behavior is added **only** through override hooks in the game repo
 The common bring-up bug is truncated/missing functions in `functions.csv` (a
 function sized to only its first instruction leaks the stack and corrupts the
 return address). Fixes go in the game repo's `recomp/functions.csv`, followed by a
-full rebuild. See `CLAUDE.md` for the detailed methodology.
+full rebuild.
+
+The **reusable, game-agnostic methodology** for pushing a decomp forward — the
+diagnostic loop, debugging a hung runner with **gdb-under-parent**, the three
+`functions.csv` bug classes and their fixes, and the HLE override patterns — is in
+**[`docs/`](docs/README.md)**. Start there (and at `CLAUDE.md`) when bringing up a
+new game.
 
 ## Layout (engine)
 

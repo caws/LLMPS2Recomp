@@ -1,0 +1,60 @@
+# PS2Recomp methodology — pushing a decomp forward
+
+This folder documents the **reusable, game-agnostic** strategies for taking a PS2Recomp
+game decompilation from "won't boot" toward "runs". The engine is stateless and ships no
+game (see the top-level [README](../README.md)); these are the techniques you apply to
+**any** game repo you point it at. They were distilled from real boot-up work and are the
+"orchestrator" knowledge a new contributor (or their coding agent) needs.
+
+The unit of work is **one frontier per cycle**: the boot reaches some point and stops — a
+spin, an early exit, a missing-function storm, or a silent 0%-CPU hang — and you diagnose
+*that* frontier, apply the narrowest fix, rebuild, and advance. **Fix incrementally; never
+mass-rewrite the inputs.**
+
+## The core loop
+
+1. **Build** — `scripts/03_build_game.sh <game_dir>` (full if `recomp/functions.csv`
+   changed; `--skip-regen --changed-recomp` for override-only changes). Run it in the
+   background (builds take many minutes); watch with `scripts/build_progress.sh <game_dir>`.
+2. **Run** — `timeout N scripts/04_run_game.sh <game_dir>` → log at `<game_dir>/tmp/run.txt`
+   (a spinning runner emits hundreds of MB/s, so it always goes to a file, never the
+   terminal).
+3. **Triage** — read the log: a spin (huge file), a missing-function storm (`Function at
+   address ... not found`), an early exit, or a silent hang (0% CPU)?
+4. **Locate** — `funcs.py` (disasm / bounds / find / scan) for static facts;
+   [gdb-under-parent](debugging.md) for a live hang.
+5. **Fix** — a [`functions.csv` correction](functions-csv.md) or an
+   [override hook](overrides.md). **Bump the `BUILD_TAG`** so you can prove the running
+   binary is current.
+6. **Verify & record** — confirm the tag in `run.txt`, confirm the frontier advanced, then
+   log it in the game repo's `docs/progress.md`. Repeat.
+
+## The documents
+
+- **[working-rules.md](working-rules.md)** — *how to work*: verify-don't-trust (disasm is ground
+  truth, notes are hypotheses), the dispatch model, the `BUILD_TAG`/incremental/build-% discipline,
+  and a quick index of the bug/fix taxonomy. Read this first.
+- **[debugging.md](debugging.md)** — diagnosing a frontier: run-log triage, the
+  **gdb-under-parent** recipe (the only reliable way to backtrace a hung runner on a
+  `ptrace_scope=1` box), one-shot override probes, and profiling a silent spin.
+- **[functions-csv.md](functions-csv.md)** — the three `functions.csv` bug classes
+  (**truncated**, **missing / CSV-gap**, **over-bound**) and their fixes, plus
+  **disasm-as-ground-truth** validation (the game ELF is typically stripped — there are no
+  symbols to trust, so the disassembly *is* the source of truth).
+- **[overrides.md](overrides.md)** — HLE override patterns: wait-free replacement, clean
+  skip, SIF/IOP handshake fakes, **answering raw-transport SIF RPCs via the runtime stub**,
+  resumable mid-function entries, calling the original, and the `BUILD_TAG` discipline.
+
+## Hard constraints (apply everywhere)
+
+- **Never edit `tools/PS2Recomp/`** — it's a separate upstream repo, and
+  `tools/PS2Recomp/ps2xRuntime/src/runner/` is wiped + regenerated every build. All
+  game-specific behavior goes in the game repo's `src/register_overrides.cpp`.
+- **Inputs are provided per game** — `recomp/config.toml`, `recomp/functions.csv`, the ELF,
+  and `gamefiles/`. The engine never generates them.
+- **A `functions.csv` change requires a FULL regen** (no `--skip-regen`). Override-only
+  changes can use the fast path.
+
+For the condensed, agent-facing version of this loop, see the
+[`ps2recomp-fix-next-crash` skill](../.claude/skills/ps2recomp-fix-next-crash/SKILL.md) and
+its `funcs.py` helper.

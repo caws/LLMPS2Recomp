@@ -100,3 +100,14 @@ which takes `--game <game_dir>` (or `$PS2RECOMP_GAME`). For a misbehaving guest 
 a one-shot probe in the game's `src/register_overrides.cpp` (you get `rdram`, `ctx`, register
 macros), dump regs/stack, then `ctx->pc = 0` to stop cleanly instead of spinning. Record each
 frontier/override in the game repo's `docs/progress.md`.
+
+The **game-agnostic methodology** (the techniques, not this game's facts) is documented in
+[`docs/`](docs/README.md). Start with [`working-rules.md`](docs/working-rules.md) (verify-don't-trust:
+disasm + generated code are ground truth, notes are hypotheses; the dispatch model; `BUILD_TAG` +
+incremental discipline). Then: [`debugging.md`](docs/debugging.md) (run-log triage, the
+**gdb-under-parent** recipe, **dispatch-logging loop maps**, profiling), [`functions-csv.md`](docs/functions-csv.md) (the
+three CSV bug classes — truncated / missing-gap **batchfix** / over-bound **boundfix** — and
+disasm-as-ground-truth validation), and [`overrides.md`](docs/overrides.md) (HLE patterns:
+wait-free replacement, clean skip, SIF/IOP handshake fakes, answering raw-transport RPCs via
+`runtime->iop().handleRPC`). Read those for the durable strategy; this file + the skill are
+the quick reference.
