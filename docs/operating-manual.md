@@ -191,10 +191,15 @@ doing it inline) is cheaper than a full workflow.
   subsystem / new render / a met checkpoint), ideally cross-checked under gdb per §4 — **commit it**
   in the game repo. This is a standing authorization (no need to ask each time); it overrides the
   default "no commit unless asked" for the game folder.
-  - **Validated progress is the gate, not "code changed."** Do NOT commit a probe/diagnostic/experiment,
-    a change that left the frontier unmoved, or one that *regressed* it (e.g. a "fix" that is more
-    correct in theory but makes the game die sooner — that is not validated progress; resolve the
-    regression first). If an experiment didn't pan out, revert or iterate — don't commit it.
+  - **Validated progress is the gate, not "code changed."** Progress = the frontier advanced in
+    **correctness or depth** — a real bug fixed, execution driven into new code/subsystems, or something
+    new rendered. **This counts even if the game now reaches FEWER frames before stopping:** a fix that is
+    more correct and exposes more behaviour but uncovers a new *deeper* wall (the game dies sooner, at a
+    point further along) **IS validated progress and SHOULD be committed** — commits are revertible, so
+    capture the forward step and undo later if it proves improper. Do NOT commit: a probe / diagnostic /
+    one-shot experiment (strip or gate it first, keep the fix), a change that left the frontier unmoved, or
+    **pure breakage** (less correct, less behaviour, no new ground reached). When torn between
+    "more-correct-but-fewer-frames" and "this just broke it", lean toward committing the former.
   - **Commit hygiene:** a focused commit per validated step; a message stating what advanced and the
     evidence; **never** add `Co-Authored-By` / `Claude-Session` trailers. Update `docs/progress.md`
     in the same commit. Only the game repo — never commit in the engine/`tools/` repos unless asked.
