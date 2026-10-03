@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index c0af2a3..6b4e36d 100644
+index 05fc764..7bf0cd2 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 @@ -1,5 +1,7 @@
@@ -173,7 +173,7 @@ index c0af2a3..6b4e36d 100644
  }
  
  void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
-@@ -244,6 +393,14 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -247,6 +396,14 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
      }
  }
  
@@ -188,7 +188,7 @@ index c0af2a3..6b4e36d 100644
  void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
  {
      if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
-@@ -258,14 +415,90 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+@@ -261,14 +418,90 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
  
  void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -280,7 +280,7 @@ index c0af2a3..6b4e36d 100644
          {
              const uint32_t availableQw = (sizeBytes - pos) / 16u;
              if (availableQw == 0u)
-@@ -274,6 +507,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -277,6 +510,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              }
  
              const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
@@ -315,7 +315,7 @@ index c0af2a3..6b4e36d 100644
              std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
              const uint64_t imageTag =
                  static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-@@ -460,31 +721,204 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -463,31 +724,204 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              uint32_t qwCount = imm;
              if (qwCount == 0)
                  qwCount = 65536;

@@ -1,0 +1,36 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 9c39ae2..3414921 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -531,8 +531,14 @@ GSCpuBackend::GSCpuBackend()
+             m_writeVramFuncs[i] = WriteZ16S;
+             break;
+         default:
+-            m_readVramFuncs[i] = ReadNull;
+-            m_writeVramFuncs[i] = WriteNull;
++            // Undefined PSM codes decode as PSMCT32 on real GS hardware -- PCSX2
++            // GS/GSLocalMemory.cpp fills every undefined m_psm[64] slot with the PSMCT32
++            // layout. A Null fallback makes any texture declared with an undefined psm read
++            // as 0 (fully transparent): LOTR ROTK's movie sprites carry a literal TEX0
++            // psm=0x20 (hardcoded immediate @0x1fa3d4), so with ReadNull the whole FMV is
++            // invisible. (Same fix as the pre-refactor ReadVram/WriteVram patch, cont.116e.)
++            m_readVramFuncs[i] = ReadCT32;
++            m_writeVramFuncs[i] = WriteCT32;
+             break;
+         }
+     }
+@@ -1024,7 +1030,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+             return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+         }
+ 
+-        return 0xFFFF00FFu;
++        // Undefined TEX0 psm decodes as PSMCT32 on real GS (PCSX2 GSLocalMemory: undefined
++        // psm table entries take the PSMCT32 layout) -- and ReadVramUnlocked above already
++        // read the texel through the CT32 fallback. Returning the magenta debug texel here
++        // instead paints every draw that uses an undefined psm solid magenta: LOTR ROTK's
++        // full-screen loading/movie sprites carry a literal TEX0 psm=0x20. (Same fix as the
++        // pre-refactor rasterizer sample dispatch, cont.116q.)
++        return applyTexa(state.texa, GS_PSM_CT32, out);
+     };
+ 
+     if (!state.linearFilter)

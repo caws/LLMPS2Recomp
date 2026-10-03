@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
-index bd68b71..0d70a4b 100644
+index 9c54919..b86c21a 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
-@@ -796,7 +796,13 @@ namespace ps2_stubs
+@@ -631,7 +631,13 @@ namespace ps2_stubs
              return;
          }
  
@@ -17,7 +17,7 @@ index bd68b71..0d70a4b 100644
          uint32_t dsax = static_cast<uint32_t>(img.x);
          uint32_t dsay = static_cast<uint32_t>(img.y);
  
-@@ -861,7 +867,8 @@ namespace ps2_stubs
+@@ -696,7 +702,8 @@ namespace ps2_stubs
              return;
          }
  
