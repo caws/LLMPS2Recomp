@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
 new file mode 100644
-index 0000000..1dd0544
+index 0000000..be1c11e
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
-@@ -0,0 +1,2076 @@
+@@ -0,0 +1,2128 @@
 +#include "runtime/gs/gs_gpu_device.h"
 +#include "runtime/gs/ps2_gs_memory.h"
 +
@@ -1157,6 +1157,7 @@ index 0000000..1dd0544
 +            Verify,
 +            PatchRaw,
 +            VerifyFull,
++            Readback,
 +            RasterBatch,
 +            VerifyRange
 +        } kind = Kind::Decode;
@@ -1167,6 +1168,8 @@ index 0000000..1dd0544
 +        GsGpuBatch batch{};       // RasterBatch only
 +        uint64_t tag = 0;         // VerifyRange only: echoed on divergence
 +        const uint8_t *drawPageMask = nullptr; // VerifyFull only (caller-owned, 512 bytes)
++        bool quiet = false;                    // VerifyFull only: suppress the report
++        std::vector<uint8_t> *readOut = nullptr; // Readback only
 +        bool *done = nullptr;     // Decode / VerifyFull (caller-stack completion flags)
 +        bool *result = nullptr;
 +    };
@@ -1279,6 +1282,14 @@ index 0000000..1dd0544
 +            case Job::Kind::PatchRaw:
 +                patchRawOnThread(j.rawOffset, j.raw);
 +                break;
++            case Job::Kind::Readback:
++            {
++                readbackOnThread(j.rawOffset, j.decode.vramSize, j.readOut);
++                std::lock_guard<std::mutex> lk(mx);
++                if (j.done)
++                    *j.done = true;
++                break;
++            }
 +            case Job::Kind::RasterBatch:
 +                rasterBatchOnThread(j.batch);
 +                break;
@@ -1288,7 +1299,7 @@ index 0000000..1dd0544
 +            case Job::Kind::VerifyFull:
 +            {
 +                const bool r = verifyFullOnThread(j.decode.vram, j.decode.vramSize,
-+                                                  j.drawPageMask);
++                                                  j.drawPageMask, j.quiet);
 +                std::lock_guard<std::mutex> lk(mx);
 +                if (j.result)
 +                    *j.result = r;
@@ -1652,6 +1663,17 @@ index 0000000..1dd0544
 +    // Phase-1b: a straight authoritative-bytes copy into the mirror. No kernel, no
 +    // swizzle -- the caller already resolved WHAT the CPU wrote by reading VRAM back, so
 +    // this cannot diverge from the CPU by construction.
++    void readbackOnThread(uint32_t offset, uint32_t len, std::vector<uint8_t> *out)
++    {
++        if (!out || offset >= kVramBytes)
++            return;
++        len = std::min<uint32_t>(len, kVramBytes - offset);
++        out->resize(len);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, mirrorBuf);
++        gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(offset),
++                            static_cast<GLsizeiptr>(len), out->data());
++    }
++
 +    void patchRawOnThread(uint32_t offset, const std::vector<uint8_t> &bytes)
 +    {
 +        if (bytes.empty() || offset >= kVramBytes)
@@ -1827,7 +1849,8 @@ index 0000000..1dd0544
 +    // Phase-1b: whole-mirror vs whole-CPU-VRAM compare. It runs after every previously
 +    // posted mirror job (strict FIFO), so a divergence here is a REAL gap -- either a
 +    // VRAM writer with no mirror path yet, or a kernel that wrote the wrong thing.
-+    bool verifyFullOnThread(const uint8_t *vram, uint32_t vramSize, const uint8_t *drawPageMask)
++    bool verifyFullOnThread(const uint8_t *vram, uint32_t vramSize,
++                            const uint8_t *drawPageMask, bool quiet)
 +    {
 +        if (!vram || vramSize < kVramBytes || !ensureFullCompare())
 +            return false;
@@ -1859,6 +1882,16 @@ index 0000000..1dd0544
 +        gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, kVramPages * 4u, hist.data());
 +
 +        ++mvRuns;
++        if (quiet)
++        {
++            const GLenum qerr = gl.GetError();
++            if (qerr != 0u && errorLogs < 8u)
++            {
++                ++errorLogs;
++                std::fprintf(stderr, "[gsgpu] GL error 0x%x during quiet mverify\n", qerr);
++            }
++            return res[0] == 0u;
++        }
 +        // Split the divergence: pages the CPU rasterizer wrote since the last verify are
 +        // EXPECTED to be stale until phase 2 mirrors draws. Everything else is a real gap.
 +        unsigned pagesBad = 0, pagesDraw = 0, pagesGap = 0;
@@ -2026,6 +2059,24 @@ index 0000000..1dd0544
 +    m_impl->enqueue(std::move(j));
 +}
 +
++void GsGpuPresentDevice::MirrorReadback(uint32_t byteOffset, uint32_t byteLen,
++                                        std::vector<uint8_t> &out)
++{
++    if (!EnsureInitialized())
++        return;
++    Impl &d = *m_impl;
++    bool done = false;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::Readback;
++    j.rawOffset = byteOffset;
++    j.decode.vramSize = byteLen;
++    j.readOut = &out;
++    j.done = &done;
++    d.enqueue(std::move(j));
++    std::unique_lock<std::mutex> lk(d.mx);
++    d.cvDone.wait(lk, [&] { return done || d.stop; });
++}
++
 +void GsGpuPresentDevice::RasterBatch(GsGpuBatch &&batch)
 +{
 +    if (batch.prims.empty() || !EnsureInitialized())
@@ -2062,7 +2113,7 @@ index 0000000..1dd0544
 +}
 +
 +bool GsGpuPresentDevice::MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
-+                                          const uint8_t *drawPageMask)
++                                          const uint8_t *drawPageMask, bool quiet)
 +{
 +    if (!vram || !EnsureInitialized())
 +        return false;
@@ -2073,6 +2124,7 @@ index 0000000..1dd0544
 +    j.decode.vram = vram;
 +    j.decode.vramSize = vramSize;
 +    j.drawPageMask = drawPageMask;
++    j.quiet = quiet;
 +    j.done = &done;
 +    j.result = &result;
 +    d.enqueue(std::move(j));

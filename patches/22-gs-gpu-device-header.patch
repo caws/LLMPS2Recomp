@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..1da4ecf
+index 0000000..8ca39d9
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,239 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -210,8 +210,10 @@ index 0000000..1da4ecf
 +    // separately, because until phase 2 mirrors draws they are EXPECTED to diverge. What
 +    // remains -- stale pages the rasterizer cannot explain -- is the actual gate.
 +    // Returns true when the mirror matches vram exactly.
++    // `quiet` suppresses the report line -- the bisect runs ~12 of these per failure and
++    // only cares about the boolean.
 +    bool MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
-+                          const uint8_t *drawPageMask = nullptr);
++                          const uint8_t *drawPageMask = nullptr, bool quiet = false);
 +
 +    // Phase 2a (cont.169): rasterize ONE primitive into the mirror. Async, FIFO-ordered
 +    // behind every prior mirror op, so the caller's seed patches are already applied.
@@ -227,6 +229,11 @@ index 0000000..1da4ecf
 +    // CPU-authoritative post-draw bytes. `tag` is echoed on divergence so a mismatch names
 +    // the draw-state combo that produced it. Async; ordered behind the raster.
 +    void MirrorVerifyRange(uint32_t byteOffset, std::vector<uint8_t> &&expected, uint64_t tag);
++
++    // Read the mirror back (synchronous). For the bisect's final step: with the culprit
++    // primitive isolated, the only way to say WHY it differs is to compare the actual
++    // pixels, which needs the GPU's bytes on the host.
++    void MirrorReadback(uint32_t byteOffset, uint32_t byteLen, std::vector<uint8_t> &out);
 +
 +    // Phase-2a tallies, printed by the caller alongside the other mirror counters.
 +    void RasterStats(unsigned long &prims, unsigned long &verifies,

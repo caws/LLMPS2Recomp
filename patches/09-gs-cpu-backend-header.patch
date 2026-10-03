@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..89a0184 100644
+index 71e8032..338b8a9 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 @@ -3,14 +3,24 @@
@@ -41,7 +41,7 @@ index 71e8032..89a0184 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +53,158 @@ private:
+@@ -36,18 +53,169 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -158,10 +158,21 @@ index 71e8032..89a0184 100644
 +        // primitive at a time -- the decisive A/B between "tiling/ordering is wrong" and
 +        // "one primitive in here shades wrong".
 +        std::vector<uint8_t> preVram;
++        // The originating draw commands, kept only for verified batches so a failure can be
++        // BISECTED: re-run the oracle into a scratch VRAM for prims [0..k) and compare
++        // against a GPU replay of the same prefix. ~12 iterations name the exact primitive.
++        std::vector<GSPrimitiveBatch> srcPrims;
 +        uint32_t maxX = 0, maxY = 0; // batch bbox, sizes the tile grid
 +    };
 +    GpuBatchAccum m_gpuBatch;
 +    unsigned long m_lastDegen = 0, m_lastOffscr = 0; // draws-nothing rejections
++    // While set, DrawPrimitive draws PIXELS ONLY -- no census, no batch accumulation, no
++    // verify gate. The bisect replay re-enters the oracle and must not recurse into any of
++    // that. Touched only under m_mutex, on the thread already inside gpuBatchFlush.
++    bool m_rawDraw = false;
++    std::vector<uint8_t> m_bisectScratch;
++    void gpuBisectFailingBatch(const std::vector<GsGpuState> &states,
++                               const std::vector<GsGpuGeom> &prims);
 +    void gpuBatchAppend(const GSPrimitiveBatch &batch);
 +    void gpuBatchFlush();
 +    void gs2FillCommonPrimState(const GSPrimitiveBatch &batch, GsGpuState &p, uint32_t mip);
@@ -201,7 +212,7 @@ index 71e8032..89a0184 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +214,36 @@ private:
+@@ -57,9 +225,36 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -240,7 +251,7 @@ index 71e8032..89a0184 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +251,52 @@ private:
+@@ -67,9 +262,52 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
