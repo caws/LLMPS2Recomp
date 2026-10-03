@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index 6f24894..5665d1e 100644
+index 6f24894..01122bd 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,6 +3,89 @@
@@ -92,7 +92,7 @@ index 6f24894..5665d1e 100644
  
  VU1Interpreter::VU1Interpreter()
  {
-@@ -21,16 +104,69 @@ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+@@ -21,20 +104,78 @@ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
      return vf[bc & 3];
  }
  
@@ -166,7 +166,16 @@ index 6f24894..5665d1e 100644
  }
  
  void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
-@@ -117,7 +253,14 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+ {
++    // EVERY caller of applyDestAcc is an ACC-writing FMAC op (ADDA/SUBA/MULA/MADDA/MSUBA and
++    // their bc/i/q forms, plus OPMULA), so the MAC update belongs here unconditionally -- unlike
++    // applyDest, which the lower pipeline also uses for MOVE/MR32/LQ*/MFIR/MFP.  Pre-clamp
++    // result, matching PCSX2's order.  See PS2X_VU_MACFLAGS in ps2_vu1_detail.h.
++    vuMacUpdateFmac(m_state.mac, m_state.status, result, dest);
+     applyDest(m_state.acc, result, dest);
+ }
+ 
+@@ -117,7 +258,14 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
      m_state.vf[0][1] = 0.0f;
      m_state.vf[0][2] = 0.0f;
      m_state.vf[0][3] = 1.0f;
@@ -181,7 +190,7 @@ index 6f24894..5665d1e 100644
  }
  
  void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
-@@ -128,7 +271,11 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+@@ -128,7 +276,11 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
      m_state.ebit = false;
      m_state.top = top;
      m_state.itop = itop;

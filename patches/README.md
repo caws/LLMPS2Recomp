@@ -28,7 +28,7 @@ rm -rf $SC && mkdir -p $SC && git -C $LIVE archive ee149581 | tar -x -C $SC
 cd $SC && git init -q . && for p in ../../patches/*.patch; do git apply "$p" || echo "FAIL $p"; done
 # then diff every patched file against $LIVE -- must be byte-identical
 ```
-Last verified: **21/21 patches apply, 21/21 files byte-identical.**
+Last verified (cycle 92): **21/21 patches apply, 21/21 files byte-identical.**
 
 ## Patch inventory
 
@@ -49,10 +49,10 @@ Last verified: **21/21 patches apply, 21/21 files byte-identical.**
 | `13-pad.patch` | `ps2xRuntime/src/lib/ps2_pad.cpp` | headless CROSS driver + `PS2X_PAD2_LOG` (both default-OFF) |
 | `14-runtime-core.patch` | `ps2xRuntime/src/lib/ps2_runtime.cpp` | wires `setGsPendingImageFn` (where `m_gs` is in scope) |
 | `15-vif1-interpreter.patch` | `ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp` | **`PS2X_VIF_DIRECTCARRY`** (payload-aligned Path2 image continuation) + **`PS2X_VIF_DIRECTSPAN`** (cross-transfer DIRECT span state; PCSX2 `vif1.tag.size` persists) |
-| `16-vu1-core.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp` | **`PS2X_VU_CLAMP`** — PS2 VU float semantics (no NaN/Inf/denormals; PCSX2 `vuDouble()`); `PS2X_VU1_MEMCENSUS` diagnostic |
-| `17-vu1-detail-header.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_detail.h` | VU1 clip/FTOI helpers |
+| `16-vu1-core.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp` | **`PS2X_VU_CLAMP`** — PS2 VU float semantics (no NaN/Inf/denormals; PCSX2 `vuDouble()`); MAC update on the ACC FMAC path; `PS2X_VU1_MEMCENSUS` diagnostic |
+| `17-vu1-detail-header.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_detail.h` | VU1 clip/FTOI helpers; **`PS2X_VU_MACFLAGS`** — the MAC/STATUS flag computation (PCSX2 `VUflags.cpp`) |
 | `18-vu1-lower.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp` | XGKICK 0x4000 packet cap (PCSX2 `Gif_Unit.h`); **`PS2X_VU_FLAGFIX`** — the flag-op decode table + FS\*/FM\*/FCGET bodies (PCSX2 `VUops.cpp`); `PS2X_VU1_KICKCENSUS` + `PS2X_VU1_FLAGCENSUS` instruments |
-| `19-vu1-upper.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp` | CLIP 24-bit mask; FTOI saturation |
+| `19-vu1-upper.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp` | CLIP 24-bit mask; FTOI saturation; MAC update routed to the true FMAC ops only |
 | `20-dbcman-hle-header.patch` | `ps2xRuntime/include/runtime/ps2_dbcman_hle.h` | DBCMAN.IRX HLE declarations (new file) |
 | `21-dbcman-hle.patch` | `ps2xRuntime/src/lib/ps2_dbcman_hle.cpp` | DBCMAN.IRX HLE implementation (new file) |
 
@@ -179,6 +179,39 @@ XGKICK the ops executed since the previous kick are attributed to one of two buc
 both buckets are printed together, so the failing population is always quoted beside its control
 (standing rule 25). `PS2X_VU1_FLAGCENSUS_ADDR=<n>` (default `8272`) additionally counts the kicks at
 the single VU1 address cont.144 pinned. Per-VU counters (rule 22). Inert when unset. | cont.145 cycle 91
+
+### VU MAC flag register (`16`/`17`/`19`)
+
+**`PS2X_VU_MACFLAGS` (default ON; `=0` restores the old behaviour — a MAC register that is never
+written).** **Nothing in the interpreter ever wrote `m_state.mac`.** It was only ever *read*, by
+FMEQ/FMAND/FMOR, and copied to/from the VU0 macro-mode context — so every MAC test in a
+microprogram read a permanently-zero register. Measured with `PS2X_VU1_FLAGCENSUS` (cycle 91):
+`mac != 0` on **zero** of ~1.07M censused kicks, while the level-era microprogram executed
+**41,069,286** `fmand` ops — 33.7M of them on kicks whose first GIF tag carried `nloop == 0`, at
+**146×** the per-kick rate of the known-good bucket.
+
+Mirrors **PCSX2 `pcsx2/VUflags.cpp`**: `VU_MAC_UPDATE` per component, `VU_MACx_CLEAR` for components
+outside the dest mask, and `VU_STAT_UPDATE` for STATUS as an OR-reduction of MAC. Shifts are x=3,
+y=2, z=1, w=0; groups are `0x0001<<s` Z, `0x0010<<s` S, `0x0100<<s` U (denormal), `0x1000<<s` O
+(Inf/NaN). Helpers live in `ps2_vu1_detail.h` (patch 17) so no header under `include/` changes —
+that would cost a ~60 min rebuild instead of ~3 min.
+
+Two details that are easy to get wrong and were checked against PCSX2 rather than assumed:
+- **Flags come from the RAW, PRE-CLAMP result.** PCSX2's `VU_MAC_UPDATE` sets the flags and *then*
+  returns the clamped value, so an overflow still registers as `O` even though `PS2X_VU_CLAMP` goes
+  on to store ±MAX_FLOAT. Computing them after the clamp would silently lose every O and U flag —
+  precisely the interesting ones.
+- **Only the TRUE FMAC arithmetic ops update MAC.** Verified in PCSX2: MAX/MINI go through
+  `applyMinMax`, and ABS/ITOF/FTOI through `applyUnaryFunction`, and **neither calls
+  `VU_MAC*_UPDATE`**; MOVE/MR32/LQ\*/SQ\*/MFIR/MFP/CLIP likewise do not. So `applyDest` must **not**
+  be hooked blanket-wise — the *lower* pipeline shares it. Routing: `applyDestAcc` (patch 16) gains
+  the update unconditionally because every one of its callers is an ACC-writing FMAC op, while patch
+  19 routes exactly the 21 FMAC sites in the main upper table through an `fmacDest` wrapper and
+  leaves the 6 MAX/MINI sites on plain `applyDest`.
+
+⚠ PCSX2's current `_vuCLIP` has since gained a denormal special-case
+(`value = (value & 0x7f800000) ? value & 0x7fffffff : 0x007fffff`) that our patch-19 CLIP does not
+mirror — noted as a follow-up, not changed in this cycle. | cont.147 cycle 92
 
 ## Maintenance
 
