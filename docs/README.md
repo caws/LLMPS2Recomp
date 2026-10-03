@@ -31,9 +31,14 @@ mass-rewrite the inputs.**
 
 ## The documents
 
+- **[operating-manual.md](operating-manual.md)** — *the top-level playbook*: how the main agent
+  operates — the role, the one-frontier work loop, the toolbox and when to use each, the
+  **verification rule** (ground truth = disassembly + generated recompiled C++ + gdb; everything
+  else is a hypothesis), what progress is and isn't, when to spawn read-only subagents, and when to
+  stop and consult. **Read this first.**
 - **[working-rules.md](working-rules.md)** — *how to work*: verify-don't-trust (disasm is ground
   truth, notes are hypotheses), the dispatch model, the `BUILD_TAG`/incremental/build-% discipline,
-  and a quick index of the bug/fix taxonomy. Read this first.
+  and a quick index of the bug/fix taxonomy.
 - **[debugging.md](debugging.md)** — diagnosing a frontier: run-log triage, the
   **gdb-under-parent** recipe (the only reliable way to backtrace a hung runner on a
   `ptrace_scope=1` box), one-shot override probes, and profiling a silent spin.

@@ -110,9 +110,11 @@ macros), dump regs/stack, then `ctx->pc = 0` to stop cleanly instead of spinning
 frontier/override in the game repo's `docs/progress.md`.
 
 The **game-agnostic methodology** (the techniques, not this game's facts) is documented in
-[`docs/`](docs/README.md). Start with [`working-rules.md`](docs/working-rules.md) (verify-don't-trust:
-disasm + generated code are ground truth, notes are hypotheses; the dispatch model; `BUILD_TAG` +
-incremental discipline). Then: [`debugging.md`](docs/debugging.md) (run-log triage, the
+[`docs/`](docs/README.md). Start with [`operating-manual.md`](docs/operating-manual.md) — the
+top-level playbook for how the main agent operates (the work loop, the toolbox, the **verification
+rule**: ground truth = disassembly + generated recompiled C++ + gdb, everything else is a hypothesis;
+what progress is; when to spawn read-only subagents; when to stop). Then [`working-rules.md`](docs/working-rules.md)
+(verify-don't-trust; the dispatch model; `BUILD_TAG` + incremental discipline) and: [`debugging.md`](docs/debugging.md) (run-log triage, the
 **gdb-under-parent** recipe, **dispatch-logging loop maps**, profiling), [`functions-csv.md`](docs/functions-csv.md) (the
 three CSV bug classes — truncated / missing-gap **batchfix** / over-bound **boundfix** — and
 disasm-as-ground-truth validation), [`overrides.md`](docs/overrides.md) (HLE patterns:
