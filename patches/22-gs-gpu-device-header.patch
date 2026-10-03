@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..1e7f0d6
+index 0000000..7315955
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,190 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -60,6 +60,63 @@ index 0000000..1e7f0d6
 +    uint32_t startPixel = 0;
 +    std::vector<uint32_t> payload; // one word per pixel
 +};
++// One primitive, fully resolved for the GPU rasterizer (cont.169, phase 2a).
++//
++// Everything the shader needs is flattened here: all members are 4-byte scalars in a
++// fixed order, mirrored field-for-field by the `Prim` block in the raster shader, so the
++// std430 layout is unambiguous (no vec3/array-stride rules in play).
++//
++// The HOST resolves everything that would otherwise need a GPU division or transcendental
++// in the setup path -- the per-triangle winding/1/|denom|, and the mip level's tbp/tbw/
++// texture size/region bounds -- because GLSL only guarantees ~2.5 ULP for division while
++// the CPU oracle divides with correctly-rounded IEEE. Vertex z is carried as the two
++// halves of the CPU's double (packDouble2x32) so interpolation is exact, matching
++// DrawTriangle's `double z = v0.z*w0 + v1.z*w1 + v2.z*w2`.
++struct GsGpuPrim
++{
++    // Vertices in screen space, XYOFFSET already subtracted (as DrawTriangle does).
++    float x0 = 0, y0 = 0, x1 = 0, y1 = 0, x2 = 0, y2 = 0;
++    uint32_t z0lo = 0, z0hi = 0, z1lo = 0, z1hi = 0, z2lo = 0, z2hi = 0;
++    uint32_t rgba0 = 0, rgba1 = 0, rgba2 = 0; // r | g<<8 | b<<16 | a<<24
++    float q0 = 0, q1 = 0, q2 = 0;
++    float s0 = 0, s1 = 0, s2 = 0;
++    float t0 = 0, t1 = 0, t2 = 0;
++    uint32_t uv0 = 0, uv1 = 0, uv2 = 0; // u | v<<16
++    uint32_t fog0 = 0, fog1 = 0, fog2 = 0;
++
++    // Raster setup, host-computed.
++    float winding = 1.0f;
++    float invAbsDenom = 0.0f;
++    float fstDiv = 16.0f; // 16 << mip, the FST texel divisor
++    uint32_t minX = 0, minY = 0, maxX = 0, maxY = 0;
++
++    // Frame / Z / scissor.
++    uint32_t fbp = 0, fbw = 1, fpsm = 0, fbmsk = 0;
++    uint32_t zbp = 0, zpsm = 0, zmsk = 0;
++    uint32_t scissorX0 = 0, scissorY0 = 0, scissorX1 = 0, scissorY1 = 0;
++
++    // PRIM flags.
++    uint32_t primType = 0, iip = 0, tme = 0, fge = 0, fst = 0, abe = 0;
++
++    // TEST / ALPHA / FBA / fog.
++    uint32_t ate = 0, atst = 0, aref = 0, afail = 0, zte = 0, ztst = 0;
++    uint32_t blendA = 0, blendB = 0, blendC = 0, blendD = 0, blendFix = 0;
++    uint32_t fba = 0;
++    uint32_t fogR = 0, fogG = 0, fogB = 0;
++
++    // TEX0 / TEXA / CLAMP (mip already folded into tbp/tbw/texW/texH/min*/max*).
++    uint32_t tbp = 0, tbw = 1, tpsm = 0, tcc = 0, tfx = 0;
++    uint32_t cbp = 0, cpsm = 0, csm = 0, csa = 0;
++    uint32_t texW = 1, texH = 1, linear = 0;
++    uint32_t wms = 0, wmt = 0, minU = 0, maxU = 0, minV = 0, maxV = 0;
++    uint32_t ta0 = 0, ta1 = 0, aem = 0;
++
++    // CLUT shadow (PS2X_GS_CLUTSHADOW): the uploaded 16-entry payload for this cbp, so the
++    // shader can reproduce LookupCLUT's RGB-zeroed-entry substitution exactly.
++    uint32_t clutShadowHave = 0;
++    uint32_t clutShadow[16] = {};
++};
++
 +class GsGpuPresentDevice
 +{
 +public:
@@ -117,6 +174,21 @@ index 0000000..1e7f0d6
 +    // remains -- stale pages the rasterizer cannot explain -- is the actual gate.
 +    void MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
 +                          const uint8_t *drawPageMask = nullptr);
++
++    // Phase 2a (cont.169): rasterize ONE primitive into the mirror. Async, FIFO-ordered
++    // behind every prior mirror op, so the caller's seed patches are already applied.
++    // Single-primitive dispatch is race-free by construction: one invocation per pixel of
++    // the scissor-clipped bbox, and a pixel owns its frame word and its Z word.
++    void RasterPrim(GsGpuPrim &&prim);
++
++    // Phase 2a shadow verify: compare mirror[byteOffset .. +expected.size()) against the
++    // CPU-authoritative post-draw bytes. `tag` is echoed on divergence so a mismatch names
++    // the draw-state combo that produced it. Async; ordered behind the raster.
++    void MirrorVerifyRange(uint32_t byteOffset, std::vector<uint8_t> &&expected, uint64_t tag);
++
++    // Phase-2a tallies, printed by the caller alongside the other mirror counters.
++    void RasterStats(unsigned long &prims, unsigned long &verifies,
++                     unsigned long &mismatchRanges, unsigned long long &mismatchWords) const;
 +
 +private:
 +    struct Impl;

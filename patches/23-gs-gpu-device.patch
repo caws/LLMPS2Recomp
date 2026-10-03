@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
 new file mode 100644
-index 0000000..49a2f88
+index 0000000..263783a
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
-@@ -0,0 +1,1137 @@
+@@ -0,0 +1,1847 @@
 +#include "runtime/gs/gs_gpu_device.h"
 +#include "runtime/gs/ps2_gs_memory.h"
 +
@@ -145,6 +145,71 @@ index 0000000..49a2f88
 +        {13, 15, 29, 31},
 +    }};
 +
++    // Z32/Z24 do NOT share the C32 block order (ps2_gs_memory.cpp BlockTableZ32); the
++    // column order IS shared with C32.
++    constexpr PixelStorageTraits<GSMem::Z32>::BlockLookupTableT kBlockTableZ32{{
++        {24, 25, 28, 29, 8, 9, 12, 13},
++        {26, 27, 30, 31, 10, 11, 14, 15},
++        {16, 17, 20, 21, 0, 1, 4, 5},
++        {18, 19, 22, 23, 2, 3, 6, 7},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::P8>::BlockLookupTableT kBlockTableP8{{
++        {0, 1, 4, 5, 16, 17, 20, 21},
++        {2, 3, 6, 7, 18, 19, 22, 23},
++        {8, 9, 12, 13, 24, 25, 28, 29},
++        {10, 11, 14, 15, 26, 27, 30, 31},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::P4>::BlockLookupTableT kBlockTableP4{{
++        {0, 2, 8, 10},
++        {1, 3, 9, 11},
++        {4, 6, 12, 14},
++        {5, 7, 13, 15},
++        {16, 18, 24, 26},
++        {17, 19, 25, 27},
++        {20, 22, 28, 30},
++        {21, 23, 29, 31},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::P8>::ColumnLookupTableT kColumnTable8{{
++        {0, 4, 16, 20, 32, 36, 48, 52, 2, 6, 18, 22, 34, 38, 50, 54},
++        {8, 12, 24, 28, 40, 44, 56, 60, 10, 14, 26, 30, 42, 46, 58, 62},
++        {33, 37, 49, 53, 1, 5, 17, 21, 35, 39, 51, 55, 3, 7, 19, 23},
++        {41, 45, 57, 61, 9, 13, 25, 29, 43, 47, 59, 63, 11, 15, 27, 31},
++        {96, 100, 112, 116, 64, 68, 80, 84, 98, 102, 114, 118, 66, 70, 82, 86},
++        {104, 108, 120, 124, 72, 76, 88, 92, 106, 110, 122, 126, 74, 78, 90, 94},
++        {65, 69, 81, 85, 97, 101, 113, 117, 67, 71, 83, 87, 99, 103, 115, 119},
++        {73, 77, 89, 93, 105, 109, 121, 125, 75, 79, 91, 95, 107, 111, 123, 127},
++        {128, 132, 144, 148, 160, 164, 176, 180, 130, 134, 146, 150, 162, 166, 178, 182},
++        {136, 140, 152, 156, 168, 172, 184, 188, 138, 142, 154, 158, 170, 174, 186, 190},
++        {161, 165, 177, 181, 129, 133, 145, 149, 163, 167, 179, 183, 131, 135, 147, 151},
++        {169, 173, 185, 189, 137, 141, 153, 157, 171, 175, 187, 191, 139, 143, 155, 159},
++        {224, 228, 240, 244, 192, 196, 208, 212, 226, 230, 242, 246, 194, 198, 210, 214},
++        {232, 236, 248, 252, 200, 204, 216, 220, 234, 238, 250, 254, 202, 206, 218, 222},
++        {193, 197, 209, 213, 225, 229, 241, 245, 195, 199, 211, 215, 227, 231, 243, 247},
++        {201, 205, 217, 221, 233, 237, 249, 253, 203, 207, 219, 223, 235, 239, 251, 255},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::P4>::ColumnLookupTableT kColumnTable4{{
++        {0, 8, 32, 40, 64, 72, 96, 104, 2, 10, 34, 42, 66, 74, 98, 106, 4, 12, 36, 44, 68, 76, 100, 108, 6, 14, 38, 46, 70, 78, 102, 110},
++        {16, 24, 48, 56, 80, 88, 112, 120, 18, 26, 50, 58, 82, 90, 114, 122, 20, 28, 52, 60, 84, 92, 116, 124, 22, 30, 54, 62, 86, 94, 118, 126},
++        {65, 73, 97, 105, 1, 9, 33, 41, 67, 75, 99, 107, 3, 11, 35, 43, 69, 77, 101, 109, 5, 13, 37, 45, 71, 79, 103, 111, 7, 15, 39, 47},
++        {81, 89, 113, 121, 17, 25, 49, 57, 83, 91, 115, 123, 19, 27, 51, 59, 85, 93, 117, 125, 21, 29, 53, 61, 87, 95, 119, 127, 23, 31, 55, 63},
++        {192, 200, 224, 232, 128, 136, 160, 168, 194, 202, 226, 234, 130, 138, 162, 170, 196, 204, 228, 236, 132, 140, 164, 172, 198, 206, 230, 238, 134, 142, 166, 174},
++        {208, 216, 240, 248, 144, 152, 176, 184, 210, 218, 242, 250, 146, 154, 178, 186, 212, 220, 244, 252, 148, 156, 180, 188, 214, 222, 246, 254, 150, 158, 182, 190},
++        {129, 137, 161, 169, 193, 201, 225, 233, 131, 139, 163, 171, 195, 203, 227, 235, 133, 141, 165, 173, 197, 205, 229, 237, 135, 143, 167, 175, 199, 207, 231, 239},
++        {145, 153, 177, 185, 209, 217, 241, 249, 147, 155, 179, 187, 211, 219, 243, 251, 149, 157, 181, 189, 213, 221, 245, 253, 151, 159, 183, 191, 215, 223, 247, 255},
++        {256, 264, 288, 296, 320, 328, 352, 360, 258, 266, 290, 298, 322, 330, 354, 362, 260, 268, 292, 300, 324, 332, 356, 364, 262, 270, 294, 302, 326, 334, 358, 366},
++        {272, 280, 304, 312, 336, 344, 368, 376, 274, 282, 306, 314, 338, 346, 370, 378, 276, 284, 308, 316, 340, 348, 372, 380, 278, 286, 310, 318, 342, 350, 374, 382},
++        {321, 329, 353, 361, 257, 265, 289, 297, 323, 331, 355, 363, 259, 267, 291, 299, 325, 333, 357, 365, 261, 269, 293, 301, 327, 335, 359, 367, 263, 271, 295, 303},
++        {337, 345, 369, 377, 273, 281, 305, 313, 339, 347, 371, 379, 275, 283, 307, 315, 341, 349, 373, 381, 277, 285, 309, 317, 343, 351, 375, 383, 279, 287, 311, 319},
++        {448, 456, 480, 488, 384, 392, 416, 424, 450, 458, 482, 490, 386, 394, 418, 426, 452, 460, 484, 492, 388, 396, 420, 428, 454, 462, 486, 494, 390, 398, 422, 430},
++        {464, 472, 496, 504, 400, 408, 432, 440, 466, 474, 498, 506, 402, 410, 434, 442, 468, 476, 500, 508, 404, 412, 436, 444, 470, 478, 502, 510, 406, 414, 438, 446},
++        {385, 393, 417, 425, 449, 457, 481, 489, 387, 395, 419, 427, 451, 459, 483, 491, 389, 397, 421, 429, 453, 461, 485, 493, 391, 399, 423, 431, 455, 463, 487, 495},
++        {401, 409, 433, 441, 465, 473, 497, 505, 403, 411, 435, 443, 467, 475, 499, 507, 405, 413, 437, 445, 469, 477, 501, 509, 407, 415, 439, 447, 471, 479, 503, 511},
++    }};
++
 +    constexpr PixelStorageTraits<GSMem::C16>::ColumnLookupTableT kColumnTable16{{
 +        {0, 2, 8, 10, 16, 18, 24, 26, 1, 3, 9, 11, 17, 19, 25, 27},
 +        {4, 6, 12, 14, 20, 22, 28, 30, 5, 7, 13, 15, 21, 23, 29, 31},
@@ -162,12 +227,17 @@ index 0000000..49a2f88
 +    constexpr uint32_t kVramPages = kVramBytes / 8192u;
 +    constexpr uint32_t kHostW = 640u;
 +    constexpr uint32_t kHostH = 512u;
-+    // Flat halfword offsets of each page table in the concatenated table SSBO
-+    // ([C32 32x(64x32)][C16 32x(64x64)][C16S 32x(64x64)]).
++    // Flat halfword offsets of each page table in the concatenated table SSBO. Phase 0/1
++    // needed only the display formats; the phase-2 rasterizer also samples paletted
++    // textures (P8/P4 have their own page geometry AND column order) and reads/writes the
++    // Z buffer (Z32/Z24 share C32's column order but NOT its block order).
 +    constexpr uint32_t kTabOffC32 = 0u;
 +    constexpr uint32_t kTabOffC16 = 32u * 64u * 32u;
 +    constexpr uint32_t kTabOffC16S = kTabOffC16 + 32u * 64u * 64u;
-+    constexpr uint32_t kTabHalfwords = kTabOffC16S + 32u * 64u * 64u;
++    constexpr uint32_t kTabOffZ32 = kTabOffC16S + 32u * 64u * 64u;
++    constexpr uint32_t kTabOffP8 = kTabOffZ32 + 32u * 64u * 32u;
++    constexpr uint32_t kTabOffP4 = kTabOffP8 + 32u * 128u * 64u;
++    constexpr uint32_t kTabHalfwords = kTabOffP4 + 32u * 128u * 128u;
 +
 +    // The kernel: one invocation per host output pixel. Mirrors, in order:
 +    // PixelStorageTraits<>::PageId/Address (page tables uploaded), ::Read's
@@ -351,24 +421,518 @@ index 0000000..49a2f88
 +layout(std430, binding = 2) buffer Result { uint mism; uint firstIdx; uint firstGot; uint firstExp; };
 +layout(std430, binding = 3) buffer Hist { uint pageHist[]; };
 +uniform uint uWords;
++uniform uint uBase;   // word offset into the mirror (0 = whole-VRAM compare)
 +
 +void main()
 +{
 +    uint i = gl_GlobalInvocationID.x;
 +    if (i >= uWords)
 +        return;
-+    uint g = mir[i];
++    uint g = mir[uBase + i];
 +    uint e = refv[i];
 +    if (g != e)
 +    {
 +        atomicAdd(mism, 1u);
-+        atomicAdd(pageHist[i >> 11u], 1u);
++        atomicAdd(pageHist[(uBase + i) >> 11u], 1u);
 +        if (atomicCompSwap(firstIdx, 0xFFFFFFFFu, i) == 0xFFFFFFFFu)
 +        {
 +            firstGot = g;
 +            firstExp = e;
 +        }
 +    }
++}
++)GLSL";
++
++    // Phase-2a rasterizer (cont.169): ONE primitive per dispatch, one invocation per pixel
++    // of its scissor-clipped bbox. Race-free by construction -- within a single primitive
++    // each pixel is visited once, and a pixel owns its frame word and its Z word.
++    //
++    // This is a line-by-line replica of the CPU oracle's pixel pipeline: DrawTriangle's
++    // barycentric setup and interpolation, SampleTexture (wrap, bilinear, TEXA, CLUT),
++    // combineTexture, classifyAlphaTest, the Z test, the ALPHA blend equation and
++    // WritePixel's FBMSK/FBA/preserve-alpha write-out. Where the CPU uses double (the Z
++    // interpolation) so does this; where the CPU divides, the host pre-divided (see
++    // GsGpuPrim) -- except SampleTexture's per-pixel 1/q, which is done in double and
++    // rounded once, since GLSL only guarantees ~2.5 ULP for float division.
++    const char *kRasterShader = R"GLSL(#version 430
++#extension GL_ARB_gpu_shader_fp64 : enable
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(std430, binding = 0) buffer Mirror { uint vram[]; };
++layout(std430, binding = 1) readonly buffer PageTab { uint ptab[]; };
++layout(std430, binding = 2) readonly buffer PrimBuf
++{
++    float x0, y0, x1, y1, x2, y2;
++    uint z0lo, z0hi, z1lo, z1hi, z2lo, z2hi;
++    uint rgba0, rgba1, rgba2;
++    float q0, q1, q2;
++    float s0, s1, s2;
++    float t0, t1, t2;
++    uint uv0, uv1, uv2;
++    uint fog0, fog1, fog2;
++    float winding, invAbsDenom, fstDiv;
++    uint minX, minY, maxX, maxY;
++    uint fbp, fbw, fpsm, fbmsk;
++    uint zbp, zpsm, zmsk;
++    uint scissorX0, scissorY0, scissorX1, scissorY1;
++    uint primType, iip, tme, fge, fst, abe;
++    uint ate, atst, aref, afail, zte, ztst;
++    uint blendA, blendB, blendC, blendD, blendFix;
++    uint fba;
++    uint fogR, fogG, fogB;
++    uint tbp, tbw, tpsm, tcc, tfx;
++    uint cbp, cpsm, csm, csa;
++    uint texW, texH, linear;
++    uint wms, wmt, minU, maxU, minV, maxV;
++    uint ta0, ta1, aem;
++    uint clutShadowHave;
++    uint clutShadow[16];
++} P;
++
++// Page-table offsets, in halfwords, matching the host's kTabOff* constants.
++const uint TAB_C32  = 0u;
++const uint TAB_C16  = 65536u;
++const uint TAB_C16S = 196608u;
++const uint TAB_Z32  = 327680u;
++const uint TAB_P8   = 393216u;
++const uint TAB_P4   = 655360u;
++
++uint tab16(uint tabOff, uint idx)
++{
++    uint h = tabOff + idx;
++    uint w = ptab[h >> 1u];
++    return ((h & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
++}
++
++// PixelStorageTraits<>::Address: page id (monotonic in x/y) * pixels-per-page + the
++// in-page lookup. bw is in 64-pixel units; T8/T4's wider pages divide it down.
++uint pixelAddr(uint tabOff, uint bp, uint bw, uint x, uint y, uint pw, uint ph)
++{
++    uint pixPerPage = pw * ph;
++    uint page = (bp >> 5u) + (y / ph) * ((max(bw, 1u) * 64u) / pw) + (x / pw);
++    uint lidx = (bp & 31u) * pixPerPage + (y % ph) * pw + (x % pw);
++    return page * pixPerPage + tab16(tabOff, lidx);
++}
++
++uint loadByte(uint byteAddr)
++{
++    return (vram[byteAddr >> 2u] >> ((byteAddr & 3u) * 8u)) & 0xFFu;
++}
++
++uint rgba5551to8888(uint c)
++{
++    uint r = (c & 31u) << 3u;
++    uint g = ((c >> 5u) & 31u) << 3u;
++    uint b = ((c >> 10u) & 31u) << 3u;
++    uint a = ((c >> 15u) & 1u) << 7u;
++    return r | (g << 8u) | (b << 16u) | (a << 24u);
++}
++
++// GSMem::Read<psm> for every format the sampler and the frame/Z paths can see.
++uint readVram(uint psm, uint bp, uint bw, uint x, uint y)
++{
++    if (psm == 2u || psm == 10u || psm == 50u || psm == 58u) // CT16 / CT16S / Z16 / Z16S
++    {
++        uint tab = (psm == 10u || psm == 58u) ? TAB_C16S : TAB_C16;
++        uint pa = pixelAddr(tab, bp, bw, x, y, 64u, 64u);
++        uint byteAddr = (pa * 2u) & 0x3FFFFEu;
++        uint w = vram[byteAddr >> 2u];
++        return ((byteAddr & 2u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
++    }
++    if (psm == 19u) // T8
++    {
++        uint pa = pixelAddr(TAB_P8, bp, bw, x, y, 128u, 64u);
++        return loadByte(pa & 0x3FFFFFu);
++    }
++    if (psm == 20u) // T4
++    {
++        uint pa = pixelAddr(TAB_P4, bp, bw, x, y, 128u, 128u);
++        uint bits = pa * 4u;
++        uint byteAddr = (bits >> 3u) & 0x3FFFFFu;
++        return (loadByte(byteAddr) >> (bits & 7u)) & 0x0Fu;
++    }
++    // Everything else rides the C32 page layout (Z32/Z24 use their own block order).
++    uint tab = (psm == 48u || psm == 49u) ? TAB_Z32 : TAB_C32;
++    uint pa = pixelAddr(tab, bp, bw, x, y, 64u, 32u);
++    if (psm == 27u) // T8H: the high byte of the word
++        return loadByte((pa * 4u + 3u) & 0x3FFFFFu);
++    if (psm == 36u) // T4HL: low nibble of the high byte
++        return loadByte((pa * 4u + 3u) & 0x3FFFFFu) & 0x0Fu;
++    if (psm == 44u) // T4HH: high nibble of the high byte
++        return (loadByte((pa * 4u + 3u) & 0x3FFFFFu) >> 4u) & 0x0Fu;
++    uint word = vram[((pa * 4u) & 0x3FFFFCu) >> 2u];
++    if (psm == 1u || psm == 49u) // CT24 / Z24
++        return word & 0x00FFFFFFu;
++    return word;
++}
++
++// GSMem::Write<psm> for the frame/Z formats. Only one invocation ever targets a given
++// pixel within a single-primitive dispatch, so a plain read-modify-write is safe for the
++// sub-word formats -- EXCEPT the 16-bit ones, where two pixels share a word and the RMW
++// needs an atomic. (This game's census has CT32 frames and Z24 only; the 16-bit arm is
++// there so an unexpected format is still correct rather than silently wrong.)
++void writeVramPsm(uint psm, uint bp, uint bw, uint x, uint y, uint value)
++{
++    if (psm == 2u || psm == 10u || psm == 50u || psm == 58u) // CT16 / CT16S / Z16 / Z16S
++    {
++        uint tab = (psm == 10u || psm == 58u) ? TAB_C16S : TAB_C16;
++        uint pa = pixelAddr(tab, bp, bw, x, y, 64u, 64u);
++        uint byteAddr = (pa * 2u) & 0x3FFFFEu;
++        uint wi = byteAddr >> 2u;
++        if ((byteAddr & 2u) == 0u)
++            atomicAnd(vram[wi], 0xFFFF0000u), atomicOr(vram[wi], value & 0xFFFFu);
++        else
++            atomicAnd(vram[wi], 0x0000FFFFu), atomicOr(vram[wi], (value & 0xFFFFu) << 16u);
++        return;
++    }
++    uint tab = (psm == 48u || psm == 49u) ? TAB_Z32 : TAB_C32;
++    uint pa = pixelAddr(tab, bp, bw, x, y, 64u, 32u);
++    uint wi = ((pa * 4u) & 0x3FFFFCu) >> 2u;
++    if (psm == 1u || psm == 49u) // CT24 / Z24 keep the top byte (RMW)
++        vram[wi] = (vram[wi] & 0xFF000000u) | (value & 0x00FFFFFFu);
++    else
++        vram[wi] = value;
++}
++
++uint applyTexa(uint psm, uint texel)
++{
++    if (psm == 0u) // CT32 passes through
++        return texel;
++    bool rgbZero = (texel & 0x00FFFFFFu) == 0u;
++    uint a = (texel >> 24u) & 0xFFu;
++    if (psm == 1u) // CT24
++        a = (P.aem != 0u && rgbZero) ? 0u : P.ta0;
++    else if (psm == 2u || psm == 10u) // CT16 / CT16S
++        a = ((a & 0x80u) != 0u) ? P.ta1 : ((P.aem != 0u && rgbZero) ? 0u : P.ta0);
++    return (texel & 0x00FFFFFFu) | (a << 24u);
++}
++
++uint resolveClutIndex(uint index)
++{
++    if (P.csm != 0u)
++        return (P.tpsm == 20u || P.tpsm == 44u || P.tpsm == 36u) ? (index & 0x0Fu) : index;
++    bool is16 = (P.cpsm == 2u || P.cpsm == 10u);
++    uint csaMask = is16 ? 0x1Fu : 0x0Fu;
++    uint idxMask = is16 ? 0x1FFu : 0x0FFu;
++    uint clutBase = (P.csa & csaMask) << 4u;
++    uint ci;
++    if (P.tpsm == 20u || P.tpsm == 44u || P.tpsm == 36u)
++        ci = clutBase + (index & 0x0Fu);
++    else if (P.tpsm == 19u || P.tpsm == 27u)
++        ci = clutBase + index;
++    else
++        return index;
++    ci = ci & idxMask;
++    // CSM1 swaps address bits 3 and 4.
++    return (ci & ~0x18u) | ((ci & 0x08u) << 1u) | ((ci & 0x10u) >> 1u);
++}
++
++uint lookupClut(uint index)
++{
++    uint ci = resolveClutIndex(index);
++    bool csm2 = (P.csm != 0u);
++    uint clutWidth = 1u; // CSM1 ignores TEXCLUT; CSM2 does not occur in this game
++    uint clutX = ci & 0x0Fu;
++    uint clutY = ci >> 4u;
++    if (P.cpsm == 0u)
++    {
++        uint entry = readVram(0u, P.cbp, clutWidth, clutX, clutY);
++        // CLUT shadow: an entry whose RGB was zeroed by a colliding render target while
++        // its alpha still matches the uploaded payload is served from the upload.
++        if (P.clutShadowHave != 0u && !csm2 && (entry & 0x00FFFFFFu) == 0u &&
++            clutX < 8u && clutY < 2u)
++        {
++            uint up = P.clutShadow[clutY * 8u + clutX];
++            if ((up & 0xFF000000u) == (entry & 0xFF000000u) && (up & 0x00FFFFFFu) != 0u)
++                entry = up;
++        }
++        return applyTexa(0u, entry);
++    }
++    if (P.cpsm == 1u)
++        return applyTexa(1u, readVram(1u, P.cbp, clutWidth, clutX, clutY));
++    if (P.cpsm == 2u || P.cpsm == 10u)
++        return applyTexa(P.cpsm, rgba5551to8888(readVram(P.cpsm, P.cbp, clutWidth, clutX, clutY)));
++    return 0xFFFF00FFu;
++}
++
++int wrapCoord(int c, int size, uint mode, uint rMin, uint rMax)
++{
++    if (mode == 0u)
++        return int(uint(c) & uint(size - 1));
++    if (mode == 1u)
++        return clamp(c, 0, size - 1);
++    if (mode == 2u)
++        return min(max(c, int(rMin)), int(rMax));
++    return int((uint(c) & rMin) | rMax);
++}
++
++uint samplePoint(int su, int sv)
++{
++    su = wrapCoord(su, int(P.texW), P.wms, P.minU, P.maxU);
++    sv = wrapCoord(sv, int(P.texH), P.wmt, P.minV, P.maxV);
++    uint raw = readVram(P.tpsm, P.tbp, P.tbw, uint(su), uint(sv));
++    if (P.tpsm == 0u || P.tpsm == 48u || P.tpsm == 1u || P.tpsm == 49u)
++        return applyTexa(P.tpsm, raw);
++    if (P.tpsm == 2u || P.tpsm == 10u || P.tpsm == 50u || P.tpsm == 58u)
++        return applyTexa(P.tpsm, rgba5551to8888(raw));
++    if (P.tpsm == 19u || P.tpsm == 27u || P.tpsm == 20u || P.tpsm == 36u || P.tpsm == 44u)
++        return lookupClut(raw);
++    return applyTexa(0u, raw); // undefined psm decodes as CT32
++}
++
++uint lerpChan(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
++{
++    // `precise` is load-bearing, not decoration: GLSL lets an implementation contract
++    // a*b+c into an FMA, and the CPU oracle (built -msse4.1, so no FMA at all) does not.
++    // A sub-ULP difference here lands on the other side of floor(x+0.5) and shows up as a
++    // +-1 LSB colour channel -- exactly the 634-word divergence run181b measured.
++    precise float top = float(c00) + (float(c10) - float(c00)) * fx;
++    precise float bot = float(c01) + (float(c11) - float(c01)) * fx;
++    precise float mid = top + (bot - top) * fy;
++    // std::lround = half away from zero; GLSL round() picks its direction at .5, so spell
++    // it out. Channel lerps of 0..255 endpoints with fx,fy in [0,1) never go negative.
++    return uint(clamp(int(floor(mid + 0.5)), 0, 255));
++}
++
++uint sampleTexture(float s, float t, float q, uint uu, uint vv)
++{
++    precise float texUf, texVf;
++    if (P.fst != 0u)
++    {
++        texUf = float(uu) / P.fstDiv;
++        texVf = float(vv) / P.fstDiv;
++    }
++    else
++    {
++        float aq = (abs(q) > 1.0e-8) ? q : 1.0;
++        float invQ = float(1.0lf / double(aq)); // fp64 divide is IEEE; float divide is not
++        texUf = s * invQ * float(P.texW);
++        texVf = t * invQ * float(P.texH);
++        // (both already `precise` by declaration -- see lerpChan's note)
++    }
++    if (P.linear == 0u)
++        return samplePoint(int(texUf), int(texVf));
++
++    precise float su = texUf - 0.5;
++    precise float sv = texVf - 0.5;
++    int u0 = int(floor(su));
++    int v0 = int(floor(sv));
++    precise float fx = su - float(u0);
++    precise float fy = sv - float(v0);
++    uint c00 = samplePoint(u0, v0);
++    uint c10 = samplePoint(u0 + 1, v0);
++    uint c01 = samplePoint(u0, v0 + 1);
++    uint c11 = samplePoint(u0 + 1, v0 + 1);
++    uint r = lerpChan(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy);
++    uint g = lerpChan((c00 >> 8u) & 0xFFu, (c10 >> 8u) & 0xFFu, (c01 >> 8u) & 0xFFu, (c11 >> 8u) & 0xFFu, fx, fy);
++    uint b = lerpChan((c00 >> 16u) & 0xFFu, (c10 >> 16u) & 0xFFu, (c01 >> 16u) & 0xFFu, (c11 >> 16u) & 0xFFu, fx, fy);
++    uint a = lerpChan((c00 >> 24u) & 0xFFu, (c10 >> 24u) & 0xFFu, (c01 >> 24u) & 0xFFu, (c11 >> 24u) & 0xFFu, fx, fy);
++    return r | (g << 8u) | (b << 16u) | (a << 24u);
++}
++
++bool passesAlphaTest(uint a)
++{
++    if (P.ate == 0u)
++        return true;
++    if (P.atst == 0u) return false;
++    if (P.atst == 1u) return true;
++    if (P.atst == 2u) return a < P.aref;
++    if (P.atst == 3u) return a <= P.aref;
++    if (P.atst == 4u) return a == P.aref;
++    if (P.atst == 5u) return a >= P.aref;
++    if (P.atst == 6u) return a > P.aref;
++    return a != P.aref;
++}
++
++int pickRGB(uint sel, int cs, int cd)
++{
++    if (sel == 0u) return cs;
++    if (sel == 1u) return cd;
++    return 0;
++}
++
++void main()
++{
++    uint px_i = P.minX + gl_GlobalInvocationID.x;
++    uint py_i = P.minY + gl_GlobalInvocationID.y;
++    if (px_i > P.maxX || py_i > P.maxY)
++        return;
++
++    float px = float(px_i) + 0.5;
++    float py = float(py_i) + 0.5;
++
++    // DrawTriangle's barycentric coverage test, on the same floats in the same order.
++    precise float w0 = (((P.y1 - P.y2) * (px - P.x2) + (P.x2 - P.x1) * (py - P.y2)) * P.winding) * P.invAbsDenom;
++    precise float w1 = (((P.y2 - P.y0) * (px - P.x2) + (P.x0 - P.x2) * (py - P.y2)) * P.winding) * P.invAbsDenom;
++    precise float w2 = 1.0 - w0 - w1;
++    const float kEdgeEpsilon = 1.0e-4;
++    if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++        return;
++
++    // The oracle interpolates Z in double from float weights; match exactly.
++    double zd = packDouble2x32(uvec2(P.z0lo, P.z0hi)) * double(w0) +
++                packDouble2x32(uvec2(P.z1lo, P.z1hi)) * double(w1) +
++                packDouble2x32(uvec2(P.z2lo, P.z2hi)) * double(w2);
++
++    uint r, g, b, a;
++    if (P.iip != 0u)
++    {
++        precise float ir = float((P.rgba0      ) & 0xFFu) * w0 + float((P.rgba1      ) & 0xFFu) * w1 + float((P.rgba2      ) & 0xFFu) * w2;
++        precise float ig = float((P.rgba0 >>  8u) & 0xFFu) * w0 + float((P.rgba1 >>  8u) & 0xFFu) * w1 + float((P.rgba2 >>  8u) & 0xFFu) * w2;
++        precise float ib = float((P.rgba0 >> 16u) & 0xFFu) * w0 + float((P.rgba1 >> 16u) & 0xFFu) * w1 + float((P.rgba2 >> 16u) & 0xFFu) * w2;
++        precise float ia = float((P.rgba0 >> 24u) & 0xFFu) * w0 + float((P.rgba1 >> 24u) & 0xFFu) * w1 + float((P.rgba2 >> 24u) & 0xFFu) * w2;
++        r = uint(clamp(int(ir), 0, 255));
++        g = uint(clamp(int(ig), 0, 255));
++        b = uint(clamp(int(ib), 0, 255));
++        a = uint(clamp(int(ia), 0, 255));
++    }
++    else
++    {
++        r = P.rgba2 & 0xFFu;
++        g = (P.rgba2 >> 8u) & 0xFFu;
++        b = (P.rgba2 >> 16u) & 0xFFu;
++        a = (P.rgba2 >> 24u) & 0xFFu;
++    }
++
++    if (P.tme != 0u)
++    {
++        precise float is = 0.0, it = 0.0, iq = 1.0;
++        uint iu = 0u, iv = 0u;
++        if (P.fst != 0u)
++        {
++            precise float fu = float(P.uv0 & 0xFFFFu) * w0 + float(P.uv1 & 0xFFFFu) * w1 + float(P.uv2 & 0xFFFFu) * w2;
++            precise float fv = float(P.uv0 >> 16u) * w0 + float(P.uv1 >> 16u) * w1 + float(P.uv2 >> 16u) * w2;
++            iu = uint(fu) & 0xFFFFu;
++            iv = uint(fv) & 0xFFFFu;
++        }
++        else
++        {
++            // The GS DDA interpolates homogeneous S/T/Q; texel coords come from S/Q, T/Q
++            // only AFTER interpolation.
++            is = P.s0 * w0 + P.s1 * w1 + P.s2 * w2;
++            it = P.t0 * w0 + P.t1 * w1 + P.t2 * w2;
++            iq = P.q0 * w0 + P.q1 * w1 + P.q2 * w2;
++        }
++        uint texel = sampleTexture(is, it, iq, iu, iv);
++        uint tr = texel & 0xFFu, tg = (texel >> 8u) & 0xFFu;
++        uint tb = (texel >> 16u) & 0xFFu, ta = (texel >> 24u) & 0xFFu;
++        bool hasAlpha = P.tcc != 0u;
++        uint nr, ng, nb, na;
++        if (P.tfx == 0u) // MODULATE
++        {
++            nr = uint(clamp(int((tr * r) >> 7u), 0, 255));
++            ng = uint(clamp(int((tg * g) >> 7u), 0, 255));
++            nb = uint(clamp(int((tb * b) >> 7u), 0, 255));
++            na = hasAlpha ? uint(clamp(int((ta * a) >> 7u), 0, 255)) : a;
++        }
++        else if (P.tfx == 1u) // DECAL
++        {
++            nr = tr; ng = tg; nb = tb; na = hasAlpha ? ta : a;
++        }
++        else if (P.tfx == 2u) // HIGHLIGHT
++        {
++            nr = uint(clamp(int(((tr * r) >> 7u) + a), 0, 255));
++            ng = uint(clamp(int(((tg * g) >> 7u) + a), 0, 255));
++            nb = uint(clamp(int(((tb * b) >> 7u) + a), 0, 255));
++            na = hasAlpha ? uint(clamp(int(ta + a), 0, 255)) : a;
++        }
++        else // HIGHLIGHT2 (tfx is 2 bits, so this is the only remaining case)
++        {
++            nr = uint(clamp(int(((tr * r) >> 7u) + a), 0, 255));
++            ng = uint(clamp(int(((tg * g) >> 7u) + a), 0, 255));
++            nb = uint(clamp(int(((tb * b) >> 7u) + a), 0, 255));
++            na = hasAlpha ? ta : a;
++        }
++        r = nr; g = ng; b = nb; a = na;
++    }
++
++    // --- WritePixel ---
++    if (px_i < P.scissorX0 || px_i > P.scissorX1 || py_i < P.scissorY0 || py_i > P.scissorY1)
++        return;
++
++    if (P.fge != 0u)
++    {
++        precise float ifog = float(P.fog0) * w0 + float(P.fog1) * w1 + float(P.fog2) * w2;
++        uint fog = uint(clamp(int(ifog), 0, 255));
++        uint inv = 255u - fog;
++        r = (((fog * r) >> 8u) + ((inv * P.fogR) >> 8u)) & 0xFFu;
++        g = (((fog * g) >> 8u) + ((inv * P.fogG) >> 8u)) & 0xFFu;
++        b = (((fog * b) >> 8u) + ((inv * P.fogB) >> 8u)) & 0xFFu;
++    }
++
++    // classifyAlphaTest
++    bool writeRgb = true, writeAlpha = true, writeDepth = true;
++    if (!passesAlphaTest(a))
++    {
++        if (P.afail == 1u)      { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
++        else if (P.afail == 2u) { writeRgb = false; writeAlpha = false; writeDepth = true;  }
++        else if (P.afail == 3u)
++        {
++            if (P.fpsm == 0u)   { writeRgb = true;  writeAlpha = false; writeDepth = false; }
++            else                { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
++        }
++        else                    { writeRgb = false; writeAlpha = false; writeDepth = false; }
++    }
++    bool writesFb = writeRgb || writeAlpha;
++    if (!writesFb && !writeDepth)
++        return;
++
++    bool preserveDstAlpha = writeRgb && !writeAlpha && P.fpsm == 0u;
++    bool frmw = writesFb && ((P.fbmsk != 0u) || P.abe != 0u || preserveDstAlpha);
++    uint fbrgba = 0u;
++    if (frmw)
++    {
++        uint raw = readVram(P.fpsm, P.fbp, P.fbw, px_i, py_i);
++        fbrgba = raw;
++        if (P.fpsm == 2u || P.fpsm == 10u)
++            fbrgba = rgba5551to8888(raw);
++        else if (P.fpsm == 1u)
++            fbrgba = raw | 0x80000000u; // the GS supplies 0x80 dest alpha for RGB24
++    }
++
++    bool zpass = false;
++    if (P.ztst == 1u)
++        zpass = true;
++    else if (P.ztst == 2u || P.ztst == 3u)
++    {
++        uint zval = uint(zd + 0.5lf);
++        uint stored = readVram(P.zpsm, P.zbp, P.fbw, px_i, py_i);
++        zpass = (P.ztst == 2u) ? (zval >= stored) : (zval > stored);
++    }
++    if (!zpass)
++        return;
++
++    if (writesFb)
++    {
++        if (P.abe != 0u)
++        {
++            int dr = int(fbrgba & 0xFFu), dg = int((fbrgba >> 8u) & 0xFFu);
++            int db = int((fbrgba >> 16u) & 0xFFu), da = int((fbrgba >> 24u) & 0xFFu);
++            int cAlpha = (P.blendC == 0u) ? int(a) : ((P.blendC == 1u) ? da : int(P.blendFix));
++            int sr = int(r), sg = int(g), sb = int(b);
++            r = uint(clamp(((pickRGB(P.blendA, sr, dr) - pickRGB(P.blendB, sr, dr)) * cAlpha >> 7) + pickRGB(P.blendD, sr, dr), 0, 255));
++            g = uint(clamp(((pickRGB(P.blendA, sg, dg) - pickRGB(P.blendB, sg, dg)) * cAlpha >> 7) + pickRGB(P.blendD, sg, dg), 0, 255));
++            b = uint(clamp(((pickRGB(P.blendA, sb, db) - pickRGB(P.blendB, sb, db)) * cAlpha >> 7) + pickRGB(P.blendD, sb, db), 0, 255));
++        }
++        if (writeAlpha && (P.fba & 1u) != 0u && P.fpsm != 1u)
++            a |= 0x80u;
++        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
++        if (P.fbmsk != 0u)
++            pixel = (pixel & ~P.fbmsk) | (fbrgba & P.fbmsk);
++        if (preserveDstAlpha)
++            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
++        if (P.fpsm == 2u || P.fpsm == 10u)
++        {
++            uint pr = ((pixel      ) & 0xFFu) >> 3u;
++            uint pg = ((pixel >>  8) & 0xFFu) >> 3u;
++            uint pb = ((pixel >> 16) & 0xFFu) >> 3u;
++            uint pa = ((pixel >> 24) & 0xFFu) >> 7u;
++            pixel = pr | (pg << 5u) | (pb << 10u) | (pa << 15u);
++        }
++        writeVramPsm(P.fpsm, P.fbp, P.fbw, px_i, py_i, pixel);
++    }
++
++    if (writeDepth && P.zmsk == 0u)
++        writeVramPsm(P.zpsm, P.zbp, P.fbw, px_i, py_i, uint(zd + 0.5lf));
 +}
 +)GLSL";
 +
@@ -429,12 +993,16 @@ index 0000000..49a2f88
 +            Upload,
 +            Verify,
 +            PatchRaw,
-+            VerifyFull
++            VerifyFull,
++            RasterPrim,
++            VerifyRange
 +        } kind = Kind::Decode;
 +        DecodeDesc decode{};      // Decode / VerifyFull (vram+vramSize; out unused for the latter)
 +        GsGpuUploadChunk chunk{}; // Upload/Verify only
-+        std::vector<uint8_t> raw; // PatchRaw only: authoritative CPU VRAM bytes
-+        uint32_t rawOffset = 0;   // PatchRaw only: mirror byte offset
++        std::vector<uint8_t> raw; // PatchRaw / VerifyRange: CPU VRAM bytes
++        uint32_t rawOffset = 0;   // PatchRaw / VerifyRange: mirror byte offset
++        GsGpuPrim prim{};         // RasterPrim only
++        uint64_t tag = 0;         // VerifyRange only: echoed on divergence
 +        const uint8_t *drawPageMask = nullptr; // VerifyFull only (caller-owned, 512 bytes)
 +        bool *done = nullptr;     // Decode / VerifyFull (caller-stack completion flags)
 +        bool *result = nullptr;
@@ -477,9 +1045,15 @@ index 0000000..49a2f88
 +    GLuint histBuf = 0;
 +    GLuint fullProgram = 0;
 +    GLint locFullWords = -1;
++    GLint locFullBase = -1;
 +    unsigned long mvRuns = 0;
 +    unsigned long prPatches = 0;
 +    unsigned long long prBytes = 0;
++    // Phase-2a raster state (lazily created with the first raster job).
++    GLuint rasterProgram = 0;
++    GLuint primBuf = 0;
++    unsigned long rasterPrims = 0, rasterVerifies = 0, rasterMismRanges = 0;
++    unsigned long long rasterMismWords = 0;
 +
 +    bool fail(const char *stage)
 +    {
@@ -532,6 +1106,12 @@ index 0000000..49a2f88
 +                break;
 +            case Job::Kind::PatchRaw:
 +                patchRawOnThread(j.rawOffset, j.raw);
++                break;
++            case Job::Kind::RasterPrim:
++                rasterPrimOnThread(j.prim);
++                break;
++            case Job::Kind::VerifyRange:
++                verifyRangeOnThread(j.rawOffset, j.raw, j.tag);
 +                break;
 +            case Job::Kind::VerifyFull:
 +            {
@@ -706,6 +1286,15 @@ index 0000000..49a2f88
 +            auto t16s = std::make_unique<PixelStorageTraits<GSMem::C16S>::PageLookupTableT>();
 +            PixelStorageTraits<GSMem::C16S>::InitPageLookupTable(*t16s, kBlockTableC16S, kColumnTable16);
 +            std::memcpy(flat.data() + kTabOffC16S, t16s->data(), sizeof(*t16s));
++            auto tz32 = std::make_unique<PixelStorageTraits<GSMem::Z32>::PageLookupTableT>();
++            PixelStorageTraits<GSMem::Z32>::InitPageLookupTable(*tz32, kBlockTableZ32, kColumnTable32);
++            std::memcpy(flat.data() + kTabOffZ32, tz32->data(), sizeof(*tz32));
++            auto tp8 = std::make_unique<PixelStorageTraits<GSMem::P8>::PageLookupTableT>();
++            PixelStorageTraits<GSMem::P8>::InitPageLookupTable(*tp8, kBlockTableP8, kColumnTable8);
++            std::memcpy(flat.data() + kTabOffP8, tp8->data(), sizeof(*tp8));
++            auto tp4 = std::make_unique<PixelStorageTraits<GSMem::P4>::PageLookupTableT>();
++            PixelStorageTraits<GSMem::P4>::InitPageLookupTable(*tp4, kBlockTableP4, kColumnTable4);
++            std::memcpy(flat.data() + kTabOffP4, tp4->data(), sizeof(*tp4));
 +        }
 +
 +        gl.GenBuffers(1, &vramBuf);
@@ -905,6 +1494,90 @@ index 0000000..49a2f88
 +        prBytes += len;
 +    }
 +
++    bool ensureRaster()
++    {
++        if (rasterProgram != 0u)
++            return true;
++        rasterProgram = buildProgram(kRasterShader, "raster");
++        if (!rasterProgram)
++            return false;
++        gl.GenBuffers(1, &primBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, primBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GsGpuPrim), nullptr, GL_DYNAMIC_DRAW);
++        return gl.GetError() == 0u;
++    }
++
++    // Phase 2a: rasterize one primitive into the mirror. The caller has already seeded the
++    // mirror's frame/Z pages with the CPU's PRE-draw bytes (FIFO order guarantees those
++    // patches landed), so what this leaves behind is directly comparable with the CPU's
++    // post-draw VRAM.
++    void rasterPrimOnThread(const GsGpuPrim &prim)
++    {
++        if (!ensureRaster() || prim.maxX < prim.minX || prim.maxY < prim.minY)
++            return;
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, primBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GsGpuPrim), &prim, GL_DYNAMIC_DRAW);
++        gl.UseProgram(rasterProgram);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mirrorBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, tabBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, primBuf);
++        const uint32_t w = prim.maxX - prim.minX + 1u;
++        const uint32_t h = prim.maxY - prim.minY + 1u;
++        gl.DispatchCompute((w + 7u) / 8u, (h + 7u) / 8u, 1u);
++        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        ++rasterPrims;
++    }
++
++    // Phase 2a shadow verify: mirror[offset..] vs the CPU's post-draw bytes for the same
++    // range. Reuses the full-compare kernel through its uBase offset.
++    void verifyRangeOnThread(uint32_t offset, const std::vector<uint8_t> &expected, uint64_t tag)
++    {
++        if (expected.empty() || (offset & 3u) != 0u || !ensureFullCompare())
++            return;
++        const uint32_t len = std::min<uint32_t>(static_cast<uint32_t>(expected.size()),
++                                                kVramBytes - std::min(offset, kVramBytes));
++        const uint32_t words = len / 4u;
++        if (words == 0u)
++            return;
++        const uint32_t init[4] = {0u, 0xFFFFFFFFu, 0u, 0u};
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, refBuf);
++        gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, words * 4u, expected.data());
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuf);
++        gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 16, init);
++
++        gl.UseProgram(fullProgram);
++        gl.Uniform1ui(locFullWords, words);
++        gl.Uniform1ui(locFullBase, offset / 4u);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mirrorBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, refBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, resultBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, histBuf);
++        gl.DispatchCompute((words + 255u) / 256u, 1u, 1u);
++        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++
++        uint32_t res[4] = {0u, 0u, 0u, 0u};
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuf);
++        gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 16, res);
++        ++rasterVerifies;
++        if (res[0] != 0u)
++        {
++            ++rasterMismRanges;
++            rasterMismWords += res[0];
++            if (rasterMismRanges <= 16u || (rasterMismRanges % 4096u) == 0u)
++                std::fprintf(stderr,
++                             "[gsgpu:raster] MISMATCH #%lu tag=%016llx off=0x%06x words=%u: "
++                             "%u differ, first i=%u gpu=%08x cpu=%08x\n",
++                             rasterMismRanges, static_cast<unsigned long long>(tag),
++                             offset, words, res[0], res[1], res[2], res[3]);
++        }
++        const GLenum err = gl.GetError();
++        if (err != 0u && errorLogs < 8u)
++        {
++            ++errorLogs;
++            std::fprintf(stderr, "[gsgpu] GL error 0x%x during raster verify\n", err);
++        }
++    }
++
 +    bool ensureFullCompare()
 +    {
 +        if (fullProgram != 0u)
@@ -913,6 +1586,7 @@ index 0000000..49a2f88
 +        if (!fullProgram)
 +            return false;
 +        locFullWords = gl.GetUniformLocation(fullProgram, "uWords");
++        locFullBase = gl.GetUniformLocation(fullProgram, "uBase");
 +        gl.GenBuffers(1, &refBuf);
 +        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, refBuf);
 +        gl.BufferData(GL_SHADER_STORAGE_BUFFER, kVramBytes, nullptr, GL_DYNAMIC_DRAW);
@@ -941,6 +1615,7 @@ index 0000000..49a2f88
 +
 +        gl.UseProgram(fullProgram);
 +        gl.Uniform1ui(locFullWords, words);
++        gl.Uniform1ui(locFullBase, 0u);
 +        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mirrorBuf);
 +        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, refBuf);
 +        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, resultBuf);
@@ -1121,6 +1796,41 @@ index 0000000..49a2f88
 +    j.rawOffset = byteOffset;
 +    j.raw = std::move(bytes);
 +    m_impl->enqueue(std::move(j));
++}
++
++void GsGpuPresentDevice::RasterPrim(GsGpuPrim &&prim)
++{
++    if (!EnsureInitialized())
++        return;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::RasterPrim;
++    j.prim = std::move(prim);
++    m_impl->enqueue(std::move(j));
++}
++
++void GsGpuPresentDevice::MirrorVerifyRange(uint32_t byteOffset, std::vector<uint8_t> &&expected,
++                                           uint64_t tag)
++{
++    if (expected.empty() || !EnsureInitialized())
++        return;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::VerifyRange;
++    j.rawOffset = byteOffset;
++    j.raw = std::move(expected);
++    j.tag = tag;
++    m_impl->enqueue(std::move(j));
++}
++
++void GsGpuPresentDevice::RasterStats(unsigned long &prims, unsigned long &verifies,
++                                     unsigned long &mismatchRanges,
++                                     unsigned long long &mismatchWords) const
++{
++    // Read without the lock: these are device-thread counters sampled for a log line, and
++    // a torn read only misreports a diagnostic tally.
++    prims = m_impl->rasterPrims;
++    verifies = m_impl->rasterVerifies;
++    mismatchRanges = m_impl->rasterMismRanges;
++    mismatchWords = m_impl->rasterMismWords;
 +}
 +
 +void GsGpuPresentDevice::MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
