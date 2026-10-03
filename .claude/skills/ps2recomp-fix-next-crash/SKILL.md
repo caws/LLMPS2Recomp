@@ -89,6 +89,29 @@ a CSV function does nothing.
 6. **Full rebuild**, run again, confirm the frontier advanced (new log activity, the old
    warning gone). Update `docs/progress.md`. Repeat.
 
+## If the fix is an OVERRIDE (not a CSV bug)
+
+The registration goes in the game's `src/register_overrides.cpp` (the **control plane** — the one
+descriptor and every `registerFunction` call, in order); the hook **body** goes in a
+`src/<domain>/` module. Which module, and when a new one is warranted:
+[`docs/overrides.md`](../../../docs/overrides.md).
+
+**★ Never relocate a registration line.** Dispatch is last-wins and many registrations sit inside a
+conditional, so a line's position and guard are *semantics* — moving one changes which hook wins, or
+under which condition it installs (the symptom is a hook silently not running). Same reason: keep a
+`#define` in the same TU as its `#if`, and prefer env vars.
+
+After any control-plane change, verify with the companion checker:
+
+```
+check_registrations.py --game <game_dir>          # same address/order/GUARD DEPTH/body vs git; audits #ifs
+check_registrations.py --game <game_dir> --dead   # registrations a later unconditional one always overwrites
+check_registrations.py --game <game_dir> --list   # the ordered registration table
+```
+
+A hook that "does nothing" when you enable its env flag is usually a **dead registration** — check
+`--dead` before you debug the body.
+
 ## Override-based diagnostics (when a guest addr misbehaves)
 
 Register a one-shot probe in the game's `src/register_overrides.cpp` — you have `rdram`,

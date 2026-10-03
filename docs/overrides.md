@@ -46,6 +46,76 @@ catches the most demoralizing failure mode — debugging a stale binary.
 
 ---
 
+## Where new code goes: control plane + domain modules
+
+An override file grows without bound (LOTR's hit **7,500 lines / 190 hooks** before we split it).
+The shape that scales, and the one the build now supports:
+
+- **`src/register_overrides.cpp` = the CONTROL PLANE.** It holds the one
+  `PS2_REGISTER_GAME_OVERRIDE` descriptor and **every** `registerFunction` call, in one ordered
+  list. That list *is* the semantics of the override set (see below), so it must be readable
+  top-to-bottom in one file.
+- **`src/<domain>/<domain>.{cpp,h}` = the hook BODIES**, as named functions:
+
+```cpp
+// src/register_overrides.cpp — the ordered list; the guard stays here, with the registration
+if (std::getenv("LOTR_PROBE")) runtime.registerFunction(0x1F6C00u, lotr::pad_input::hook_1f6c00);
+
+// src/pad_input/pad_input.cpp — the body
+void hook_1f6c00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime) { ... }
+```
+
+### ★ Never relocate a registration line
+
+`registerFunction` → `replaceFunction` does `table[slot] = fn`: one slot per address, **last
+registration wins**. Addresses are often registered several times, and many registrations sit
+inside a conditional. So a registration's **position and guard are semantics, not formatting**:
+
+- Moving one — or hoisting a group into a per-module `installX(runtime)` helper — can put it under
+  a *different* guard, or change who wins the slot. The hook then silently stops running. (This
+  cost us a build: a pad-hook group landed inside another domain's `if`, and the only symptom was
+  one log line disappearing.) **Move the body; leave the registration where it is.**
+- A `#define` must stay in the same TU as its `#if`. If it drifts into a module, the `#if` left
+  behind quietly becomes `0`, its registration vanishes, and a *different* hook wins the address —
+  invisible to any check that ignores the preprocessor. **Prefer env vars; they cannot drift.**
+- A registration is **dead** if a later one for the same address is unconditional — it can never
+  win. Dead registrations accumulate and hide broken debug switches (a probe that "does nothing"
+  when you enable it is usually this).
+
+After **any** control-plane change:
+`.claude/skills/ps2recomp-fix-next-crash/check_registrations.py --game <game_dir>` — asserts same
+address / same order / **same guard depth** / same body vs a git ref, and audits every `#if`.
+`--dead` lists the registrations that can never win.
+
+### Which module? (and when a new one is warranted)
+
+Default: **the existing domain that owns that guest subsystem** — a loader hook goes in `loader/`,
+a glyph fix in `font_text/`. Create a **new domain** only when it clears all three:
+
+1. it is a **distinct guest subsystem** (not another hook on an existing one);
+2. it **owns state** — globals its hooks share and nobody else touches;
+3. it has, or will plainly have, **more than a hook or two**.
+
+A one-off probe does not earn a folder — it goes in the domain it probes, env-gated, default OFF,
+and gets deleted when the frontier moves on. Two failure modes to watch:
+
+- **Sprawl** — when a domain stops having one story (LOTR's `menu_flow`: 69 hooks), split it along
+  a real seam. Safe: moving a *body* between modules changes nothing.
+- **Accretion into a mega-hook** — a per-frame/vsync hook becomes the dumping ground for every
+  domain's periodic work (LOTR's `0x144B70`: **1,172 lines**). When new work starts landing there,
+  give it its own module and split it by what the pieces actually do.
+
+### Mechanics
+
+- Sources are installed into the runner **flattened by basename** (its CMake glob is non-recursive,
+  headers are included by bare filename), so **basenames must be globally unique** —
+  `scripts/03_build_game.sh` hard-errors on a collision, including with a generated file.
+- Modules are excluded from the runner's unity build (engine patch 08), so each is its own TU:
+  adding one recompiles one file instead of reshuffling every unity batch.
+- Namespace each domain (`namespace lotr::<domain>`); the control plane `using namespace`s them.
+
+---
+
 ## Pattern: wait-free replacement (uncompletable busy-wait)
 
 A guest function spins on a flag that a never-invoked completion handler would clear (an

@@ -22,7 +22,9 @@ first disc/file read, fixing crashes/stalls one frontier at a time. Readability 
 <game-repo>/
   <ELF>            # the PS2 executable; its path is declared in recomp/config.toml `input`
   recomp/          # PROVIDED inputs: config.toml + functions.csv
-  src/             # OUR work: register_overrides.cpp (+ .h)
+  src/             # OUR work: register_overrides.cpp (the control plane: the one
+                   #   PS2_REGISTER_GAME_OVERRIDE + every registerFunction call, in order)
+                   #   + src/<domain>/ modules holding the hook BODIES (docs/overrides.md)
   docs/            # game-specific human docs (elf.md = static facts, progress.md = journal)
   tmp/             # per-game scratch: generated/ (ps2_recomp output), logs
   gamefiles/       # disc/CD data (for the eventual file/disk reads)
@@ -47,9 +49,20 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   separate git repo (cloned per game). In particular
   `tools/<game>/PS2Recomp/ps2xRuntime/src/runner/` is **wiped and regenerated on every
   build**; never hand-edit it.
-- **All game-specific behavior goes through override hooks** in the game repo's
-  `src/register_overrides.cpp` only — `PS2_REGISTER_GAME_OVERRIDE(...)` +
-  `runtime.registerFunction(addr, lambda)`. Never patch generated runner files directly.
+- **All game-specific behavior goes through override hooks** in the game repo's `src/` — never
+  patch generated runner files directly. `src/` has a **control plane + domain modules** shape:
+  - `src/register_overrides.cpp` is the **CONTROL PLANE**. It owns the single
+    `PS2_REGISTER_GAME_OVERRIDE(...)` descriptor and **every** `runtime.registerFunction(addr, fn)`
+    call, in one ordered list. Nothing else may register a function.
+  - Hook **bodies** live in `src/<domain>/` (`dbcman/`, `menu_flow/`, `loader/`, `font_text/`, …) as
+    named `hook_<addr>` functions. New code: registration line here, body in the domain module —
+    see [`docs/overrides.md`](docs/overrides.md) for which module (and when a new one is warranted).
+  - **★ NEVER RELOCATE A REGISTRATION LINE.** Dispatch is last-wins (one slot per address) and many
+    registrations sit inside a conditional, so a line's **position and guard are semantics, not
+    formatting** — moving one changes which hook wins, or under which condition it installs. Same
+    reason: keep a `#define` in the same TU as its `#if` (prefer **env vars**, which cannot drift).
+    After ANY control-plane change run
+    `.claude/skills/ps2recomp-fix-next-crash/check_registrations.py --game <game_dir>`.
 - **Builds run in the background** and can take many minutes. Launch
   `scripts/03_build_game.sh <game_dir>` with a 600000 ms tool timeout and poll the log for
   `Build complete`. Do not block on it in the foreground.
