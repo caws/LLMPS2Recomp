@@ -17,3 +17,4 @@
 .idea/
 .vscode/
 sccache.log
+.claude/skills/ps2recomp-fix-next-crash/__*
