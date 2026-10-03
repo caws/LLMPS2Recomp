@@ -157,16 +157,19 @@ for f in "$GAME_DIR/src/"*.h;   do [[ -f "$f" ]] && install_if_changed "$f" "$RU
 if [ "$SKIP_BUILD" = false ]; then
     echo
     echo "[3/3] Building ps2EntryRunner..."
-    echo "    build type: $BUILD_TYPE"
+    echo "    build type: $BUILD_TYPE  (jobs: ${BUILD_JOBS:-6})"
     # Link with lld — the ~900MB runner relinks in seconds vs minutes on GNU ld.
     # Fallback if lld misbehaves: -fuse-ld=gold, or drop the flag entirely.
+    # NOTE: debug info (-g, from RelWithDebInfo) is kept on purpose — gdb on the runner
+    # is part of the workflow. Jobs capped (default 6) to avoid swap/OOM thrash on this
+    # 8-core/15GB box; override with BUILD_JOBS=N.
     cmake -S "$PS2RECOMP_ROOT" -B "$PS2RECOMP_ROOT/out/build" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         -DCMAKE_EXE_LINKER_FLAGS="-pthread -fuse-ld=lld"
     cmake --build "$PS2RECOMP_ROOT/out/build" \
         --target ps2EntryRunner \
         --config "$BUILD_TYPE" \
-        -j "$(nproc)"
+        -j "${BUILD_JOBS:-6}"
 
     # Move (not copy) the runner into the game's tmp/ so each game keeps its own
     # binary — there is no stale shared runner to clash with another game being
