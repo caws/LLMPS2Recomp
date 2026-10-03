@@ -1,11 +1,442 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..2f6d6d0 100644
+index bd75bba..cedfa23 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-@@ -840,6 +840,53 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -22,6 +22,48 @@ namespace
      }
  }
  
++// ---- Pipeline-commit tracking (PS2X_VU1_COMMITSKIP, default ON; =0 reverts to the
++// unconditional scans). Profiling (game cont.158a) measured the per-cycle
++// commitReadyPipelines() walk over all seven pipeline arrays (~50 slots) at 28% of total
++// runtime — called once per pair-loop iteration AND once per advanceOneCycle(), where the
++// top-of-loop call always re-scans at the same m_cycle the previous advance already
++// scanned. We track (a) a lower bound on the earliest readyCycle among valid entries and
++// (b) per-array valid-entry counts, so commitReadyPipelines() returns in O(1) when
++// nothing can be due, skips empty arrays when it does scan, and pipelinesPending()
++// answers in O(1). Purely a memoization: commit timing, order, and values are untouched
++// (no modeled hardware behavior changes, so no PCSX2 semantics to mirror).
++// File-static on purpose (a member would touch include/runtime/ps2_vu1.h, which the
++// generated code includes: ~60 min rebuild). The owner pointer keeps a second
++// interpreter instance (VU0) safe: the counters describe ONE instance, and any owner
++// switch or reset falls back to a full (status-quo) scan that rebuilds exact state.
++// Staleness is one-directional by construction — it can only ADD scans, never skip a due
++// commit: entries become valid only in the queue* helpers (each lowers the watermark via
++// notePipeInsert) and are cleared only inside the scan itself or resetScheduler() (which
++// drops ownership).
++static constexpr uint64_t kPipeIdle = ~0ull;
++static const bool s_vu1CommitSkip = []
++{ const char *e = std::getenv("PS2X_VU1_COMMITSKIP"); return !(e && e[0] == '0'); }();
++namespace
++{
++    struct PipeTrack
++    {
++        const void *owner = nullptr;
++        uint64_t nextReady = kPipeIdle; // lower bound while owner holds; kPipeIdle = none valid
++        uint32_t flag = 0, efu = 0, store = 0, vf = 0, vi = 0, acc = 0, fdiv = 0;
++        uint32_t total() const { return flag + efu + store + vf + vi + acc + fdiv; }
++    };
++}
++static PipeTrack s_pipe;
++static inline void notePipeInsert(const void *self, uint32_t &counter, uint64_t readyCycle)
++{
++    if (s_pipe.owner == self)
++    {
++        ++counter;
++        if (readyCycle < s_pipe.nextReady)
++            s_pipe.nextReady = readyCycle;
++    }
++}
++
+ void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
+ {
+     if (lanes == 0u)
+@@ -66,21 +108,41 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+ 
+ void VU1Interpreter::resetScheduler()
+ {
+-    m_flagPipeline = {};
+-    m_fdiv = {};
+-    m_efu = {};
+-    m_storePipeline = {};
+-    m_vfWritePipeline = {};
+-    m_viWritePipeline = {};
+-    m_accWritePipeline = {};
++    // Per-program scheduler prep — called at every execute() start, which for VU0 is
++    // EVERY VCALLMS at math-library rates (profiling cont.158d: the unconditional ~4KB
++    // of array clears here were the top memset in the run). Two cost cuts, both exact:
++    //
++    // (1) The in-flight pipeline arrays only need clearing when something is in flight.
++    // With the commit tracking (cont.158b) owning this instance, total()==0 PROVES all
++    // seven arrays are empty (a normal program end drains them via flushPipelines), so
++    // the clears are skipped. Any doubt — untracked, other owner, live entries — means
++    // a full clear, exactly the old behavior.
++    //
++    // (2) The ready/latest-write bookkeeping (m_vfReady/m_viReady/m_accReady/
++    // m_*LatestWrite/m_nextWriteSequence) is no longer cleared here at all: m_cycle and
++    // the write sequence are monotonic across programs (only reset() zeroes them, and it
++    // clears this bookkeeping itself), so stale entries are inert — a stale readyCycle
++    // is at most its issue cycle + the instruction latency, costing at worst a few
++    // bounded stall cycles on a register whose queued write a budget-exhausted program
++    // abandoned (the wholesale clear dropped those writes just the same).
++    //
++    // PCSX2 parity: vu0ExecMicro (VU0micro.cpp) performs no wholesale reset on VCALLMS —
++    // it syncs flags/cycle and starts the program with all other state persisting.
++    const bool pipesProvedEmpty =
++        s_vu1CommitSkip && s_pipe.owner == this && s_pipe.total() == 0u && !m_fdiv.valid;
++    if (!pipesProvedEmpty)
++    {
++        if (s_pipe.owner == this)
++            s_pipe = {}; // wholesale clear below invalidates the tracked state
++        m_flagPipeline = {};
++        m_fdiv = {};
++        m_efu = {};
++        m_storePipeline = {};
++        m_vfWritePipeline = {};
++        m_viWritePipeline = {};
++        m_accWritePipeline = {};
++    }
+     m_xgkick = {};
+-    m_vfReady = {};
+-    m_viReady = {};
+-    m_accReady = {};
+-    m_vfLatestWrite = {};
+-    m_viLatestWrite = {};
+-    m_accLatestWrite = {};
+-    m_nextWriteSequence = 0;
+     m_efuResourceReady = 0;
+     m_workingClip = m_state.clip;
+     m_viBranchBackupValue = 0;
+@@ -98,6 +160,15 @@ void VU1Interpreter::reset()
+     m_state.q = 1.0f;
+     m_state.r = 0x3F800000u;
+     m_cycle = 0;
++    // m_cycle just went backward to 0, so the monotonicity that lets resetScheduler()
++    // keep the ready/latest-write bookkeeping must be re-established by clearing it here.
++    m_vfReady = {};
++    m_viReady = {};
++    m_accReady = {};
++    m_vfLatestWrite = {};
++    m_viLatestWrite = {};
++    m_accLatestWrite = {};
++    m_nextWriteSequence = 0;
+     resetScheduler();
+ }
+ 
+@@ -538,6 +609,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->extraSticky = extraSticky;
+     entry->writesMac = true;
+     entry->writesStatus = true;
++    notePipeInsert(this, s_pipe.flag, entry->readyCycle);
+ }
+ 
+ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+@@ -574,6 +646,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.readyCycle = m_cycle + kFmacLatency;
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
++            notePipeInsert(this, s_pipe.flag, entry.readyCycle);
+             return;
+         }
+     }
+@@ -593,6 +666,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.readyCycle = m_cycle + kFmacLatency;
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
++            notePipeInsert(this, s_pipe.flag, entry.readyCycle);
+             return;
+         }
+     }
+@@ -617,6 +691,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.readyCycle = m_cycle + kFmacLatency;
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
++            notePipeInsert(this, s_pipe.flag, entry.readyCycle);
+             return;
+         }
+     }
+@@ -627,6 +702,13 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+ {
+     uint32_t ignoredFlags = 0u;
+     value = normalizeResult(value, ignoredFlags);
++    if (s_pipe.owner == this)
++    {
++        if (!m_fdiv.valid)
++            ++s_pipe.fdiv;
++        if (m_cycle + latency < s_pipe.nextReady)
++            s_pipe.nextReady = m_cycle + latency;
++    }
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
+     m_fdiv.value = value;
+@@ -646,6 +728,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
++            notePipeInsert(this, s_pipe.efu, entry.readyCycle);
+             return;
+         }
+     }
+@@ -663,6 +746,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
++            notePipeInsert(this, s_pipe.store, store.readyCycle);
+             return;
+         }
+     }
+@@ -690,6 +774,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+                 if ((laneMask & laneForComponent(component)) != 0u)
+                     m_vfLatestWrite[reg][component] = write.sequence;
+             }
++            notePipeInsert(this, s_pipe.vf, write.readyCycle);
+             return;
+         }
+     }
+@@ -711,6 +796,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write.reg = reg;
+             write.value = value;
+             m_viLatestWrite[reg] = write.sequence;
++            notePipeInsert(this, s_pipe.vi, write.readyCycle);
+             return;
+         }
+     }
+@@ -736,6 +822,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+                 if ((laneMask & laneForComponent(component)) != 0u)
+                     m_accLatestWrite[component] = write.sequence;
+             }
++            notePipeInsert(this, s_pipe.acc, write.readyCycle);
+             return;
+         }
+     }
+@@ -744,99 +831,218 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
+-    for (FlagPipelineEntry &entry : m_flagPipeline)
++    // O(1) fast path (PS2X_VU1_COMMITSKIP): while we own the tracking, s_pipe.nextReady
++    // is a lower bound on the earliest readyCycle among ALL valid entries (kPipeIdle when
++    // none are valid), so nothing can be due before it — the skip is exact, not a
++    // heuristic. Any doubt (other owner, flag off) falls through to the full scan.
++    const bool tracked = s_vu1CommitSkip && s_pipe.owner == this;
++    if (tracked && m_cycle < s_pipe.nextReady)
++        return;
++
++    // Full scan: commit everything due (identical order and effects to the untracked
++    // code), skipping arrays the counters prove empty, and rebuild exact counters + the
++    // exact next-ready watermark from the surviving entries.
++    uint64_t nextReady = kPipeIdle;
++    PipeTrack fresh;
++    const auto note = [&nextReady](uint64_t readyCycle)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
+-            continue;
++        if (readyCycle < nextReady)
++            nextReady = readyCycle;
++    };
+ 
+-        if (entry.writesMac)
+-            m_state.mac = entry.mac;
+-        if (entry.writesStatus)
+-        {
+-            const uint32_t current = entry.status & 0xFu;
+-            m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+-        }
+-        if (entry.writesSticky)
++    if (!tracked || s_pipe.flag != 0u)
++        for (FlagPipelineEntry &entry : m_flagPipeline)
+         {
+-            m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
++            if (!entry.valid)
++                continue;
++            if (entry.readyCycle > m_cycle)
++            {
++                ++fresh.flag;
++                note(entry.readyCycle);
++                continue;
++            }
++
++            if (entry.writesMac)
++                m_state.mac = entry.mac;
++            if (entry.writesStatus)
++            {
++                const uint32_t current = entry.status & 0xFu;
++                m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
++            }
++            if (entry.writesSticky)
++            {
++                m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
++            }
++            if (entry.writesClip)
++                m_state.clip = entry.clip;
++            entry = {};
+         }
+-        if (entry.writesClip)
+-            m_state.clip = entry.clip;
+-        entry = {};
+-    }
+ 
+-    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++    if ((!tracked || s_pipe.fdiv != 0u) && m_fdiv.valid)
+     {
+-        m_state.q = m_fdiv.value;
+-        const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+-        m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+-        m_fdiv = {};
++        if (m_fdiv.readyCycle <= m_cycle)
++        {
++            m_state.q = m_fdiv.value;
++            const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
++            m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
++            m_fdiv = {};
++        }
++        else
++        {
++            ++fresh.fdiv;
++            note(m_fdiv.readyCycle);
++        }
+     }
+ 
+-    for (ScalarPipelineEntry &entry : m_efu)
+-    {
+-        if (entry.valid && entry.readyCycle <= m_cycle)
++    if (!tracked || s_pipe.efu != 0u)
++        for (ScalarPipelineEntry &entry : m_efu)
+         {
++            if (!entry.valid)
++                continue;
++            if (entry.readyCycle > m_cycle)
++            {
++                ++fresh.efu;
++                note(entry.readyCycle);
++                continue;
++            }
+             m_state.p = entry.value;
+             entry = {};
+         }
+-    }
+ 
+-    for (PendingStore &store : m_storePipeline)
+-    {
+-        if (!store.valid || store.readyCycle > m_cycle)
+-            continue;
+-        if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
++    if (!tracked || s_pipe.store != 0u)
++        for (PendingStore &store : m_storePipeline)
++        {
++            if (!store.valid)
++                continue;
++            if (store.readyCycle > m_cycle)
++            {
++                ++fresh.store;
++                note(store.readyCycle);
++                continue;
++            }
++            if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
++            {
++                uint32_t oldWords[4]{};
++                std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
++                for (uint32_t component = 0; component < 4u; ++component)
++                {
++                    if ((store.laneMask & laneForComponent(component)) != 0u)
++                        oldWords[component] = store.words[component];
++                }
++                std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
++            }
++            store = {};
++        }
++
++    if (!tracked || s_pipe.vf != 0u)
++        for (PendingVfWrite &write : m_vfWritePipeline)
+         {
+-            uint32_t oldWords[4]{};
+-            std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
++            if (!write.valid)
++                continue;
++            if (write.readyCycle > m_cycle)
++            {
++                ++fresh.vf;
++                note(write.readyCycle);
++                continue;
++            }
+             for (uint32_t component = 0; component < 4u; ++component)
+             {
+-                if ((store.laneMask & laneForComponent(component)) != 0u)
+-                    oldWords[component] = store.words[component];
++                if ((write.laneMask & laneForComponent(component)) != 0u &&
++                    m_vfLatestWrite[write.reg][component] == write.sequence)
++                {
++                    m_state.vf[write.reg][component] = write.value[component];
++                }
+             }
+-            std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
++            write = {};
+         }
+-        store = {};
+-    }
+ 
+-    for (PendingVfWrite &write : m_vfWritePipeline)
+-    {
+-        if (!write.valid || write.readyCycle > m_cycle)
+-            continue;
+-        for (uint32_t component = 0; component < 4u; ++component)
++    if (!tracked || s_pipe.vi != 0u)
++        for (PendingViWrite &write : m_viWritePipeline)
+         {
+-            if ((write.laneMask & laneForComponent(component)) != 0u &&
+-                m_vfLatestWrite[write.reg][component] == write.sequence)
++            if (!write.valid)
++                continue;
++            if (write.readyCycle > m_cycle)
+             {
+-                m_state.vf[write.reg][component] = write.value[component];
++                ++fresh.vi;
++                note(write.readyCycle);
++                continue;
+             }
++            if (m_viLatestWrite[write.reg] == write.sequence)
++                m_state.vi[write.reg] = static_cast<int16_t>(write.value);
++            write = {};
+         }
+-        write = {};
+-    }
+ 
+-    for (PendingViWrite &write : m_viWritePipeline)
+-    {
+-        if (!write.valid || write.readyCycle > m_cycle)
+-            continue;
+-        if (m_viLatestWrite[write.reg] == write.sequence)
+-            m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+-        write = {};
+-    }
++    if (!tracked || s_pipe.acc != 0u)
++        for (PendingAccWrite &write : m_accWritePipeline)
++        {
++            if (!write.valid)
++                continue;
++            if (write.readyCycle > m_cycle)
++            {
++                ++fresh.acc;
++                note(write.readyCycle);
++                continue;
++            }
++            for (uint32_t component = 0; component < 4u; ++component)
++            {
++                if ((write.laneMask & laneForComponent(component)) != 0u &&
++                    m_accLatestWrite[component] == write.sequence)
++                {
++                    m_state.acc[component] = write.value[component];
++                }
++            }
++            write = {};
++        }
+ 
+-    for (PendingAccWrite &write : m_accWritePipeline)
++    fresh.owner = this;
++    fresh.nextReady = nextReady;
++    s_pipe = fresh;
++}
++
 +// XGKICK walk fixes (cont.155, both default ON with kill switches):
 +// - PS2X_VU1_KICKFLG3 (=0 reverts): GIF-tag FLG=3 is NOT a reserved format — ps2tek documents
 +//   FLG 11b as "Disable (same as IMAGE)" and PCSX2 (GIF_FLG_IMAGE2) falls through to the IMAGE
@@ -30,15 +461,21 @@ index bd75bba..2f6d6d0 100644
 +    static unsigned long s_drops = 0;
 +    ++s_drops;
 +    if (s_drops <= 24u || (s_drops % 1024u) == 0u)
-+    {
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
+-            continue;
+-        for (uint32_t component = 0; component < 4u; ++component)
 +        std::fprintf(stderr, "[VU1 kick-drop] n=%lu reason=0x%x pc=0x%x cycle=%llu src=0x%x\n",
 +                     s_drops, reason, pc, cycle, srcAddr);
 +        // Rule 12: dump the bytes the counter counts — the first two qwords at the kick source
 +        // identify the corruption class (zeros / file data / shifted stream / floats-as-tag).
 +        if (vuData && dataSize)
-+        {
+         {
+-            if ((write.laneMask & laneForComponent(component)) != 0u &&
+-                m_accLatestWrite[component] == write.sequence)
 +            for (uint32_t q = 0; q < 2u; ++q)
-+            {
+             {
+-                m_state.acc[component] = write.value[component];
 +                uint32_t w[4];
 +                for (uint32_t i = 0; i < 4u; ++i)
 +                {
@@ -48,15 +485,13 @@ index bd75bba..2f6d6d0 100644
 +                    w[i] = v;
 +                }
 +                std::fprintf(stderr, "    q%u: %08x %08x %08x %08x\n", q, w[0], w[1], w[2], w[3]);
-+            }
-+        }
-+    }
-+}
-+
- void VU1Interpreter::progressXgkick()
- {
-     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
-@@ -851,6 +898,44 @@ void VU1Interpreter::progressXgkick()
+             }
+         }
+-        write = {};
+     }
+ }
+ 
+@@ -851,6 +1057,44 @@ void VU1Interpreter::progressXgkick()
          m_xgkick.cycleCredit -= 2u;
          if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
          {
@@ -101,7 +536,7 @@ index bd75bba..2f6d6d0 100644
              reportReservedInstruction(false, 0xFFFFFFFBu);
              m_xgkick.active = false;
              return;
-@@ -879,10 +964,16 @@ void VU1Interpreter::progressXgkick()
+@@ -879,10 +1123,16 @@ void VU1Interpreter::progressXgkick()
                  tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
              else if (format == 1u)
                  tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
@@ -120,7 +555,7 @@ index bd75bba..2f6d6d0 100644
                  reportReservedInstruction(false, 0xFFFFFFF8u);
                  m_xgkick.active = false;
                  return;
-@@ -890,6 +981,12 @@ void VU1Interpreter::progressXgkick()
+@@ -890,6 +1140,12 @@ void VU1Interpreter::progressXgkick()
  
              if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
              {
@@ -133,7 +568,7 @@ index bd75bba..2f6d6d0 100644
                  reportReservedInstruction(false, 0xFFFFFFFBu);
                  m_xgkick.active = false;
                  return;
-@@ -922,15 +1019,33 @@ void VU1Interpreter::finishXgkick()
+@@ -922,15 +1178,33 @@ void VU1Interpreter::finishXgkick()
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
@@ -167,7 +602,18 @@ index bd75bba..2f6d6d0 100644
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
      m_xgkick = {};
      m_xgkick.active = true;
-@@ -1590,6 +1705,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -959,6 +1233,10 @@ bool VU1Interpreter::pipelinesPending() const
+ {
+     if (m_fdiv.valid || m_xgkick.active)
+         return true;
++    // O(1) while the commit tracking (PS2X_VU1_COMMITSKIP) owns this instance: the
++    // counters are exact, so total()==0 proves every array is empty.
++    if (s_vu1CommitSkip && s_pipe.owner == this)
++        return s_pipe.total() != 0u;
+     for (const ScalarPipelineEntry &entry : m_efu)
+         if (entry.valid)
+             return true;
+@@ -1590,6 +1868,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t startPC, uint32_t top, uint32_t itop,
                               uint32_t maxCycles)
  {

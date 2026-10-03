@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..a295077 100644
+index 9c39ae2..73b85a8 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,6 +10,7 @@
@@ -266,7 +266,82 @@ index 9c39ae2..a295077 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -947,6 +1182,12 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -745,6 +980,21 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+         }
+     });
+ 
++    // Per-batch resolved draw state (cont.158c perf): batch.state is immutable for the
++    // batch, so resolve the psm-table function pointers and block bases ONCE here instead
++    // of per pixel in WritePixel/SampleTexture. No VRAM = every read 0 / write no-op, so
++    // skipping the raster entirely is behavior-identical.
++    if (!m_vram)
++        return;
++    m_draw.frameRead = m_readVramFuncs[ctx.frame.psm & 0x3Fu];
++    m_draw.frameWrite = m_writeVramFuncs[ctx.frame.psm & 0x3Fu];
++    m_draw.zRead = m_readVramFuncs[ctx.zbuf.psm & 0x3Fu];
++    m_draw.zWrite = m_writeVramFuncs[ctx.zbuf.psm & 0x3Fu];
++    m_draw.texRead = m_readVramFuncs[ctx.tex0.psm & 0x3Fu];
++    m_draw.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
++    m_draw.fbw = std::max<u32>(ctx.frame.fbw, 1u);
++    m_draw.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++
+     switch (state.prim.type)
+     {
+     case GS_PRIM_SPRITE:
+@@ -792,11 +1042,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         b = applyFog(b, state.fogB);
+     }
+ 
+-    const u32 fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+-    const u32 fbw = std::max<u32>(ctx.frame.fbw, 1u);
++    const u32 fbp = m_draw.fbp;
++    const u32 fbw = m_draw.fbw;
+     const u32 fpsm = ctx.frame.psm;
+-    const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+-    const u32 zpsm = ctx.zbuf.psm;
++    const u32 zbp = m_draw.zbp;
+ 
+     const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
+     if (!writeMask.writesAnything())
+@@ -817,7 +1066,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+     u32 fbrgba = 0;
+     if (frmw)
+     {
+-        rawFramebufferPixel = ReadVramUnlocked(fpsm, fbp, fbw, x, y);
++        rawFramebufferPixel = m_draw.frameRead(m_vram, fbp, fbw, x, y);
+         fbrgba = rawFramebufferPixel;
+ 
+         if (bitsPerPixel(fpsm) == 16)
+@@ -847,11 +1096,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         zpass = true;
+         break;
+     case 2:
+-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
++        storedZ = m_draw.zRead(m_vram, zbp, fbw, x, y);
+         zpass = static_cast<uint32_t>(z) >= storedZ;
+         break;
+     case 3:
+-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
++        storedZ = m_draw.zRead(m_vram, zbp, fbw, x, y);
+         zpass = static_cast<uint32_t>(z) > storedZ;
+         break;
+     }
+@@ -930,12 +1179,12 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+             pixel = Rgba8888ToRgba5551(pixel);
+         }
+ 
+-        WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
++        m_draw.frameWrite(m_vram, fbp, fbw, x, y, pixel);
+     }
+ 
+     if (writeMask.writeDepth && !ctx.zbuf.zmask)
+     {
+-        WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
++        m_draw.zWrite(m_vram, zbp, fbw, x, y, z);
+     }
+ }
+ 
+@@ -947,6 +1196,12 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -279,7 +354,7 @@ index 9c39ae2..a295077 100644
      const uint32_t clutIndex = resolveClutIndex(index, cpsm, csm, csa, sourcePsm);
      const uint32_t clutWidth = (state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
      const uint32_t clutX = static_cast<uint32_t>(state.texclut.cou) + (clutIndex & 0x0Fu);
-@@ -969,26 +1210,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,26 +1224,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -341,16 +416,16 @@ index 9c39ae2..a295077 100644
      }
      else
      {
-@@ -1002,7 +1269,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +1283,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
 -        u32 out = ReadVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
-+        u32 out = ReadVramUnlocked(tex.psm, mipTbp, mipTbw, sampleU, sampleV);
++        u32 out = m_draw.texRead(m_vram, mipTbp, mipTbw, sampleU, sampleV);
  
          switch (tex.psm)
          {
-@@ -1024,7 +1291,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +1305,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -365,7 +440,7 @@ index 9c39ae2..a295077 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +1498,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,6 +1512,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -406,7 +481,7 @@ index 9c39ae2..a295077 100644
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +1588,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +1602,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -415,7 +490,7 @@ index 9c39ae2..a295077 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +1606,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +1620,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -448,7 +523,7 @@ index 9c39ae2..a295077 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1406,6 +1739,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +1753,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -492,7 +567,7 @@ index 9c39ae2..a295077 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1812,6 +2182,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +2196,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;
