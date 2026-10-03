@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
 new file mode 100644
-index 0000000..2dd220b
+index 0000000..8222505
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,895 @@
 +#include "runtime/gs/gs_gpu_device.h"
 +#include "runtime/gs/ps2_gs_memory.h"
 +
@@ -13,6 +13,7 @@ index 0000000..2dd220b
 +#include <condition_variable>
 +#include <cstdio>
 +#include <cstring>
++#include <deque>
 +#include <mutex>
 +#include <thread>
 +
@@ -243,6 +244,97 @@ index 0000000..2dd220b
 +}
 +)GLSL";
 +
++    // Phase-1 upload kernel: one invocation per chunk pixel, replicating
++    // UploadImageUnlocked's CT32 path (cursor x = dsax + p%rrw, y = dsay + p/rrw;
++    // WriteCT32's page walk + byte-address mask). Each pixel owns its word -- no
++    // atomics needed within a chunk.
++    const char *kUploadShader = R"GLSL(#version 430
++layout(local_size_x = 64) in;
++layout(std430, binding = 0) buffer Mirror { uint vram[]; };
++layout(std430, binding = 1) readonly buffer Payload { uint pay[]; };
++layout(std430, binding = 2) readonly buffer PageTab { uint ptab[]; };
++uniform uint uDbp;        // destination base, BLOCKS
++uniform uint uDbw;        // buffer width, 64-pixel units
++uniform uint uDsax;
++uniform uint uDsay;
++uniform uint uRrw;
++uniform uint uStartPixel;
++uniform uint uCount;
++uniform uint uTabOff;     // C32 table = 0
++
++uint tab16(uint idx)
++{
++    uint h = uTabOff + idx;
++    uint w = ptab[h >> 1u];
++    return ((h & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
++}
++
++void main()
++{
++    uint i = gl_GlobalInvocationID.x;
++    if (i >= uCount)
++        return;
++    uint p = uStartPixel + i;
++    uint x = uDsax + (p % uRrw);
++    uint y = uDsay + (p / uRrw);
++    uint page = (uDbp >> 5u) + (y >> 5u) * uDbw + (x >> 6u);
++    uint lidx = (uDbp & 31u) * 2048u + (y & 31u) * 64u + (x & 63u);
++    uint pixAddr = page * 2048u + tab16(lidx);
++    uint byteAddr = (pixAddr * 4u) & 0x3FFFFCu;
++    vram[byteAddr >> 2u] = pay[i];
++}
++)GLSL";
++
++    // Phase-1 verify kernel: compare the mirror at the chunk's addresses against the
++    // CPU-read post-upload values; atomically tally mismatches + capture the first
++    // divergent index/value pair (16-byte readback instead of the 4MB mirror).
++    const char *kVerifyShader = R"GLSL(#version 430
++layout(local_size_x = 64) in;
++layout(std430, binding = 0) readonly buffer Mirror { uint vram[]; };
++layout(std430, binding = 1) readonly buffer Expected { uint expv[]; };
++layout(std430, binding = 2) readonly buffer PageTab { uint ptab[]; };
++layout(std430, binding = 3) buffer Result { uint mism; uint firstIdx; uint firstGot; uint firstExp; };
++uniform uint uDbp;
++uniform uint uDbw;
++uniform uint uDsax;
++uniform uint uDsay;
++uniform uint uRrw;
++uniform uint uStartPixel;
++uniform uint uCount;
++uniform uint uTabOff;
++
++uint tab16(uint idx)
++{
++    uint h = uTabOff + idx;
++    uint w = ptab[h >> 1u];
++    return ((h & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
++}
++
++void main()
++{
++    uint i = gl_GlobalInvocationID.x;
++    if (i >= uCount)
++        return;
++    uint p = uStartPixel + i;
++    uint x = uDsax + (p % uRrw);
++    uint y = uDsay + (p / uRrw);
++    uint page = (uDbp >> 5u) + (y >> 5u) * uDbw + (x >> 6u);
++    uint lidx = (uDbp & 31u) * 2048u + (y & 31u) * 64u + (x & 63u);
++    uint pixAddr = page * 2048u + tab16(lidx);
++    uint byteAddr = (pixAddr * 4u) & 0x3FFFFCu;
++    uint got = vram[byteAddr >> 2u];
++    if (got != expv[i])
++    {
++        atomicAdd(mism, 1u);
++        if (atomicCompSwap(firstIdx, 0xFFFFFFFFu, i) == 0xFFFFFFFFu)
++        {
++            firstGot = got;
++            firstExp = expv[i];
++        }
++    }
++}
++)GLSL";
++
 +#ifndef EGL_PLATFORM_SURFACELESS_MESA
 +#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
 +#endif
@@ -272,15 +364,15 @@ index 0000000..2dd220b
 +        Failed
 +    };
 +
-+    // Job marshalling (one synchronous decode at a time; caller blocks on cvDone).
++    // Job marshalling: a bounded FIFO. Decode jobs are synchronous (the caller parks on
++    // cvDone until its stack flags are set); mirror upload/verify jobs are self-contained
++    // fire-and-forget. Multiple producers (present thread decodes, GS worker mirrors).
 +    std::mutex mx;
 +    std::condition_variable cv;     // wakes the device thread
-+    std::condition_variable cvDone; // wakes the caller (init finished / job finished)
++    std::condition_variable cvDone; // wakes callers (init done / decode done / queue space)
 +    State state = State::Untried;   // written by the device thread under mx
-+    bool haveJob = false;
-+    bool jobDone = false;
 +    bool stop = false;
-+    struct JobDesc
++    struct DecodeDesc
 +    {
 +        const uint8_t *vram = nullptr;
 +        uint32_t vramSize = 0;
@@ -291,8 +383,24 @@ index 0000000..2dd220b
 +        uint32_t originX = 0, originY = 0;
 +        bool preserveAlpha = false;
 +        std::vector<uint8_t> *out = nullptr;
-+        bool result = false;
-+    } job;
++    };
++    struct Job
++    {
++        enum class Kind : uint8_t
++        {
++            Decode,
++            Upload,
++            Verify
++        } kind = Kind::Decode;
++        DecodeDesc decode{};      // Decode only (out/done/result live on the caller's stack)
++        GsGpuUploadChunk chunk{}; // Upload/Verify only
++        bool *done = nullptr;     // Decode only
++        bool *result = nullptr;
++    };
++    std::deque<Job> jobs;
++    size_t pendingBytes = 0; // queued mirror payload bytes (producer backpressure)
++    static constexpr size_t kMaxPendingBytes = 64u * 1024u * 1024u;
++    static constexpr size_t kMaxPendingJobs = 8192u;
 +    std::thread worker;
 +
 +    // Device-thread-only state.
@@ -301,7 +409,7 @@ index 0000000..2dd220b
 +    EGLSurface surface = EGL_NO_SURFACE; // pbuffer fallback only
 +    GlApi gl{};
 +    GLuint program = 0;
-+    GLuint vramBuf = 0;
++    GLuint vramBuf = 0; // phase-0 present-snapshot buffer (upload cache per sourceId)
 +    GLuint tabBuf = 0;
 +    GLuint outBuf = 0;
 +    GLint locMode = -1, locBlockBase = -1, locBw = -1, locOriginX = -1, locOriginY = -1;
@@ -309,6 +417,18 @@ index 0000000..2dd220b
 +    uint64_t lastSourceId = 0;
 +    bool haveUpload = false;
 +    unsigned errorLogs = 0;
++    // Phase-1 VRAM mirror state (device thread only).
++    GLuint mirrorBuf = 0;  // the persistent 4MB guest-VRAM mirror
++    GLuint payloadBuf = 0; // per-chunk payload / expected-values scratch (orphaned per job)
++    GLuint resultBuf = 0;  // verify result: {mism, firstIdx, firstGot, firstExp}
++    GLuint uploadProgram = 0;
++    GLuint verifyProgram = 0;
++    struct ChunkLocs
++    {
++        GLint dbp = -1, dbw = -1, dsax = -1, dsay = -1, rrw = -1, startPixel = -1, count = -1, tabOff = -1;
++    } upLocs, vfLocs;
++    unsigned long xvChunks = 0, xvMismChunks = 0;
++    unsigned long long xvWords = 0, xvMismWords = 0;
 +
 +    bool fail(const char *stage)
 +    {
@@ -329,20 +449,80 @@ index 0000000..2dd220b
 +            return; // callers see Failed and never post a job
 +        for (;;)
 +        {
-+            std::unique_lock<std::mutex> lk(mx);
-+            cv.wait(lk, [&] { return stop || haveJob; });
-+            if (stop)
-+                return;
-+            haveJob = false;
-+            lk.unlock();
-+            // The caller blocks until jobDone, so the job fields (and *job.out) are
-+            // stable while unlocked here.
-+            job.result = decodeOnThread(job);
-+            lk.lock();
-+            jobDone = true;
-+            lk.unlock();
-+            cvDone.notify_all();
++            Job j;
++            {
++                std::unique_lock<std::mutex> lk(mx);
++                cv.wait(lk, [&] { return stop || !jobs.empty(); });
++                if (stop)
++                    return;
++                j = std::move(jobs.front());
++                jobs.pop_front();
++                pendingBytes -= j.chunk.payload.size() * 4u;
++            }
++            switch (j.kind)
++            {
++            case Job::Kind::Decode:
++            {
++                // The caller parks on cvDone until *done, so decode.out and the flags
++                // (caller-stack) are stable while we run unlocked.
++                const bool r = decodeOnThread(j.decode);
++                std::lock_guard<std::mutex> lk(mx);
++                if (j.result)
++                    *j.result = r;
++                if (j.done)
++                    *j.done = true;
++                break;
++            }
++            case Job::Kind::Upload:
++                uploadOnThread(j.chunk);
++                break;
++            case Job::Kind::Verify:
++                verifyOnThread(j.chunk);
++                break;
++            }
++            cvDone.notify_all(); // decode completion AND queue-space waiters
 +        }
++    }
++
++    void enqueue(Job &&j)
++    {
++        std::unique_lock<std::mutex> lk(mx);
++        cvDone.wait(lk, [&] { return stop || (jobs.size() < kMaxPendingJobs &&
++                                              pendingBytes < kMaxPendingBytes); });
++        if (stop)
++            return;
++        pendingBytes += j.chunk.payload.size() * 4u;
++        jobs.push_back(std::move(j));
++        cv.notify_one();
++    }
++
++    GLuint buildProgram(const char *src, const char *name)
++    {
++        const GLuint shader = gl.CreateShader(GL_COMPUTE_SHADER);
++        gl.ShaderSource(shader, 1, &src, nullptr);
++        gl.CompileShader(shader);
++        GLint status = 0;
++        gl.GetShaderiv(shader, GL_COMPILE_STATUS, &status);
++        if (!status)
++        {
++            char log[1024] = {};
++            gl.GetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
++            std::fprintf(stderr, "[gsgpu] %s shader compile log:\n%s\n", name, log);
++            return 0;
++        }
++        const GLuint prog = gl.CreateProgram();
++        gl.AttachShader(prog, shader);
++        gl.LinkProgram(prog);
++        gl.GetProgramiv(prog, GL_LINK_STATUS, &status);
++        gl.DeleteShader(shader);
++        if (!status)
++        {
++            char log[1024] = {};
++            gl.GetProgramInfoLog(prog, sizeof(log) - 1, nullptr, log);
++            std::fprintf(stderr, "[gsgpu] %s program link log:\n%s\n", name, log);
++            return 0;
++        }
++        return prog;
 +    }
 +
 +    bool initOnThread()
@@ -418,30 +598,11 @@ index 0000000..2dd220b
 +        if (!ok)
 +            return fail("eglGetProcAddress(GL 4.3 core fn)");
 +
-+        const GLuint shader = gl.CreateShader(GL_COMPUTE_SHADER);
-+        gl.ShaderSource(shader, 1, &kDecodeShader, nullptr);
-+        gl.CompileShader(shader);
-+        GLint status = 0;
-+        gl.GetShaderiv(shader, GL_COMPILE_STATUS, &status);
-+        if (!status)
-+        {
-+            char log[1024] = {};
-+            gl.GetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
-+            std::fprintf(stderr, "[gsgpu] shader compile log:\n%s\n", log);
-+            return fail("compute shader compile");
-+        }
-+        program = gl.CreateProgram();
-+        gl.AttachShader(program, shader);
-+        gl.LinkProgram(program);
-+        gl.GetProgramiv(program, GL_LINK_STATUS, &status);
-+        gl.DeleteShader(shader);
-+        if (!status)
-+        {
-+            char log[1024] = {};
-+            gl.GetProgramInfoLog(program, sizeof(log) - 1, nullptr, log);
-+            std::fprintf(stderr, "[gsgpu] program link log:\n%s\n", log);
-+            return fail("compute program link");
-+        }
++        program = buildProgram(kDecodeShader, "decode");
++        uploadProgram = buildProgram(kUploadShader, "upload");
++        verifyProgram = buildProgram(kVerifyShader, "verify");
++        if (!program || !uploadProgram || !verifyProgram)
++            return fail("compute program build");
 +        locMode = gl.GetUniformLocation(program, "uMode");
 +        locBlockBase = gl.GetUniformLocation(program, "uBlockBase");
 +        locBw = gl.GetUniformLocation(program, "uBw");
@@ -451,6 +612,21 @@ index 0000000..2dd220b
 +        locHeight = gl.GetUniformLocation(program, "uHeight");
 +        locPreserveAlpha = gl.GetUniformLocation(program, "uPreserveAlpha");
 +        locTabOff = gl.GetUniformLocation(program, "uTabOff");
++        auto chunkLocs = [&](GLuint prog) -> ChunkLocs
++        {
++            ChunkLocs l;
++            l.dbp = gl.GetUniformLocation(prog, "uDbp");
++            l.dbw = gl.GetUniformLocation(prog, "uDbw");
++            l.dsax = gl.GetUniformLocation(prog, "uDsax");
++            l.dsay = gl.GetUniformLocation(prog, "uDsay");
++            l.rrw = gl.GetUniformLocation(prog, "uRrw");
++            l.startPixel = gl.GetUniformLocation(prog, "uStartPixel");
++            l.count = gl.GetUniformLocation(prog, "uCount");
++            l.tabOff = gl.GetUniformLocation(prog, "uTabOff");
++            return l;
++        };
++        upLocs = chunkLocs(uploadProgram);
++        vfLocs = chunkLocs(verifyProgram);
 +
 +        // Build the page lookup tables with the same template code as ps2_gs_memory.cpp
 +        // (heap: ~640KB total) and upload the concatenation once.
@@ -477,6 +653,13 @@ index 0000000..2dd220b
 +        gl.GenBuffers(1, &outBuf);
 +        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, outBuf);
 +        gl.BufferData(GL_SHADER_STORAGE_BUFFER, kHostW * kHostH * 4u, nullptr, GL_DYNAMIC_DRAW);
++        gl.GenBuffers(1, &mirrorBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, mirrorBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, kVramBytes, nullptr, GL_DYNAMIC_DRAW);
++        gl.GenBuffers(1, &payloadBuf);
++        gl.GenBuffers(1, &resultBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, 16, nullptr, GL_DYNAMIC_DRAW);
 +        if (gl.GetError() != 0u)
 +            return fail("buffer setup");
 +
@@ -487,7 +670,7 @@ index 0000000..2dd220b
 +        return true;
 +    }
 +
-+    bool decodeOnThread(JobDesc &j)
++    bool decodeOnThread(DecodeDesc &j)
 +    {
 +        if (!j.vram || j.vramSize < kVramBytes || !j.out)
 +            return false;
@@ -563,6 +746,82 @@ index 0000000..2dd220b
 +        }
 +        return true;
 +    }
++
++    void setChunkUniforms(const ChunkLocs &l, const GsGpuUploadChunk &c, uint32_t count)
++    {
++        gl.Uniform1ui(l.dbp, c.dbp);
++        gl.Uniform1ui(l.dbw, c.dbw);
++        gl.Uniform1ui(l.dsax, c.dsax);
++        gl.Uniform1ui(l.dsay, c.dsay);
++        gl.Uniform1ui(l.rrw, c.rrw);
++        gl.Uniform1ui(l.startPixel, c.startPixel);
++        gl.Uniform1ui(l.count, count);
++        gl.Uniform1ui(l.tabOff, kTabOffC32);
++    }
++
++    void uploadOnThread(const GsGpuUploadChunk &c)
++    {
++        const uint32_t count = static_cast<uint32_t>(c.payload.size());
++        if (count == 0u || c.rrw == 0u)
++            return;
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, payloadBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(count) * 4,
++                      c.payload.data(), GL_DYNAMIC_DRAW); // orphan + fill per chunk
++        gl.UseProgram(uploadProgram);
++        setChunkUniforms(upLocs, c, count);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mirrorBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, payloadBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, tabBuf);
++        gl.DispatchCompute((count + 63u) / 64u, 1u, 1u);
++        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT); // later verify/raster reads see it
++    }
++
++    void verifyOnThread(const GsGpuUploadChunk &c)
++    {
++        const uint32_t count = static_cast<uint32_t>(c.payload.size());
++        if (count == 0u || c.rrw == 0u)
++            return;
++        const uint32_t init[4] = {0u, 0xFFFFFFFFu, 0u, 0u};
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuf);
++        gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 16, init);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, payloadBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(count) * 4,
++                      c.payload.data(), GL_DYNAMIC_DRAW); // expected values
++        gl.UseProgram(verifyProgram);
++        setChunkUniforms(vfLocs, c, count);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mirrorBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, payloadBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, tabBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, resultBuf);
++        gl.DispatchCompute((count + 63u) / 64u, 1u, 1u);
++        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        uint32_t res[4] = {0u, 0u, 0u, 0u};
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, resultBuf);
++        gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 16, res);
++        ++xvChunks;
++        xvWords += count;
++        if (res[0] != 0u)
++        {
++            ++xvMismChunks;
++            xvMismWords += res[0];
++            if (xvMismChunks <= 8u)
++                std::fprintf(stderr,
++                             "[gsgpu:xverify] MISMATCH chunk#%lu dbp=%u dbw=%u dsa=(%u,%u) rrw=%u "
++                             "start=%u n=%u: %u words differ, first i=%u mirror=%08x cpu=%08x\n",
++                             xvMismChunks, c.dbp, c.dbw, c.dsax, c.dsay, c.rrw,
++                             c.startPixel, count, res[0], res[1], res[2], res[3]);
++        }
++        if ((xvChunks % 2048u) == 0u)
++            std::fprintf(stderr,
++                         "[gsgpu:xverify] chunks=%lu words=%llu mismatch-chunks=%lu mismatch-words=%llu\n",
++                         xvChunks, xvWords, xvMismChunks, xvMismWords);
++        const GLenum err = gl.GetError();
++        if (err != 0u && errorLogs < 8u)
++        {
++            ++errorLogs;
++            std::fprintf(stderr, "[gsgpu] GL error 0x%x during xverify\n", err);
++        }
++    }
 +};
 +
 +GsGpuPresentDevice::GsGpuPresentDevice() : m_impl(std::make_unique<Impl>()) {}
@@ -578,6 +837,7 @@ index 0000000..2dd220b
 +        d.stop = true;
 +    }
 +    d.cv.notify_all();
++    d.cvDone.notify_all(); // release producers parked on queue space / decode waiters
 +    if (d.worker.joinable())
 +        d.worker.join();
 +}
@@ -607,12 +867,35 @@ index 0000000..2dd220b
 +    if (!EnsureInitialized())
 +        return false;
 +    Impl &d = *m_impl;
++    bool done = false, result = false;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::Decode;
++    j.decode = {vram, vramSize, sourceId, frame, width, height,
++                frameBaseIsPages, originX, originY, preserveAlpha, &outPixels};
++    j.done = &done;
++    j.result = &result;
++    d.enqueue(std::move(j));
 +    std::unique_lock<std::mutex> lk(d.mx);
-+    d.job = {vram, vramSize, sourceId, frame, width, height,
-+             frameBaseIsPages, originX, originY, preserveAlpha, &outPixels, false};
-+    d.haveJob = true;
-+    d.jobDone = false;
-+    d.cv.notify_all();
-+    d.cvDone.wait(lk, [&] { return d.jobDone; });
-+    return d.job.result;
++    d.cvDone.wait(lk, [&] { return done || d.stop; });
++    return result;
++}
++
++void GsGpuPresentDevice::MirrorUpload(GsGpuUploadChunk &&chunk)
++{
++    if (!EnsureInitialized())
++        return;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::Upload;
++    j.chunk = std::move(chunk);
++    m_impl->enqueue(std::move(j));
++}
++
++void GsGpuPresentDevice::MirrorVerify(GsGpuUploadChunk &&chunk)
++{
++    if (!EnsureInitialized())
++        return;
++    Impl::Job j;
++    j.kind = Impl::Job::Kind::Verify;
++    j.chunk = std::move(chunk);
++    m_impl->enqueue(std::move(j));
 +}

@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..72c2bc6
+index 0000000..a1df175
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,88 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -25,8 +25,31 @@ index 0000000..72c2bc6
 +// Threading: ALL EGL/GL work runs on a dedicated device thread that exclusively owns
 +// the context (a thread has ONE current GL context regardless of binding API, and the
 +// present thread already holds raylib's GLX context -- eglMakeCurrent there fails with
-+// EGL_BAD_ACCESS). DecodeFrameRect marshals one synchronous job at a time to it and is
-+// callable from any thread. Any init failure disables the device for the run (logged).
++// EGL_BAD_ACCESS). Jobs flow through a bounded FIFO: DecodeFrameRect is synchronous
++// (the caller waits for its job), the phase-1 VRAM-mirror uploads/verifies are
++// fire-and-forget. Callable from any thread. Any init failure disables the device for
++// the run (logged).
++//
++// Phase 1 (cont.167, VRAM residency): a persistent 4MB guest-VRAM MIRROR SSBO fed by
++// host->local upload chunks (CT32 -- empirically 99.9997% of this game's 1.76M
++// transfers; other formats are counted + skipped, leaving the mirror stale there until
++// their kernels land). MirrorVerify compares the mirror against the CPU-authoritative
++// post-upload bytes ON THE GPU (atomic mismatch counter, 16-byte readback) for sampled
++// chunks -- the same shadow-verify gate the phase-0 present decode passed.
++
++// One host->local upload chunk, self-contained (the CPU transfer cursor state is baked
++// into startPixel; geometry from BITBLTBUF/TRXPOS/TRXREG). For MirrorUpload, payload =
++// the chunk's CT32 words; for MirrorVerify, payload = the CPU-read post-upload values.
++struct GsGpuUploadChunk
++{
++    uint32_t dbp = 0;  // destination base, BLOCKS
++    uint32_t dbw = 0;  // destination buffer width, 64-pixel units (>=1)
++    uint32_t dsax = 0; // destination rect origin
++    uint32_t dsay = 0;
++    uint32_t rrw = 0;  // rect width (pixel cursor wraps at it)
++    uint32_t startPixel = 0;
++    std::vector<uint32_t> payload; // one word per pixel
++};
 +class GsGpuPresentDevice
 +{
 +public:
@@ -57,6 +80,13 @@ index 0000000..72c2bc6
 +                         uint32_t originY,
 +                         bool preserveAlpha,
 +                         std::vector<uint8_t> &outPixels);
++
++    // Phase-1 VRAM mirror (both async fire-and-forget; bounded queue backpressures the
++    // producer). MirrorUpload swizzle-writes the chunk into the mirror SSBO; MirrorVerify
++    // compares the mirror at the chunk's addresses against payload (the CPU-read
++    // post-upload values), tallying into [gsgpu:xverify] counters printed periodically.
++    void MirrorUpload(GsGpuUploadChunk &&chunk);
++    void MirrorVerify(GsGpuUploadChunk &&chunk);
 +
 +private:
 +    struct Impl;
