@@ -78,6 +78,16 @@ and the disasm, then gdb, before asserting or acting.
   — it shows done/phase/≈% + the cc1plus monster/OOM warning that flags an over-bound unit.
 - **Background builds, `timeout` runs.** Builds take many minutes (launch in background, poll the
   log); a spinning runner emits hundreds of MB/s, so always run under `timeout` to a file.
+- **★ Instrument the run log BEFORE reaching for gdb — gdb is the expensive tool.** gdb-under-parent
+  perturbs the very timing-sensitive races we debug, is manual and serial, and needs the parent-attach
+  dance, so it costs real time. For any *live-behavior* question ("what fires / what value / what path /
+  does X ever happen"), **lead with cheap log instrumentation**: a one-shot probe override that prints
+  regs/stack/memory, dispatch/`[dispatch:*]` logging, or an `fprintf` counter — yielding a scriptable,
+  reproducible `run.txt` you can diff across configs and re-run without interaction. **Escalate to gdb
+  only when the log genuinely can't answer it** — a hung-thread backtrace, a hardware watchpoint on the
+  writer of an arbitrary address, or live-state validation of a load-bearing claim (operating-manual §4).
+  gdb still *validates* (it does not stop being ground-truth per "Verify, don't trust") — it is simply
+  the escalation, not the first move. **Instrument first; validate with gdb.**
 - **Consult the external references when reimplementing hardware.** Whenever an override has to
   reimplement or work around hardware the runtime stubs or gets wrong (IPU/GS/VIF/GIF/DMAC/SPU2/
   SIF/CDVD/…), keep [resources.md](resources.md) in mind: read **ps2tek** for the spec and **mirror

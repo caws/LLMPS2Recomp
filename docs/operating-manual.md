@@ -81,7 +81,12 @@ Boot reaches a point and stops — a crash, a spin, a silent hang, a missing-fun
   than guessing — then verify against our ground truth (§4). Cite the file/function you mirrored.
 
 Pick the cheapest tool that answers the question. A single-fact lookup is a `funcs.py`/grep, not a
-workflow.
+workflow. **And for a live-behavior question, the cheapest tool is log instrumentation, not gdb** — a
+one-shot probe, dispatch logging, or an `fprintf` counter gives a scriptable, diffable `run.txt`. gdb
+is the *expensive* tool (it perturbs the timing races we debug, is manual and serial, and needs the
+parent-attach dance), so **instrument the log first and escalate to gdb only when the log can't answer
+it** — a hung-thread backtrace, a hardware watchpoint on an arbitrary-address writer, or live-state
+validation of a load-bearing claim (§4). See working-rules.md (Discipline) for the full rule.
 
 ## 4. Ground truth and the verification rule
 
@@ -157,7 +162,9 @@ memory, prior findings, a subagent/workflow synthesis, even a runtime probe's pr
     is how you confirm it against live execution. Before building on any non-trivial claim ("this fn sets
     screen-ID", "this loop iterates table-C", "this callback fires every frame", "a1 is the current
     screen"), check it under gdb: breakpoint the function and read the real args/registers/guest memory,
-    or watch the address it supposedly writes. Make gdb a routine step in investigation, not a fallback.
+    or watch the address it supposedly writes. Make gdb a routine step for *validating* load-bearing
+    claims — but **instrument the run log first to locate and answer** the question; gdb is the expensive
+    escalation (§3 / working-rules.md Discipline), not the first reach.
   - **Before concluding a hardware-subsystem override is stuck or "options are exhausted," consult
     PCSX2's actual reference implementation** ([resources.md](resources.md)) — not just the bare spec
     or a table pulled from FFmpeg/similar. This bit us: the IPU MPEG decoder was stuck at
