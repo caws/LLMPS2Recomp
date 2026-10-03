@@ -62,10 +62,31 @@ _GOOD_OPS = {0x09, 0x0f, 0x23, 0x2b, 0x0d, 0x04, 0x05, 0x03, 0x0c, 0x0a, 0x0b,
              0x37, 0x3f, 0x1e, 0x1f}  # addiu/lui/lw/sw/ori/beq/bne/jal/.../sq/ld/lq/sd
 
 
+# SPECIAL (op=0) register-move / compare funcs that legitimately OPEN a function -- the
+# arg-shuffling forwarding thunk (`daddu a0,a1,zero ... j target`) and functions whose
+# `addiu sp,-N` prologue is only the SECOND instruction. op=0 is excluded wholesale above
+# because jump-table address words decode as SPECIAL, but those words are discriminated by
+# two fields a real move never fails: the shift-amount field must be 0, and rd must not be
+# $zero (writing $zero is a no-op, the signature of misdecoded data). Added after
+# 0x1D1290 -- a live `jalr` target reached from dispatcher 0x1d2a30 -- proved unfindable by
+# BOTH `gaps` and `bounds-scan`; the discriminator yields 13 candidates game-wide, 8 real.
+_SPECIAL_START_FUNCS = {0x21, 0x2d, 0x25, 0x24, 0x2a, 0x2b, 0x20, 0x22, 0x23}
+
+
+def _is_special_move_start(w):
+    if (w >> 26) != 0:
+        return False
+    sa = (w >> 6) & 0x1f
+    rd = (w >> 11) & 0x1f
+    return sa == 0 and rd != 0 and (w & 0x3f) in _SPECIAL_START_FUNCS
+
+
 def _valid_start(w):
     if w is None or w == 0:
         return False
     if F.is_prologue(w) or F.is_return(w) or _is_jtail(w):
+        return True
+    if _is_special_move_start(w):
         return True
     return (w >> 26) in _GOOD_OPS
 
