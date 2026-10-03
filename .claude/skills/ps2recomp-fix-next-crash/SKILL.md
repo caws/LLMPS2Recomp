@@ -36,7 +36,7 @@ From the engine (pass the game dir):
 ```
 scripts/03_build_game.sh <game_dir>                              # full: regen → install → build
 scripts/03_build_game.sh <game_dir> --skip-regen --changed-recomp # fast: override-only changes
-timeout 20 scripts/04_run_game.sh <game_dir>                      # run → <game_dir>/tmp/run.txt
+timeout 20 scripts/04_run_game.sh <game_dir> run.txt              # run → <game_dir>/tmp/run.txt (no log arg = console)
 ```
 
 Flags: no flags = full pipeline (ps2_recomp regen → install → cmake build).
@@ -68,7 +68,7 @@ a CSV function does nothing.
 ## Workflow
 
 1. **Build** (full, if CSV changed) and wait for `Build complete`.
-2. **Run**: `timeout 20 scripts/04_run_game.sh <game_dir>` → read `<game_dir>/tmp/run.txt`.
+2. **Run**: `timeout 20 scripts/04_run_game.sh <game_dir> run.txt` → read `<game_dir>/tmp/run.txt`.
 3. **Triage** the run log:
    - file size: a huge file ⇒ a spin (something dispatched in a tight loop).
    - `grep "Function at address" <game_dir>/tmp/run.txt | grep -oE "0x[0-9a-f]+" | sort -u`

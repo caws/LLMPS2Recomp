@@ -66,10 +66,13 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
 - **Builds run in the background** and can take many minutes. Launch
   `scripts/03_build_game.sh <game_dir>` with a 600000 ms tool timeout and poll the log for
   `Build complete`. Do not block on it in the foreground.
-- **Always run the game under `timeout`.** `04_run_game.sh` writes the runner's output to
-  the game's own `tmp/run.txt` (a spinning build emits hundreds of MB/s — it goes to that
-  file, never the terminal). Read `<game_dir>/tmp/run.txt` after; never pipe a raw run into
-  `head`/`tail`.
+- **Always run the game under `timeout` AND with an explicit log file.** `04_run_game.sh
+  <game_dir> [run_log]` writes the runner's output to the given log (2nd arg or `PS2X_RUN_LOG`;
+  relative paths land in `<game_dir>/tmp/`); with NO log target it streams to the CONSOLE (for
+  the user's interactive terminal use). Agent/automated invocations MUST pass a log (canonically
+  `run.txt`; a spinning runner emits hundreds of MB/s), and overlapping runs (background retry
+  loop + manual run) must use DISTINCT log files so they never interleave. Read the log after;
+  never pipe a raw run into `head`/`tail`.
 - **Temp/scratch files go in the engine `tmp/`** (gitignored). Clean them up.
 - **No `git commit` / destructive git** unless explicitly asked.
 - No "auto mode" — only take actions the user has asked for.
@@ -82,7 +85,7 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   `patches/README.md`; idempotent, warns on upstream drift). Keep new tools-clone fixes
   captured as patches there, or a re-clone loses them.
 - `scripts/03_build_game.sh <game_dir> [flags]` — regen → install → cmake build.
-- `scripts/04_run_game.sh <game_dir>` — run the last-built runner (ELF read from config).
+- `scripts/04_run_game.sh <game_dir> [run_log]` — run the last-built runner (ELF read from config); log to file if given, else console.
 - `scripts/05_screenshot.sh [--launch] <game_dir> [count] [interval]` — burst-screenshot the **game
   window only** (crops the composited root by the window geometry; `import -window <id>` is black for
   this GL window). Textures FLICKER, so it takes a burst and flags frames with content by mean
@@ -99,7 +102,7 @@ from `<game_dir>` and its `recomp/config.toml`; nothing about a game is hardcode
 ```
 scripts/03_build_game.sh <game_dir>                              # full: regen → install → build
 scripts/03_build_game.sh <game_dir> --skip-regen --changed-recomp # fast: override-only changes
-timeout 20 scripts/04_run_game.sh <game_dir>                       # run → log at <game_dir>/tmp/run.txt
+timeout 20 scripts/04_run_game.sh <game_dir> run.txt               # run → log at <game_dir>/tmp/run.txt (no log arg = console, interactive only)
 ```
 
 **Invocation gotcha — run from the ENGINE repo dir, not the game dir.** `scripts/` lives in

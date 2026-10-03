@@ -3,11 +3,18 @@ set -euo pipefail
 
 # Run a game built with the PS2Recomp engine.
 #
-# Usage: 04_run_game.sh <game_dir>
+# Usage: 04_run_game.sh <game_dir> [run_log]
 #
 # The ELF path is read from <game_dir>/recomp/config.toml `input`. The runner
 # binary is whatever was last built by 03_build_game.sh (one active game at a
 # time — static recompilation).
+#
+# run_log: optional log-file target (2nd arg, or PS2X_RUN_LOG env). With NO log
+# target the runner's output goes to the CONSOLE (stdout/stderr passthrough) —
+# for interactive terminal use. Automated/agent invocations MUST pass a log file
+# (canonically tmp/run.txt; a spinning runner emits hundreds of MB/s), and runs
+# that may OVERLAP (background retry loop + manual run) should use DISTINCT
+# paths so logs don't interleave. Relative paths resolve against <game_dir>/tmp.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -17,7 +24,9 @@ GAME_DIR="${1:-}"
 GAME_DIR="$(cd "$GAME_DIR" && pwd)"
 
 RUNNER="$GAME_DIR/tmp/ps2EntryRunner"   # per-game binary, placed here by 03_build_game.sh
-RUN_LOG="$GAME_DIR/tmp/run.txt"
+# Log target: 2nd arg > PS2X_RUN_LOG env > default = console passthrough (no redirect).
+RUN_LOG="${2:-${PS2X_RUN_LOG:-}}"
+if [[ -n "$RUN_LOG" && "$RUN_LOG" != /* ]]; then RUN_LOG="$GAME_DIR/tmp/$RUN_LOG"; fi
 CONFIG="$GAME_DIR/recomp/config.toml"
 
 [[ -f "$CONFIG" ]] || { echo "ERROR: config.toml not found: $CONFIG"; exit 1; }
@@ -39,17 +48,24 @@ if [[ ! -x "$RUNNER" ]]; then
 fi
 [[ -f "$ELF" ]] || { echo "ERROR: ELF not found (from config 'input'): $ELF"; exit 1; }
 
-# Runner output (often hundreds of MB/s when spinning) goes to the game's own
-# tmp/run.txt, NOT the terminal. Wrap the invocation in `timeout` to cap a spin:
-#   timeout 20 scripts/04_run_game.sh <game_dir>
+# Wrap the invocation in `timeout` to cap a spin:
+#   timeout 20 scripts/04_run_game.sh <game_dir> run.txt
 mkdir -p "$GAME_DIR/tmp"
-# ALWAYS remove the old log first, so the run.txt that exists afterward is GUARANTEED to be
-# from THIS run. If the runner fails to launch/write, run.txt will be absent/empty rather than
-# a stale leftover that looks like a fresh result (this bit us: a stale run.txt was mistaken for
-# the current run, hiding a fresh binary's output).
-rm -f "$RUN_LOG"
-echo "log: $RUN_LOG"
 # Game-side overrides (e.g. DBCMAN HLE serving) read gamefiles/ from this env var, so the
 # path is never hardcoded and survives a game-folder rename.
 export PS2_GAMEFILES="$GAME_DIR/gamefiles"
-exec "$RUNNER" "$ELF" > "$RUN_LOG" 2>&1
+if [[ -n "$RUN_LOG" ]]; then
+    mkdir -p "$(dirname "$RUN_LOG")"
+    # ALWAYS remove the old log first, so the log that exists afterward is GUARANTEED to be
+    # from THIS run. If the runner fails to launch/write, it will be absent/empty rather than
+    # a stale leftover that looks like a fresh result (this bit us: a stale run.txt was mistaken
+    # for the current run, hiding a fresh binary's output).
+    rm -f "$RUN_LOG"
+    echo "log: $RUN_LOG"
+    exec "$RUNNER" "$ELF" > "$RUN_LOG" 2>&1
+else
+    # Interactive/console mode: output streams to the terminal. NB a spinning runner can emit
+    # hundreds of MB/s — automated invocations should always pass a log file instead.
+    echo "log: (console)"
+    exec "$RUNNER" "$ELF"
+fi

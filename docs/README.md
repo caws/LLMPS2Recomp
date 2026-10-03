@@ -16,7 +16,7 @@ mass-rewrite the inputs.**
 1. **Build** — `scripts/03_build_game.sh <game_dir>` (full if `recomp/functions.csv`
    changed; `--skip-regen --changed-recomp` for override-only changes). Run it in the
    background (builds take many minutes); watch with `scripts/build_progress.sh <game_dir>`.
-2. **Run** — `timeout N scripts/04_run_game.sh <game_dir>` → log at `<game_dir>/tmp/run.txt`
+2. **Run** — `timeout N scripts/04_run_game.sh <game_dir> run.txt` → log at `<game_dir>/tmp/run.txt`
    (a spinning runner emits hundreds of MB/s, so it always goes to a file, never the
    terminal).
 3. **Triage** — read the log: a spin (huge file), a missing-function storm (`Function at
