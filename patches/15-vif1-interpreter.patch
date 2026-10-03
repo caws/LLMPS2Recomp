@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index 05fc764..9d7d25a 100644
+index 05fc764..07572e2 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 @@ -1,5 +1,7 @@
@@ -418,10 +418,28 @@ index 05fc764..9d7d25a 100644
              }
              pos += mpgBytes;
              if (pos > sizeBytes)
-@@ -463,31 +807,263 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -461,33 +805,280 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
+         {
              uint32_t qwCount = imm;
++            // ★ cont.156: DIRECT imm=0 consumes NOTHING in this engine's chain-flattened
++            // delivery. The game's frame chains carry a terminal-and-mid-list [NOP][DIRECT
++            // imm=0] embed followed by MORE embed-wrapped mini-DIRECTs and real VIF commands
++            // (STCYCL/UNPACK matrix uploads); with imm=0 -> 0 the captured 3.7 MB level chain
++            // parses PERFECTLY at both layers (VIF walk consumes the buffer exactly, 0 unknown
++            // opcodes; the concatenated 3.16 MB GIF stream = 184 tags, 0 implausible, 0
++            // overrun -- offline proof, vifbuf_bad.bin). With the nominal 65536-qw reading it
++            // swallowed ~1 MB of the chain (embeds decode as GIF NOPs so it half-worked,
++            // until UNPACK float payloads got read as tags -> the phantom-PACKED garbage
++            // register writes). PCSX2 uses 65536 on the raw DMA stream; our flattened
++            // delivery differs structurally. PS2X_VIF_IMM0DIRECT=65536 restores the old read.
++            static const uint32_t s_imm0Direct = [] {
++                const char *e = std::getenv("PS2X_VIF_IMM0DIRECT");
++                return e && e[0] ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
++            }();
              if (qwCount == 0)
-                 qwCount = 65536;
+-                qwCount = 65536;
++                qwCount = s_imm0Direct;
 +            const uint32_t declaredQw = qwCount;
              const uint32_t availableQw = (sizeBytes - pos) / 16u;
              const bool truncated = qwCount > availableQw;
@@ -689,7 +707,7 @@ index 05fc764..9d7d25a 100644
                  pos = sizeBytes;
                  break;
              }
-@@ -530,6 +1106,62 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -530,6 +1121,62 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              if (wl == 0u)
                  wl = 1u;
  
@@ -752,7 +770,7 @@ index 05fc764..9d7d25a 100644
              uint32_t sourceVectorCount = writeVectorCount;
              if (cl < wl)
              {
-@@ -549,6 +1181,43 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -549,6 +1196,43 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
  
              const bool zeroExtend = (imm & 0x4000u) != 0u;
  
@@ -796,7 +814,7 @@ index 05fc764..9d7d25a 100644
              if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
              {
                  const uint8_t *srcBase = data + pos;
-@@ -758,3 +1427,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -758,3 +1442,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          }
      }
  }
