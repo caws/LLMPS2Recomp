@@ -1,0 +1,213 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_dbcman_hle.h b/ps2xRuntime/include/runtime/ps2_dbcman_hle.h
+new file mode 100644
+index 0000000..ecb33fd
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_dbcman_hle.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <cstdint>
++
++class PS2Runtime;
++
++// DBCMAN (DualShock controller manager) pad HLE — runtime side.
++//
++// Re-expressed for upstream ee14958, which deleted the old ps2_iop_dbcman.cpp and removed
++// runtime->iop().handleRPC. The example game drives DBCMAN over the RAW SIF transport
++// (guest 0x11bfa8/0x11c178) that native ee14958 (SID-routed off sceSifCallRpc) never sees, so the
++// GAME OVERRIDE intercepts that transport and calls answerDbcManRpc() directly (a plain free
++// function). deliverPadData() MUST be called at the vblank-interrupt-worker frequency
++// (Interrupt.cpp) — a guest-side override hook fires far too rarely under present starvation, so
++// the per-vblank work-table re-assertion is lost and the controller reads "removed" (self-exit).
++namespace ps2_dbcman_hle
++{
++    // Answer a DBCMAN-family / event RPC (sid 0x80001300 family, or the 0x8000131b/c event
++    // channels). Writes the reply into guest memory, sets resultPtr = recv, returns true (handled).
++    bool answerDbcManRpc(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t rpcNum,
++                         uint32_t sendBuf, uint32_t sendSize, uint32_t recvBuf, uint32_t recvSize,
++                         uint32_t &resultPtr);
++
++    // Per-vblank: re-assert the per-port connection table + refresh the pad double-buffers. Call
++    // from the runtime vblank interrupt worker (see Kernel/Syscalls/Interrupt.cpp).
++    void deliverPadData(uint8_t *rdram, PS2Runtime *runtime);
++
++    // Reset all pad state (sockets, work addr, seq). Call on IOP reset.
++    void reset();
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+index 220eadf..2980113 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
+@@ -2,6 +2,7 @@
+ #include "Interrupt.h"
+ #include "ps2_log.h"
+ #include "Stubs/GS.h"
++#include "runtime/ps2_dbcman_hle.h"
+ 
+ namespace ps2_syscalls
+ {
+@@ -354,6 +355,7 @@ namespace ps2_syscalls
+             for (int i = 0; i < ticksToProcess; ++i)
+             {
+                 const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
++                ps2_dbcman_hle::deliverPadData(rdram, runtime); // per-vblank pad delivery + work-table re-assertion
+                 ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
+                 dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
+                 std::this_thread::sleep_for(std::chrono::microseconds(500));
+diff --git a/ps2xRuntime/src/lib/ps2_dbcman_hle.cpp b/ps2xRuntime/src/lib/ps2_dbcman_hle.cpp
+new file mode 100644
+index 0000000..b3c8bfd
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_dbcman_hle.cpp
+@@ -0,0 +1,139 @@
++#include "runtime/ps2_dbcman_hle.h"
++#include "ps2_runtime.h"
++
++#include <cstdint>
++#include <cstring>
++#include <cstdlib>
++
++// DBCMAN pad HLE (runtime side). See ps2_dbcman_hle.h for why this lives in the runtime rather than
++// the game override: the per-vblank deliverPadData() must run at the vblank-interrupt-worker
++// frequency (a guest override hook fires too rarely under present starvation, so the work-table
++// re-assertion is lost and the controller reads "removed" -> self-exit). Logic ported from
++// patch-05; default-on env gates PS2X_PAD2_HLE/_WORKTBL/_DELIVER preserved.
++
++namespace
++{
++    constexpr uint32_t kRpcCheckVersion = 0x80001363u;
++    constexpr uint32_t kEventSid1 = 0x8000131bu, kEventSid2 = 0x8000131cu;
++    constexpr uint32_t kRpcInit = 0x80001300u, kRpcCreateSocket = 0x80001301u, kRpcDeleteSocket = 0x80001302u,
++                       kRpcGetDepNumber = 0x80001303u, kRpcSetWorkAddr = 0x80001304u, kRpcInitSocket = 0x80001315u,
++                       kRpcGetDeviceStatus = 0x80001317u, kRpcSRData = 0x80001318u, kRpcReceiveData = 0x8000131au,
++                       kRpcSearchPortSpecific = 0x8000131du;
++    constexpr int kMaxSockets = 8;
++    constexpr uint8_t kProfile[5] = {0xFF, 0xFF, 0xFF, 0xFF, 0x00};
++    constexpr uint32_t kPadDataLen = 18u, kProfileLen = 5u, kHalfSeqOffset = 124u;
++    constexpr uint8_t kPadTypeAnalog = 0x73; // DS2 analog-mode id (desc+0x1A gate)
++
++    struct PadSocket { bool active = false; uint32_t buf0 = 0, buf1 = 0; };
++    uint32_t g_padWorkAddr = 0u;
++    PadSocket g_padSockets[kMaxSockets];
++    int g_padSocketCount = 0;
++    unsigned long g_padSeq = 0u;
++
++    inline bool padEnvFlag(const char *n) { const char *v = std::getenv(n); return !(v && v[0] == '0'); }
++    inline bool padHleEnabled() { static const bool e = padEnvFlag("PS2X_PAD2_HLE"); return e; }
++    inline bool padWorkTblEnabled() { static const bool e = padEnvFlag("PS2X_PAD2_WORKTBL"); return e; }
++    inline bool padDeliverEnabled() { static const bool e = padEnvFlag("PS2X_PAD2_DELIVER"); return e; }
++
++    inline uint32_t padRd32(uint8_t *rd, uint32_t a) { if (!a) return 0u; uint32_t v; std::memcpy(&v, rd + (a & 0x01FFFFFFu), 4); return v; }
++    inline void padWr32(uint8_t *rd, uint32_t a, uint32_t v) { if (a) std::memcpy(rd + (a & 0x01FFFFFFu), &v, 4); }
++
++    void writeVersionResponse(uint8_t *rd, uint32_t recv, uint32_t recvSize)
++    {
++        const uint32_t ver = 0x0320u; uint32_t n = recvSize / 4u; if (n > 4u) n = 4u; if (n == 0u) n = 1u;
++        for (uint32_t i = 0; i < n; ++i) padWr32(rd, recv + i * 4u, ver);
++    }
++
++    void buildPadPayload(PS2Runtime *runtime, int socketIndex, uint8_t out[32])
++    {
++        uint8_t raw[32]; bool haveState = false;
++        if (runtime && socketIndex == 0) haveState = runtime->padBackend().readState(0, 0, raw, sizeof(raw));
++        if (!haveState) { std::memset(raw, 0, sizeof(raw)); raw[2] = 0xFF; raw[3] = 0xFF; raw[4] = raw[5] = raw[6] = raw[7] = 0x80; }
++        out[0] = raw[2]; out[1] = raw[3]; out[2] = raw[4]; out[3] = raw[5]; out[4] = raw[6]; out[5] = raw[7];
++        const uint16_t btns = (uint16_t)(raw[2] | (raw[3] << 8));
++        const uint16_t pm[12] = {0x0020, 0x0080, 0x0010, 0x0040, 0x1000, 0x2000, 0x4000, 0x8000, 0x0400, 0x0800, 0x0100, 0x0200};
++        for (int p = 0; p < 12; ++p) out[6 + p] = (btns & pm[p]) ? 0x00 : 0xFF;
++        std::memcpy(out + kPadDataLen, kProfile, kProfileLen);
++    }
++
++    void writeHalfBuffer(uint8_t *rd, uint32_t half, const uint8_t *payload, uint32_t seq)
++    {
++        if (!half) return; uint8_t *p = rd + (half & 0x01FFFFFFu);
++        p[0] = 1; p[1] = 0; p[2] = (uint8_t)kPadDataLen; p[3] = (uint8_t)kProfileLen;
++        const uint32_t total = kPadDataLen + kProfileLen; std::memcpy(p + 4, &total, 4);
++        std::memcpy(p + 28, payload, total); std::memcpy(p + kHalfSeqOffset, &seq, 4);
++    }
++
++    void deliverToSocket(uint8_t *rd, PS2Runtime *runtime, int idx)
++    {
++        const PadSocket &s = g_padSockets[idx];
++        if (!s.active || !s.buf0 || !s.buf1 || !padDeliverEnabled()) return;
++        uint8_t payload[32]; buildPadPayload(runtime, idx, payload);
++        const uint32_t seq0 = padRd32(rd, s.buf0 + kHalfSeqOffset), seq1 = padRd32(rd, s.buf1 + kHalfSeqOffset);
++        const uint32_t target = (seq0 <= seq1) ? s.buf0 : s.buf1;
++        writeHalfBuffer(rd, target, payload, (uint32_t)(++g_padSeq));
++    }
++}
++
++namespace ps2_dbcman_hle
++{
++    bool answerDbcManRpc(uint8_t *rd, PS2Runtime *runtime, uint32_t sid, uint32_t rpcNum,
++                         uint32_t sendBuf, uint32_t /*sendSize*/, uint32_t recvBuf, uint32_t recvSize,
++                         uint32_t &resultPtr)
++    {
++        resultPtr = recvBuf;
++        if (sid == kEventSid1 || sid == kEventSid2) return true; // event channels: nothing to deliver
++        if (!padHleEnabled()) { if (rpcNum == kRpcCheckVersion) writeVersionResponse(rd, recvBuf, recvSize); return true; }
++        switch (rpcNum)
++        {
++        case kRpcInit: return true;
++        case kRpcCheckVersion: writeVersionResponse(rd, recvBuf, recvSize); return true;
++        case kRpcSetWorkAddr:
++        {
++            g_padWorkAddr = padRd32(rd, sendBuf + 4);
++            if (g_padWorkAddr && padWorkTblEnabled()) { padWr32(rd, g_padWorkAddr, 1u); for (uint32_t port = 1; port < 16; ++port) padWr32(rd, g_padWorkAddr + port * 4u, 0u); }
++            return true;
++        }
++        case kRpcCreateSocket:
++        {
++            int idx = g_padSocketCount < kMaxSockets ? g_padSocketCount++ : kMaxSockets - 1;
++            g_padSockets[idx].active = true; g_padSockets[idx].buf0 = padRd32(rd, sendBuf + 40); g_padSockets[idx].buf1 = padRd32(rd, sendBuf + 44);
++            padWr32(rd, recvBuf + 36, (uint32_t)idx); deliverToSocket(rd, runtime, idx); return true;
++        }
++        case kRpcDeleteSocket: { const uint32_t idx = padRd32(rd, sendBuf); if (idx < (uint32_t)kMaxSockets) g_padSockets[idx] = PadSocket{}; return true; }
++        case kRpcGetDepNumber: padWr32(rd, recvBuf + 4, 0u); return true;
++        case kRpcInitSocket: case kRpcGetDeviceStatus: case kRpcSearchPortSpecific: padWr32(rd, recvBuf + 4, 0u); return true;
++        case kRpcReceiveData:
++        {
++            const uint32_t mode = padRd32(rd, sendBuf + 4); uint32_t len = 0; uint8_t payload[16] = {0};
++            switch (mode & 0xFFu)
++            {
++            case 0x02u: len = 1; payload[0] = kPadTypeAnalog; break; // controller-type -> DS2 analog
++            case 0x0Cu: len = 1; payload[0] = 1; break;             // pad state -> connected
++            default: len = 0; break;
++            }
++            padWr32(rd, recvBuf + 8, len); if (len > 0) std::memcpy(rd + ((recvBuf + 12) & 0x01FFFFFFu), payload, len);
++            padWr32(rd, recvBuf + 0x20C, 0u); return true;
++        }
++        case kRpcSRData: padWr32(rd, recvBuf + 12, 0u); padWr32(rd, recvBuf + 0x410, 0u); return true;
++        default: return true; // generic ack (resultPtr = recv already set)
++        }
++    }
++
++    void deliverPadData(uint8_t *rdram, PS2Runtime *runtime)
++    {
++        if (!rdram || !padHleEnabled()) return;
++        // Re-assert the per-port connection table every tick (the game wipes this BSS during load, so
++        // a one-shot SetWorkAddr write is lost -> GetDepNumber fails -> controller "removed").
++        if (g_padWorkAddr && padWorkTblEnabled()) padWr32(rdram, g_padWorkAddr, 1u);
++        for (int i = 0; i < g_padSocketCount; ++i) deliverToSocket(rdram, runtime, i);
++    }
++
++    void reset()
++    {
++        g_padWorkAddr = 0u;
++        for (auto &s : g_padSockets) s = PadSocket{};
++        g_padSocketCount = 0;
++        g_padSeq = 0u;
++    }
++}
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 91a23c2..08f783d 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -351,6 +351,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_gs_memory.cpp
+     src/lib/ps2_gs_rasterizer.cpp
+     src/lib/ps2_iop_host.cpp
++    src/lib/ps2_dbcman_hle.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_runtime.cpp
