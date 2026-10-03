@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '%s' 'BINDING FIRST STEP (LLMPS2Recomp PS2 decomp): before ANY work, read docs/operating-manual.md and docs/working-rules.md, then docs/README.md for the rest. Do NOT act until you have read them; they are binding doctrine. Key rules: ground-truth ranking generated C++ > disasm > gdb (gdb must verify load-bearing claims); ONE frontier per cycle; bump BUILD_TAG and confirm it in run.txt after every build; never edit tools/<game>/PS2Recomp (wiped + regenerated every build) -- all game behavior goes through override hooks in the game repo.'"
+          }
+        ]
+      }
+    ]
+  }
+}

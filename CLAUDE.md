@@ -1,5 +1,10 @@
 # PS2Recomp engine — project guide
 
+> **▶ BINDING FIRST STEP — before ANY work, read [`docs/operating-manual.md`](docs/operating-manual.md)
+> and [`docs/working-rules.md`](docs/working-rules.md), then [`docs/README.md`](docs/README.md) for the
+> rest. Do not act until you have; they are binding doctrine, not background reading.** (A `SessionStart`
+> hook in `.claude/settings.json` also injects this directive every session.)
+
 A **stateless engine** for statically recompiling PS2 games. It recompiles an EE MIPS
 R5900 ELF into C++ (`ps2_recomp`) and runs it on `ps2xRuntime` (which emulates the EE
 kernel, GS, SIF/IOP, threading). It contains **no game** — you point it at a separate
