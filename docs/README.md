@@ -54,6 +54,11 @@ mass-rewrite the inputs.**
   override). Use when a frontier is an **architecture question**, not a CSV/override bug.
   Sub-agents are READ-ONLY; **only the main agent builds**. Reusable template at
   `.claude/workflows/re-fanout.js`.
+- **[upstream-wiki-reference.md](upstream-wiki-reference.md)** — distilled reference of the
+  **ran-j/PS2Recomp wiki**: the analyzer→recompiler→runtime pipeline, the full TOML config
+  schema (incl. `[patches].instructions` and `skip`=startup-code), the game-override-hook
+  API, the runtime memory/dispatch model, and the stripped-game playbook — annotated with how
+  each maps to our setup. Upstream's *intended* behavior; secondary to our own ground truth.
 
 ## Hard constraints (apply everywhere)
 
