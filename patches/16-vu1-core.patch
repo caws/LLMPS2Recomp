@@ -1,0 +1,162 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd75bba..f56fa43 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -840,6 +840,51 @@ void VU1Interpreter::commitReadyPipelines()
+     }
+ }
+ 
++// XGKICK walk fixes (cont.155, both default ON with kill switches):
++// - PS2X_VU1_KICKFLG3 (=0 reverts): GIF-tag FLG=3 is NOT a reserved format — ps2tek documents
++//   FLG 11b as "Disable (same as IMAGE)" and PCSX2 (GIF_FLG_IMAGE2) falls through to the IMAGE
++//   path. Upstream aborted the kick AND killed the whole microprogram on every FLG=3 packet.
++// - PS2X_VU1_KICKDROP_SOFT (=0 reverts): an oversized/garbage tag walk (the historical DROP
++//   population) drops THE KICK (bounded-walk host safety) but must not kill the microprogram —
++//   real hardware never stops the VU over GIF data content, and the old interpreter dropped the
++//   kick and continued. Upstream's m_stopRequested abort turned every garbage-tag kick into a
++//   whole dead geometry batch (~140 killed programs / 10 min in the LOTR level era).
++static const bool s_vu1KickFlg3Image = []
++{ const char *e = std::getenv("PS2X_VU1_KICKFLG3"); return !(e && e[0] == '0'); }();
++static const bool s_vu1KickDropSoft = []
++{ const char *e = std::getenv("PS2X_VU1_KICKDROP_SOFT"); return !(e && e[0] == '0'); }();
++
++// File-static on purpose: adding a member would touch include/runtime/ps2_vu1.h, which the
++// generated code includes (a ~60 min rebuild vs ~3 min for this .cpp alone).
++static void logXgkickDrop(uint32_t reason, uint32_t pc, unsigned long long cycle,
++                          uint32_t srcAddr, const uint8_t *vuData, uint32_t dataSize)
++{
++    static unsigned long s_drops = 0;
++    ++s_drops;
++    if (s_drops <= 24u || (s_drops % 1024u) == 0u)
++    {
++        std::fprintf(stderr, "[VU1 kick-drop] n=%lu reason=0x%x pc=0x%x cycle=%llu src=0x%x\n",
++                     s_drops, reason, pc, cycle, srcAddr);
++        // Rule 12: dump the bytes the counter counts — the first two qwords at the kick source
++        // identify the corruption class (zeros / file data / shifted stream / floats-as-tag).
++        if (vuData && dataSize)
++        {
++            for (uint32_t q = 0; q < 2u; ++q)
++            {
++                uint32_t w[4];
++                for (uint32_t i = 0; i < 4u; ++i)
++                {
++                    uint32_t v = 0;
++                    for (uint32_t bshift = 0; bshift < 4u; ++bshift)
++                        v |= static_cast<uint32_t>(vuData[(srcAddr + q * 16u + i * 4u + bshift) % dataSize]) << (8u * bshift);
++                    w[i] = v;
++                }
++                std::fprintf(stderr, "    q%u: %08x %08x %08x %08x\n", q, w[0], w[1], w[2], w[3]);
++            }
++        }
++    }
++}
++
+ void VU1Interpreter::progressXgkick()
+ {
+     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
+@@ -851,6 +896,44 @@ void VU1Interpreter::progressXgkick()
+         m_xgkick.cycleCredit -= 2u;
+         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
+         {
++            if (s_vu1KickDropSoft)
++            {
++                m_xgkick.active = false;
++                logXgkickDrop(0xFFFFFFFBu, m_state.pc, static_cast<unsigned long long>(m_cycle), m_xgkick.sourceAddress, m_activeVuData, m_activeVuDataSize);
++                // One-shot per-kick-pc deep dump (first 6 distinct pcs): VI regs + microcode
++                // around the kick + more source qwords, to classify the failing program's kick
++                // as "output never written" vs "input garbage" (cont.155 RE material).
++                {
++                    static uint32_t s_dumpedPcs[6] = {0};
++                    static int s_nDumped = 0;
++                    bool seen = false;
++                    for (int i = 0; i < s_nDumped; ++i)
++                        if (s_dumpedPcs[i] == m_state.pc)
++                            seen = true;
++                    if (!seen && s_nDumped < 6)
++                    {
++                        s_dumpedPcs[s_nDumped++] = m_state.pc;
++                        extern unsigned long g_vifQw10WriteGen;
++                        std::fprintf(stderr, "[VU1 kick-dump] pc=0x%x src=0x%x w10gen=%lu vi:", m_state.pc, m_xgkick.sourceAddress, g_vifQw10WriteGen);
++                        for (int i = 0; i < 16; ++i)
++                            std::fprintf(stderr, " %04x", static_cast<uint16_t>(m_state.vi[i]));
++                        std::fprintf(stderr, "\n");
++                        if (m_cachedVuCode)
++                        {
++                            const uint32_t base = (m_state.pc >= 32u) ? (m_state.pc - 32u) & ~7u : 0u;
++                            for (uint32_t off = 0; off < 64u && base + off + 8u <= m_cachedCodeSize; off += 8u)
++                            {
++                                uint32_t lo = 0, hi = 0;
++                                std::memcpy(&lo, m_cachedVuCode + base + off, 4u);
++                                std::memcpy(&hi, m_cachedVuCode + base + off + 4u, 4u);
++                                std::fprintf(stderr, "    code 0x%04x: upper=%08x lower=%08x%s\n",
++                                             base + off, hi, lo, (base + off == m_state.pc) ? "  <= kick" : "");
++                            }
++                        }
++                    }
++                }
++                return;
++            }
+             reportReservedInstruction(false, 0xFFFFFFFBu);
+             m_xgkick.active = false;
+             return;
+@@ -879,10 +962,16 @@ void VU1Interpreter::progressXgkick()
+                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
+             else if (format == 1u)
+                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
+-            else if (format == 2u)
+-                tagBytes += static_cast<uint64_t>(nloop) * 16u;
++            else if (format == 2u || (format == 3u && s_vu1KickFlg3Image))
++                tagBytes += static_cast<uint64_t>(nloop) * 16u; // FLG=3 "Disable" == IMAGE (ps2tek; PCSX2 GIF_FLG_IMAGE2)
+             else
+             {
++                if (s_vu1KickDropSoft)
++                {
++                    m_xgkick.active = false;
++                    logXgkickDrop(0xFFFFFFF8u, m_state.pc, static_cast<unsigned long long>(m_cycle), m_xgkick.sourceAddress, m_activeVuData, m_activeVuDataSize);
++                    return;
++                }
+                 reportReservedInstruction(false, 0xFFFFFFF8u);
+                 m_xgkick.active = false;
+                 return;
+@@ -890,6 +979,12 @@ void VU1Interpreter::progressXgkick()
+ 
+             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
+             {
++                if (s_vu1KickDropSoft)
++                {
++                    m_xgkick.active = false;
++                    logXgkickDrop(0xFFFFFFFBu, m_state.pc, static_cast<unsigned long long>(m_cycle), m_xgkick.sourceAddress, m_activeVuData, m_activeVuDataSize);
++                    return;
++                }
+                 reportReservedInstruction(false, 0xFFFFFFFBu);
+                 m_xgkick.active = false;
+                 return;
+@@ -926,11 +1021,28 @@ void VU1Interpreter::finishXgkick()
+     m_xgkick.active = false;
+ }
+ 
++// PS2X_VU1_KICKSTALL (default ON; =0 restores the clobber): real VU1 hardware STALLS on a
++// second XGKICK until PATH1 finishes streaming the previous kick (PCSX2 models this stall).
++// Upstream reset m_xgkick unconditionally, DESTROYING any in-flight kick — its packet was
++// silently never submitted to the GS. PATH1 streams at ~8 bytes/cycle, so a 1KB packet needs
++// ~128 cycles; programs issue batch kicks a few dozen cycles apart, which lost nearly every
++// packet except each program's last — the bulk of the level scene (cont.155).
++static const bool s_vu1KickStall = []
++{ const char *e = std::getenv("PS2X_VU1_KICKSTALL"); return !(e && e[0] == '0'); }();
++
+ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+ {
+     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
+         return;
+ 
++    if (s_vu1KickStall)
++    {
++        // Stall until the previous kick completes (progressXgkick terminates: it either
++        // finishes at EOP or soft-drops at the 64KB walk bound).
++        while (m_xgkick.active)
++            advanceOneCycle();
++    }
++
+     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+     m_xgkick = {};
+     m_xgkick.active = true;

@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index 05fc764..7bf0cd2 100644
+index 05fc764..7b6edf8 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 @@ -1,5 +1,7 @@
@@ -375,9 +375,7 @@ index 05fc764..7bf0cd2 100644
 +                // were already parsed as VIF commands and never leak into the image.
 +                uint32_t imgQw = 0u;
 +                if (s_vifDirectCarry && m_vif1PendingPath2ImageQwc != 0u)
-                 {
--                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
--                    if (imageQw > inlineImageQw)
++                {
 +                    imgQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
 +                    // PS2X_VIF_DCLOG=1 (probe, cycle 86, no behaviour change): each payload-aligned
 +                    // consume with its pending/span/truncation context -- correlates a consume with
@@ -398,9 +396,7 @@ index 05fc764..7bf0cd2 100644
 +                    uint32_t left = imgQw;
 +                    uint32_t off = 0u;
 +                    while (left > 0u)
-                     {
--                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
--                        m_vif1PendingPath2DirectHl = directHl;
++                    {
 +                        // nloop is 15-bit; a bigger chunk must be split or the tag under-declares.
 +                        const uint32_t chunk = std::min<uint32_t>(left, 0x7FFFu);
 +                        const bool final = (m_vif1PendingPath2ImageQwc == chunk);
@@ -418,10 +414,10 @@ index 05fc764..7bf0cd2 100644
 +                        m_vif1PendingPath2ImageQwc -= chunk;
 +                        left -= chunk;
 +                        off += chunk * 16u;
-                     }
++                    }
 +                    if (m_vif1PendingPath2ImageQwc == 0u)
 +                        m_vif1PendingPath2DirectHl = false;
-                 }
++                }
 +                const uint32_t restQw = qwCount - imgQw;
 +                const uint8_t *restData = data + pos + static_cast<size_t>(imgQw) * 16u;
 +
@@ -463,10 +459,14 @@ index 05fc764..7bf0cd2 100644
 +                    return e && e[0] && e[0] != '0';
 +                }();
 +                if (s_dirImgLog && newCarry != oldCarry)
-+                {
+                 {
+-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
+-                    if (imageQw > inlineImageQw)
 +                    static uint64_t s_n = 0ull;
 +                    if (++s_n <= 60ull || (s_n % 500ull) == 0ull)
-+                    {
+                     {
+-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
+-                        m_vif1PendingPath2DirectHl = directHl;
 +                        uint64_t t0 = 0u;
 +                        std::memcpy(&t0, restData, sizeof(t0));
 +                        const uint32_t nextOff = pos + qwCount * 16u;
@@ -483,8 +483,8 @@ index 05fc764..7bf0cd2 100644
 +                                     (unsigned long long)s_n, qwCount,
 +                                     (unsigned)((t0 >> 58) & 0x3u), oldCarry, newCarry,
 +                                     truncated ? 1 : 0, nb);
-+                    }
-+                }
+                     }
+                 }
 +
 +                // Carry ONLY when THIS DIRECT opened a fresh image that overran its payload
 +                // (pendBefore==0 && pendAfter>0). A pre-existing incomplete transfer (pendBefore>0)
@@ -527,3 +527,113 @@ index 05fc764..7bf0cd2 100644
                  pos = sizeBytes;
                  break;
              }
+@@ -530,6 +964,62 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             if (wl == 0u)
+                 wl = 1u;
+ 
++            // VIF1 unpack census (PS2X_VIF_CENSUS, default OFF): aggregate combo counters,
++            // printed every 8192 unpacks — which unpack shapes the game actually uses.
++            {
++                static const bool s_vifCensus = []
++                { const char *e = std::getenv("PS2X_VIF_CENSUS"); return e && e[0] && e[0] != '0'; }();
++                if (s_vifCensus)
++                {
++                    static unsigned long s_n = 0, s_byVlVn[16] = {0}, s_mask = 0, s_fill = 0, s_skip = 0,
++                                         s_mode[4] = {0};
++                    ++s_n;
++                    ++s_byVlVn[(vl & 3u) * 4u + (vn & 3u)];
++                    if (maskEnable)
++                        ++s_mask;
++                    if (cl < wl)
++                        ++s_fill;
++                    else if (cl > wl)
++                        ++s_skip;
++                    ++s_mode[vif1_regs.mode & 3u];
++                    {
++                        static unsigned long s_spanned = 0;
++                        uint32_t sourceVectorCountPre = writeVectorCount;
++                        if (cl < wl)
++                        {
++                            const uint32_t fb = writeVectorCount / wl;
++                            uint32_t rem = writeVectorCount % wl;
++                            if (rem > cl)
++                                rem = cl;
++                            sourceVectorCountPre = fb * cl + rem;
++                        }
++                        uint32_t tb = sourceVectorCountPre * bytesPerVector;
++                        tb = (tb + 3u) & ~3u;
++                        if (pos + tb > sizeBytes)
++                        {
++                            ++s_spanned;
++                            if (s_spanned <= 12u || (s_spanned % 512u) == 0u)
++                                std::fprintf(stderr,
++                                             "[vif:unpack-SPAN] n=%lu payload=%u avail=%u vl=%u vn=%u num=%u addr=0x%x cl=%u wl=%u\n",
++                                             s_spanned, tb, sizeBytes - pos, vl, vn,
++                                             static_cast<unsigned>(num), static_cast<unsigned>(imm & 0x3FFu), cl, wl);
++                        }
++                    }
++                    if ((s_n % 8192u) == 0u)
++                    {
++                        std::fprintf(stderr,
++                                     "[vif:unpack] n=%lu mask=%lu fill=%lu skip=%lu mode{0:%lu 1:%lu 2:%lu 3:%lu} "
++                                     "vl.vn{", s_n, s_mask, s_fill, s_skip, s_mode[0], s_mode[1], s_mode[2], s_mode[3]);
++                        for (unsigned i = 0; i < 16u; ++i)
++                            if (s_byVlVn[i])
++                                std::fprintf(stderr, " %u.%u:%lu", i / 4u, i % 4u, s_byVlVn[i]);
++                        std::fprintf(stderr, " } row=%08x/%08x/%08x/%08x cl=%u wl=%u num=%u addr=0x%x\n",
++                                     vif1_regs.row[0], vif1_regs.row[1], vif1_regs.row[2], vif1_regs.row[3],
++                                     cl, wl, static_cast<unsigned>(num), static_cast<unsigned>(imm & 0x3FFu));
++                    }
++                }
++            }
++
+             uint32_t sourceVectorCount = writeVectorCount;
+             if (cl < wl)
+             {
+@@ -549,6 +1039,39 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ 
+             const bool zeroExtend = (imm & 0x4000u) != 0u;
+ 
++            // Failing-buffer watch (part of PS2X_VIF_CENSUS): the level-era kick-stub kicks qw
++            // 0x10 and finds garbage — log every unpack whose dest range covers it, plus bump a
++            // generation counter the kick-drop dump reads (extern, defined here).
++            {
++                extern unsigned long g_vifQw10WriteGen;
++                static const bool s_vifCensus2 = []
++                { const char *e = std::getenv("PS2X_VIF_CENSUS"); return e && e[0] && e[0] != '0'; }();
++                if (s_vifCensus2)
++                {
++                    const uint32_t destEnd = vuAddr + writeVectorCount;
++                    if (vuAddr <= 0x10u && destEnd > 0x10u)
++                    {
++                        ++g_vifQw10WriteGen;
++                        static unsigned long s_w10 = 0;
++                        ++s_w10;
++                        if (s_w10 <= 20u || (s_w10 % 4096u) == 0u)
++                        {
++                            uint32_t s0 = 0, s1 = 0;
++                            if (pos + 8u <= sizeBytes)
++                            {
++                                std::memcpy(&s0, data + pos, 4u);
++                                std::memcpy(&s1, data + pos + 4u, 4u);
++                            }
++                            std::fprintf(stderr,
++                                         "[vif:w10] n=%lu gen=%lu vl=%u vn=%u num=%u addr=0x%x(+tops=%u) mode=%u mask=%u cl=%u wl=%u src0=%08x %08x\n",
++                                         s_w10, g_vifQw10WriteGen, vl, vn, static_cast<unsigned>(num),
++                                         vuAddr, (imm & 0x8000u) ? 1u : 0u, vif1_regs.mode & 3u,
++                                         maskEnable ? 1u : 0u, cl, wl, s0, s1);
++                        }
++                    }
++                }
++            }
++
+             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+                 const uint8_t *srcBase = data + pos;
+@@ -758,3 +1281,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         }
+     }
+ }
++
++// Definition for the qw-0x10 write-generation watch (read by the VU1 kick-drop dump).
++unsigned long g_vifQw10WriteGen = 0;
