@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..763f20b
+index 0000000..1da4ecf
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,232 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -60,36 +60,21 @@ index 0000000..763f20b
 +    uint32_t startPixel = 0;
 +    std::vector<uint32_t> payload; // one word per pixel
 +};
-+// One primitive, fully resolved for the GPU rasterizer (cont.169, phase 2a).
++// The rasterizer's inputs, split the way the hardware batch wants them (cont.171).
 +//
-+// Everything the shader needs is flattened here: all members are 4-byte scalars in a
-+// fixed order, mirrored field-for-field by the `Prim` block in the raster shader, so the
-+// std430 layout is unambiguous (no vec3/array-stride rules in play).
++// A primitive record carries ONLY geometry plus an index into a per-batch STATE TABLE.
++// That split is measured, not assumed: PS2X_GS_BATCHCENSUS found a mean of 3.9 distinct
++// draw states per render-target run (max 61), so a 128-entry table covers every batch this
++// game produces -- while GSPrimitiveBatch hands us ~200 bytes of GSDrawState per PRIMITIVE
++// and there are 7.2M of them per run.
 +//
-+// The HOST resolves everything that would otherwise need a GPU division or transcendental
-+// in the setup path -- the per-triangle winding/1/|denom|, and the mip level's tbp/tbw/
++// All members are 4-byte scalars in a fixed order, mirrored field-for-field by the shader's
++// std430 blocks. The HOST resolves everything that would otherwise need a GPU division or
++// transcendental -- the per-triangle winding and 1/|denom|, and the mip level's tbp/tbw/
 +// texture size/region bounds -- because GLSL only guarantees ~2.5 ULP for division while
-+// the CPU oracle divides with correctly-rounded IEEE. Vertex z is carried as the two
-+// halves of the CPU's double (packDouble2x32) so interpolation is exact, matching
-+// DrawTriangle's `double z = v0.z*w0 + v1.z*w1 + v2.z*w2`.
-+struct GsGpuPrim
++// the CPU oracle divides with correctly-rounded IEEE.
++struct GsGpuState
 +{
-+    // Vertices in screen space, XYOFFSET already subtracted (as DrawTriangle does).
-+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-+    uint32_t z0lo = 0, z0hi = 0, z1lo = 0, z1hi = 0, z2lo = 0, z2hi = 0;
-+    uint32_t rgba0 = 0, rgba1 = 0, rgba2 = 0; // r | g<<8 | b<<16 | a<<24
-+    float q0 = 0, q1 = 0, q2 = 0;
-+    float s0 = 0, s1 = 0, s2 = 0;
-+    float t0 = 0, t1 = 0, t2 = 0;
-+    uint32_t uv0 = 0, uv1 = 0, uv2 = 0; // u | v<<16
-+    uint32_t fog0 = 0, fog1 = 0, fog2 = 0;
-+
-+    // Raster setup, host-computed.
-+    float winding = 1.0f;
-+    float invAbsDenom = 0.0f;
-+    float fstDiv = 16.0f; // 16 << mip, the FST texel divisor
-+    uint32_t minX = 0, minY = 0, maxX = 0, maxY = 0;
-+
 +    // Frame / Z / scissor.
 +    uint32_t fbp = 0, fbw = 1, fpsm = 0, fbmsk = 0;
 +    uint32_t zbp = 0, zpsm = 0, zmsk = 0;
@@ -110,22 +95,63 @@ index 0000000..763f20b
 +    uint32_t texW = 1, texH = 1, linear = 0;
 +    uint32_t wms = 0, wmt = 0, minU = 0, maxU = 0, minV = 0, maxV = 0;
 +    uint32_t ta0 = 0, ta1 = 0, aem = 0;
++    float fstDiv = 16.0f; // 16 << mip, the FST texel divisor
 +
-+    // --- SPRITE path (primType == GS_PRIM_SPRITE). DrawSprite is not a degenerate
-+    // triangle: colour, Z and fog are taken FLAT from v1 (it ignores IIP entirely), Z is
-+    // a plain truncation of v1.z with none of the triangle path's +0.5, and UV comes from
-+    // a screen-space lerp between two corners rather than barycentrics. su/sv are the two
-+    // corners already in TEXEL units (host-resolved: `v.u >> 4` for FST, `(v.s/q)*texW`
-+    // otherwise), and sprites never mipmap.
++    // CLUT shadow (PS2X_GS_CLUTSHADOW): the uploaded 16-entry payload for this cbp, so the
++    // shader can reproduce LookupCLUT's RGB-zeroed-entry substitution exactly.
++    uint32_t clutShadowHave = 0;
++    uint32_t pad0 = 0, pad1 = 0, pad2 = 0;
++    uint32_t clutShadow[16] = {};
++};
++
++// One primitive: geometry, its scissor-clipped bbox (also the binning key), and its state.
++struct GsGpuGeom
++{
++    // Vertices in screen space, XYOFFSET already subtracted (as DrawTriangle does).
++    float x0 = 0, y0 = 0, x1 = 0, y1 = 0, x2 = 0, y2 = 0;
++    // Vertex Z as the two halves of the CPU's double (packDouble2x32), so the triangle
++    // path's double interpolation is exact.
++    uint32_t z0lo = 0, z0hi = 0, z1lo = 0, z1hi = 0, z2lo = 0, z2hi = 0;
++    uint32_t rgba0 = 0, rgba1 = 0, rgba2 = 0; // r | g<<8 | b<<16 | a<<24
++    float q0 = 0, q1 = 0, q2 = 0;
++    float s0 = 0, s1 = 0, s2 = 0;
++    float t0 = 0, t1 = 0, t2 = 0;
++    uint32_t uv0 = 0, uv1 = 0, uv2 = 0; // u | v<<16
++    uint32_t fog0 = 0, fog1 = 0, fog2 = 0;
++
++    float winding = 1.0f;
++    float invAbsDenom = 0.0f;
++    uint32_t minX = 0, minY = 0, maxX = 0, maxY = 0;
++
++    // SPRITE path (DrawSprite is not a degenerate triangle): colour, Z and fog come FLAT
++    // from v1 (it ignores IIP), Z is a plain truncation of v1.z with none of the triangle
++    // path's +0.5, and UV is a screen-space lerp between two corners already in TEXEL units.
 +    uint32_t spriteZ = 0;
 +    uint32_t unclipX0 = 0, unclipY0 = 0;
 +    float spriteW = 1.0f, spriteH = 1.0f;
 +    float su0 = 0, sv0 = 0, su1 = 0, sv1 = 0;
 +
-+    // CLUT shadow (PS2X_GS_CLUTSHADOW): the uploaded 16-entry payload for this cbp, so the
-+    // shader can reproduce LookupCLUT's RGB-zeroed-entry substitution exactly.
-+    uint32_t clutShadowHave = 0;
-+    uint32_t clutShadow[16] = {};
++    uint32_t stateIndex = 0;
++    uint32_t pad0 = 0, pad1 = 0, pad2 = 0;
++};
++
++// A batch of primitives sharing one render target, with no non-draw VRAM mutation between
++// them (see g_vramMutationSeq in gs_cpu_backend.cpp -- an upload landing mid-batch would be
++// visible to every primitive in it, while the oracle shows it only to those that follow).
++//
++// Binning is done on the HOST: it costs almost nothing (mean 491 prims x 4.21 tiles per
++// batch) and it is trivially in SUBMISSION ORDER, which a GPU atomic append would not be --
++// and submission order per pixel is the whole correctness requirement.
++struct GsGpuBatch
++{
++    std::vector<GsGpuState> states;   // <=128, dedup'd
++    std::vector<GsGpuGeom> prims;     // in submission order
++    // CSR bins over a tilesX x tilesY grid of 16x16 screen tiles: tile t owns
++    // binEntries[binOffsets[t] .. binOffsets[t+1]), each entry a prims[] index, ascending.
++    std::vector<uint32_t> binOffsets;
++    std::vector<uint32_t> binEntries;
++    std::vector<uint32_t> tileList;   // non-empty tiles, one workgroup each
++    uint32_t tilesX = 0, tilesY = 0;
 +};
 +
 +class GsGpuPresentDevice
@@ -183,14 +209,19 @@ index 0000000..763f20b
 +    // rasterizer may have written there since the last call): pages it marks are reported
 +    // separately, because until phase 2 mirrors draws they are EXPECTED to diverge. What
 +    // remains -- stale pages the rasterizer cannot explain -- is the actual gate.
-+    void MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
++    // Returns true when the mirror matches vram exactly.
++    bool MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
 +                          const uint8_t *drawPageMask = nullptr);
 +
 +    // Phase 2a (cont.169): rasterize ONE primitive into the mirror. Async, FIFO-ordered
 +    // behind every prior mirror op, so the caller's seed patches are already applied.
 +    // Single-primitive dispatch is race-free by construction: one invocation per pixel of
 +    // the scissor-clipped bbox, and a pixel owns its frame word and its Z word.
-+    void RasterPrim(GsGpuPrim &&prim);
++    // A batch is rasterized one workgroup per non-empty 16x16 tile, one thread per pixel,
++    // each thread walking its tile's primitive list IN SUBMISSION ORDER. That needs no
++    // barriers at all: pixels are independent of one another, and the only ordering the GS
++    // requires is per pixel. The phase-2a single-primitive path is just a batch of one.
++    void RasterBatch(GsGpuBatch &&batch);
 +
 +    // Phase 2a shadow verify: compare mirror[byteOffset .. +expected.size()) against the
 +    // CPU-authoritative post-draw bytes. `tag` is echoed on divergence so a mismatch names

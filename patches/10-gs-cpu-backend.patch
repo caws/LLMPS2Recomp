@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..242fb95 100644
+index 9c39ae2..5ff9127 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,9 +10,19 @@
@@ -22,7 +22,7 @@ index 9c39ae2..242fb95 100644
  
  using namespace GSInternal;
  
-@@ -468,12 +478,252 @@ namespace
+@@ -468,12 +478,291 @@ namespace
      }
  }
  
@@ -119,6 +119,16 @@ index 9c39ae2..242fb95 100644
 +    return n > 0 ? n : 1000;
 +}();
 +static unsigned long g_gpuXferSkipped = 0; // uploads the swizzle kernel cannot take (raw-patched)
++// Bumped by every VRAM mutation that is NOT a draw (host->local upload, local->local blit,
++// clear, direct poke). A GPU draw BATCH cannot span one of these: the batch is rasterized
++// at flush time, so an upload that lands mid-batch would be visible to every primitive in
++// it, while the oracle only shows it to the primitives that follow. The batch therefore
++// has to be flushed before each one -- and how often that happens decides whether batching
++// is viable at all, which is what PS2X_GS_BATCHCENSUS's "eff" run lengths measure.
++static unsigned long g_vramMutationSeq = 0;
++// Counted here (rather than with the other batch tallies) because the eager-flush
++// sites sit above them in this file.
++static unsigned long g_bvFlushExplicit = 0;
 +// Mipmapping (PS2X_GS_MIPMAP, default ON; =0 restores level-0-only sampling). The frontend
 +// stores MIPTBP1/2 + TEX1 but the sampler always read level 0 — distant minified surfaces
 +// alias into the diagonal moiré banding seen on the level terrain (the texture is clean in
@@ -144,13 +154,42 @@ index 9c39ae2..242fb95 100644
 +// its texture + CLUT pages into the mirror. See the call site -- with it OFF the verify
 +// additionally measures how often the game samples a RENDER TARGET (pixels only the
 +// rasterizer produces, which the mirror cannot have until phase 2 writes draws too).
++// PS2X_GS_GPU_BATCHVERIFY=<N> (default OFF; implies the mirror, and takes precedence over
++// the per-primitive gate): accumulate primitives into batches and rasterize each one with
++// the TILED entry point, shadow-verifying every Nth batch against the CPU oracle over the
++// whole 4MB. This is the ordering gate -- a batch of thousands of primitives matching the
++// oracle byte-for-byte is exactly the proof that per-tile submission order is right.
++static const int s_gsGpuBatchVerify = []
++{
++    const char *e = std::getenv("PS2X_GS_GPU_BATCHVERIFY");
++    if (!e || !e[0] || e[0] == '0')
++        return 0;
++    const int n = std::atoi(e);
++    return n > 0 ? n : 64;
++}();
++// Cap a batch so one enormous run cannot make the bin arrays or the seed/compare unbounded.
++static const int s_gsGpuBatchMax = []
++{
++    const char *e = std::getenv("PS2X_GS_GPU_BATCHMAX");
++    const int n = e ? std::atoi(e) : 0;
++    return (n > 0) ? n : 4096;
++}();
++
 +static const bool s_gsGpuRasterTexSeed = []
 +{ const char *e = std::getenv("PS2X_GS_GPU_RASTERTEXSEED"); return !(e && e[0] == '0'); }();
++// ---- Phase 2b step 2 scouting (cont.171): PS2X_GS_BATCHCENSUS (default OFF) ----
++// A tile rasterizer is only worth building if the game actually SUBMITS in batches. Two
++// numbers decide the design: how many consecutive primitives share one render target
++// (screen-space tiles are only VRAM-disjoint within a single target -- change fbp/fbw and
++// two different tiles can alias the same VRAM word, which would break tile independence),
++// and how many tiles a primitive's bbox covers (the per-tile work amplification).
++static const bool s_gsBatchCensus = []
++{ const char *e = std::getenv("PS2X_GS_BATCHCENSUS"); return e && e[0] && e[0] != '0'; }();
 +// True when anything should be feeding the device's VRAM mirror this run.
 +static inline bool gs2MirrorWanted()
 +{
 +    return s_gsGpuXfer || s_gsGpuXferVerify > 0 || s_gsGpuMirrorVerifyMs > 0 ||
-+           s_gsGpuRasterVerify > 0;
++           s_gsGpuRasterVerify > 0 || s_gsGpuBatchVerify > 0;
 +}
 +namespace
 +{
@@ -275,7 +314,7 @@ index 9c39ae2..242fb95 100644
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +781,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +820,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -292,7 +331,7 @@ index 9c39ae2..242fb95 100644
              break;
          }
      }
-@@ -541,14 +797,22 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,14 +836,22 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -315,7 +354,7 @@ index 9c39ae2..242fb95 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      ResetUnlocked();
  }
-@@ -561,10 +825,21 @@ void GSCpuBackend::ResetUnlocked()
+@@ -561,10 +864,21 @@ void GSCpuBackend::ResetUnlocked()
      m_transferState.direction = 3u;
      m_localToHostBuffer.clear();
      m_localToHostReadPos = 0u;
@@ -337,7 +376,7 @@ index 9c39ae2..242fb95 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +848,134 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,72 +887,1914 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -445,6 +484,8 @@ index 9c39ae2..242fb95 100644
 +        {
 +            s_lastMv = nowMv;
 +            std::lock_guard<std::mutex> lock(m_mutex);
++            if (s_gsGpuBatchVerify > 0 && !m_gpuBatch.prims.empty())
++    { ++g_bvFlushExplicit; gpuBatchFlush(); }
 +            mirrorFlushPokes(); // everything written so far must be IN the mirror first
 +            if (GsGpuPresentDevice *dev = gs2GpuDevice())
 +                dev->MirrorVerifyFull(m_vram, m_vramSize, m_drawPages.data());
@@ -477,15 +518,30 @@ index 9c39ae2..242fb95 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -602,8 +989,62 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
  
- void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
- {
+-uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+-{
+-    if (!m_vram)
+-        return 0u;
+-    return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
+-}
++uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    if (!m_vram)
++        return 0u;
++    return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
++}
++
++void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
 +    // Ordered wrt queued work: drain, then write (single guest producer, so nothing can
 +    // slip in between).
 +    drainQueue();
-     std::lock_guard<std::mutex> lock(m_mutex);
-     WriteVramUnlocked(psm, base, bw, x, y, value);
++    std::lock_guard<std::mutex> lock(m_mutex);
++    ++g_vramMutationSeq;
++    if (s_gsGpuBatchVerify > 0 && !m_gpuBatch.prims.empty())
++    { ++g_bvFlushExplicit; gpuBatchFlush(); }
++    WriteVramUnlocked(psm, base, bw, x, y, value);
 +#if PS2X_HAS_GS_GPU_DEVICE
 +    // Host-side pokes (LOTR's movie frame blit, the CLUT guard, font diagnostics) mutate
 +    // VRAM outside every transfer path -- mirror them too, or the mirror drifts. They
@@ -537,13 +593,15 @@ index 9c39ae2..242fb95 100644
 +            mirrorFlushPokeSlot(slot);
 +    }
 +#endif
- }
- 
- void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
-@@ -613,8 +1054,639 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
-     m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
- }
- 
++}
++
++void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    if (!m_vram)
++        return;
++    m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
++}
++
 +#if PS2X_HAS_GS_GPU_DEVICE
 +namespace
 +{
@@ -648,6 +706,16 @@ index 9c39ae2..242fb95 100644
 +    Gs2MirrorPatchStats g_mpStats[4]; // indexed by GSCpuBackend::MirrorPatchSource
 +    const char *const kMpSourceName[4] = {"upload", "l2l", "clear", "poke"};
 +
++    // Phase-2b batch tallies, printed with the other GPU counters.
++    unsigned long g_bvBatches = 0, g_bvVerified = 0, g_bvFlushTarget = 0, g_bvFlushMutation = 0;
++    unsigned long g_bvFlushCap = 0, g_bvFlushStates = 0, g_bvFlushHazard = 0;
++    unsigned long g_bvReplays = 0, g_bvReplayTilingBug = 0, g_bvReplayPrimBug = 0;
++    unsigned long long g_bvPrims = 0, g_bvBinEntries = 0;
++    unsigned long g_bvMaxPrims = 0, g_bvMaxStates = 0;
++    unsigned long long g_bvVerifiedPrims = 0;
++    unsigned long g_bvSkippedBatches = 0;
++    unsigned long g_bvVerifiedMaxPrims = 0;
++
 +    // Phase-2a/2b coverage: of the primitives the verify SAMPLED, how many did the GPU
 +    // path actually accept, and why were the rest turned away? Without this, "0 mismatches"
 +    // could just mean "we verified almost nothing".
@@ -665,7 +733,21 @@ index 9c39ae2..242fb95 100644
 +                         kMpSourceName[i], g_mpStats[i].n, g_mpStats[i].words,
 +                         g_mpStats[i].rawN, g_mpStats[i].rawBytes);
 +        std::fprintf(stderr, "\n");
-+        if (s_gsGpuRasterVerify > 0)
++        if (s_gsGpuBatchVerify > 0)
++            std::fprintf(stderr,
++                         "[gsgpu:batch] batches=%lu verified=%lu prims=%llu bin-entries=%llu "
++                         "mean-prims=%.1f max-prims=%lu max-states=%lu | verified-prims=%llu "
++                         "verified-max=%lu unverifiable=%lu | replay{n=%lu tiling=%lu prim=%lu} | flush{target=%lu "
++                         "mutation=%lu cap=%lu states=%lu hazard=%lu explicit=%lu}\n",
++                         g_bvBatches, g_bvVerified, g_bvPrims, g_bvBinEntries,
++                         g_bvBatches ? double(g_bvPrims) / double(g_bvBatches) : 0.0,
++                         g_bvMaxPrims, g_bvMaxStates, g_bvVerifiedPrims,
++                         g_bvVerifiedMaxPrims, g_bvSkippedBatches,
++                         g_bvReplays, g_bvReplayTilingBug, g_bvReplayPrimBug,
++                         g_bvFlushTarget, g_bvFlushMutation,
++                         g_bvFlushCap, g_bvFlushStates, g_bvFlushHazard,
++                         g_bvFlushExplicit);
++        if (s_gsGpuRasterVerify > 0 || s_gsGpuBatchVerify > 0)
 +        {
 +            unsigned long total = 0;
 +            for (int i = 0; i < kRvReasonCount; ++i)
@@ -708,7 +790,7 @@ index 9c39ae2..242fb95 100644
 +// SHAPE. Kept in one place so the triangle and sprite paths cannot describe the same GS
 +// state differently. `mip` is the host-resolved LOD (always 0 for sprites -- DrawSprite
 +// calls SampleTexture without a mip argument).
-+void GSCpuBackend::gs2FillCommonPrimState(const GSPrimitiveBatch &batch, GsGpuPrim &p, uint32_t mip)
++void GSCpuBackend::gs2FillCommonPrimState(const GSPrimitiveBatch &batch, GsGpuState &p, uint32_t mip)
 +{
 +    const GSDrawState &st = batch.state;
 +    const GSContext &ctx = st.context;
@@ -787,7 +869,8 @@ index 9c39ae2..242fb95 100644
 +
 +// Seed the mirror with the CPU's PRE-draw bytes for everything this primitive will read
 +// or write, then post the raster. FIFO order guarantees the patches land first.
-+void GSCpuBackend::rasterSeedAndPost(GsGpuPrim &&p, const RasterVerifyCtx &out)
++void GSCpuBackend::rasterSeedAndPost(const GsGpuState &st, GsGpuGeom &&g,
++                                     const RasterVerifyCtx &out)
 +{
 +    GsGpuPresentDevice *dev = gs2GpuDevice();
 +    if (!dev)
@@ -805,19 +888,23 @@ index 9c39ae2..242fb95 100644
 +    // reason that has nothing to do with the pixel pipeline under test. Seeding isolates
 +    // the pipeline; it becomes unnecessary once phase 2 makes the GPU write draws too.
 +    // Turning it OFF is the measurement of how much render-to-texture actually happens.
-+    if (s_gsGpuRasterTexSeed && p.tme != 0u)
++    if (s_gsGpuRasterTexSeed && st.tme != 0u)
 +    {
 +        uint32_t tOff = 0, tLen = 0;
-+        if (p.texW != 0u && p.texH != 0u &&
-+            gs2PageRange(p.tpsm, p.tbp, p.tbw, 0u, 0u, p.texW - 1u, p.texH - 1u, m_vramSize, tOff, tLen))
++        if (st.texW != 0u && st.texH != 0u &&
++            gs2PageRange(st.tpsm, st.tbp, st.tbw, 0u, 0u, st.texW - 1u, st.texH - 1u, m_vramSize, tOff, tLen))
 +            dev->MirrorPatchRaw(tOff, std::vector<uint8_t>(m_vram + tOff, m_vram + tOff + tLen));
 +        uint32_t cOff = 0, cLen = 0;
-+        const bool paletted = p.tpsm == GS_PSM_T4 || p.tpsm == GS_PSM_T8 || p.tpsm == GS_PSM_T4HL ||
-+                              p.tpsm == GS_PSM_T4HH || p.tpsm == GS_PSM_T8H;
-+        if (paletted && gs2PageRange(p.cpsm, p.cbp, 1u, 0u, 0u, 15u, 15u, m_vramSize, cOff, cLen))
++        const bool paletted = st.tpsm == GS_PSM_T4 || st.tpsm == GS_PSM_T8 || st.tpsm == GS_PSM_T4HL ||
++                              st.tpsm == GS_PSM_T4HH || st.tpsm == GS_PSM_T8H;
++        if (paletted && gs2PageRange(st.cpsm, st.cbp, 1u, 0u, 0u, 15u, 15u, m_vramSize, cOff, cLen))
 +            dev->MirrorPatchRaw(cOff, std::vector<uint8_t>(m_vram + cOff, m_vram + cOff + cLen));
 +    }
-+    dev->RasterPrim(std::move(p));
++    GsGpuBatch batch;
++    batch.states.push_back(st);
++    g.stateIndex = 0u;
++    batch.prims.push_back(std::move(g));
++    dev->RasterBatch(std::move(batch)); // a batch of one -- same shader, same code path
 +}
 +
 +// Phase 2b (cont.170): the SPRITE path. DrawSprite is not a degenerate triangle -- it
@@ -825,7 +912,8 @@ index 9c39ae2..242fb95 100644
 +// axis-aligned scissor-clipped rect, and derives UV from a screen-space lerp between two
 +// corners (with an FST fixed-point round trip). Everything downstream of the texel is the
 +// same WritePixel, so only the setup differs.
-+bool GSCpuBackend::rasterVerifyBeginSprite(const GSPrimitiveBatch &batch, RasterVerifyCtx &out)
++bool GSCpuBackend::rasterVerifyBeginSprite(const GSPrimitiveBatch &batch, RasterVerifyCtx &out,
++                                           GsGpuState *bs, GsGpuGeom *bg)
 +{
 +    GsGpuPresentDevice *dev = gs2GpuDevice();
 +    if (!dev)
@@ -864,57 +952,71 @@ index 9c39ae2..242fb95 100644
 +    const uint32_t ztst = static_cast<uint32_t>((ctx.test >> 17) & 3u);
 +    const bool zWritten = !ctx.zbuf.zmask;
 +    const bool zUsed = zWritten || ztst == 2u || ztst == 3u;
-+    if (!gs2PageRange(ctx.frame.psm, fbp, fbw, static_cast<uint32_t>(drawX0), static_cast<uint32_t>(drawY0),
++    const bool buildOnly = (bs != nullptr && bg != nullptr);
++    if (!buildOnly &&
++        !gs2PageRange(ctx.frame.psm, fbp, fbw, static_cast<uint32_t>(drawX0), static_cast<uint32_t>(drawY0),
 +                      static_cast<uint32_t>(drawX1), static_cast<uint32_t>(drawY1), m_vramSize,
 +                      out.frameOff, out.frameLen))
 +        return ++g_rvStats[kRvRange], false;
-+    if (zUsed && !gs2PageRange(ctx.zbuf.psm, zbp, fbw, static_cast<uint32_t>(drawX0), static_cast<uint32_t>(drawY0),
++    if (!buildOnly && zUsed &&
++        !gs2PageRange(ctx.zbuf.psm, zbp, fbw, static_cast<uint32_t>(drawX0), static_cast<uint32_t>(drawY0),
 +                               static_cast<uint32_t>(drawX1), static_cast<uint32_t>(drawY1), m_vramSize,
 +                               out.zOff, out.zLen))
 +        return ++g_rvStats[kRvRange], false;
 +    out.zSeed = zUsed;
 +    out.zWritten = zWritten;
 +
-+    GsGpuPrim p;
-+    gs2FillCommonPrimState(batch, p, /*mip*/ 0u); // sprites never mipmap (SampleTexture mip=0)
-+    p.primType = GS_PRIM_SPRITE;
-+    p.minX = static_cast<uint32_t>(drawX0); p.minY = static_cast<uint32_t>(drawY0);
-+    p.maxX = static_cast<uint32_t>(drawX1); p.maxY = static_cast<uint32_t>(drawY1);
-+    p.unclipX0 = static_cast<uint32_t>(unclippedX0);
-+    p.unclipY0 = static_cast<uint32_t>(unclippedY0);
-+    p.spriteW = std::max(1.0f, static_cast<float>(spanX));
-+    p.spriteH = std::max(1.0f, static_cast<float>(spanY));
-+    p.spriteZ = static_cast<uint32_t>(v1.z);
-+    p.rgba1 = static_cast<uint32_t>(v1.r) | (static_cast<uint32_t>(v1.g) << 8) |
++    GsGpuState stt;
++    GsGpuGeom g;
++    gs2FillCommonPrimState(batch, stt, /*mip*/ 0u); // sprites never mipmap (SampleTexture mip=0)
++    stt.primType = GS_PRIM_SPRITE;
++    g.minX = static_cast<uint32_t>(drawX0); g.minY = static_cast<uint32_t>(drawY0);
++    g.maxX = static_cast<uint32_t>(drawX1); g.maxY = static_cast<uint32_t>(drawY1);
++    g.unclipX0 = static_cast<uint32_t>(unclippedX0);
++    g.unclipY0 = static_cast<uint32_t>(unclippedY0);
++    g.spriteW = std::max(1.0f, static_cast<float>(spanX));
++    g.spriteH = std::max(1.0f, static_cast<float>(spanY));
++    g.spriteZ = static_cast<uint32_t>(v1.z);
++    g.rgba1 = static_cast<uint32_t>(v1.r) | (static_cast<uint32_t>(v1.g) << 8) |
 +              (static_cast<uint32_t>(v1.b) << 16) | (static_cast<uint32_t>(v1.a) << 24);
-+    p.fog1 = v1.fog;
++    g.fog1 = v1.fog;
 +    if (st.prim.tme)
 +    {
 +        if (st.prim.fst)
 +        {
-+            p.su0 = static_cast<float>(v0.u >> 4); p.sv0 = static_cast<float>(v0.v >> 4);
-+            p.su1 = static_cast<float>(v1.u >> 4); p.sv1 = static_cast<float>(v1.v >> 4);
++            g.su0 = static_cast<float>(v0.u >> 4); g.sv0 = static_cast<float>(v0.v >> 4);
++            g.su1 = static_cast<float>(v1.u >> 4); g.sv1 = static_cast<float>(v1.v >> 4);
 +        }
 +        else
 +        {
 +            const float q0 = fabsQ(v0.q), q1 = fabsQ(v1.q);
 +            const float tw = static_cast<float>(st.textureWidth);
 +            const float th = static_cast<float>(st.textureHeight);
-+            p.su0 = (v0.s / q0) * tw; p.sv0 = (v0.t / q0) * th;
-+            p.su1 = (v1.s / q1) * tw; p.sv1 = (v1.t / q1) * th;
++            g.su0 = (v0.s / q0) * tw; g.sv0 = (v0.t / q0) * th;
++            g.su1 = (v1.s / q1) * tw; g.sv1 = (v1.t / q1) * th;
 +        }
 +    }
 +
++    if (buildOnly)
++    {
++        // Batch mode: hand back the built primitive; the accumulator owns seeding/posting.
++        *bs = stt;
++        *bg = std::move(g);
++        ++g_rvStats[kRvOk];
++        return true;
++    }
++    // Tag = the census key, so a mismatch names the draw-state combo directly.
 +    out.tag = stateCensusKey(batch);
 +    out.active = true;
 +    ++g_rvStats[kRvOk];
-+    rasterSeedAndPost(std::move(p), out);
++    rasterSeedAndPost(stt, std::move(g), out);
 +    return true;
 +}
 +
 +// Phase 2a (cont.169). Returns true when the primitive was handed to the GPU and the
 +// caller must call rasterVerifyEnd() after the CPU draw.
-+bool GSCpuBackend::rasterVerifyBegin(const GSPrimitiveBatch &batch, RasterVerifyCtx &out)
++bool GSCpuBackend::rasterVerifyBegin(const GSPrimitiveBatch &batch, RasterVerifyCtx &out,
++                                     GsGpuState *bs, GsGpuGeom *bg)
 +{
 +    out = RasterVerifyCtx{};
 +    GsGpuPresentDevice *dev = gs2GpuDevice();
@@ -940,7 +1042,7 @@ index 9c39ae2..242fb95 100644
 +    if (st.prim.tme && ctx.tex0.csm != 0u)
 +        return ++g_rvStats[kRvFeature], false;
 +    if (isSprite)
-+        return rasterVerifyBeginSprite(batch, out);
++        return rasterVerifyBeginSprite(batch, out, bs, bg);
 +
 +    const GSVertex &v0 = batch.vertices[0];
 +    const GSVertex &v1 = batch.vertices[1];
@@ -970,19 +1072,23 @@ index 9c39ae2..242fb95 100644
 +    const uint32_t ztst = static_cast<uint32_t>((ctx.test >> 17) & 3u);
 +    const bool zWritten = !ctx.zbuf.zmask;
 +    const bool zUsed = zWritten || ztst == 2u || ztst == 3u; // 2/3 READ the Z buffer
-+    if (!gs2PageRange(ctx.frame.psm, fbp, fbw, static_cast<uint32_t>(minX), static_cast<uint32_t>(minY),
++    const bool buildOnly = (bs != nullptr && bg != nullptr);
++    if (!buildOnly &&
++        !gs2PageRange(ctx.frame.psm, fbp, fbw, static_cast<uint32_t>(minX), static_cast<uint32_t>(minY),
 +                      static_cast<uint32_t>(maxX), static_cast<uint32_t>(maxY), m_vramSize,
 +                      out.frameOff, out.frameLen))
 +        return ++g_rvStats[kRvRange], false;
-+    if (zUsed && !gs2PageRange(ctx.zbuf.psm, zbp, fbw, static_cast<uint32_t>(minX), static_cast<uint32_t>(minY),
++    if (!buildOnly && zUsed &&
++        !gs2PageRange(ctx.zbuf.psm, zbp, fbw, static_cast<uint32_t>(minX), static_cast<uint32_t>(minY),
 +                               static_cast<uint32_t>(maxX), static_cast<uint32_t>(maxY), m_vramSize,
 +                               out.zOff, out.zLen))
 +        return ++g_rvStats[kRvRange], false;
 +    out.zSeed = zUsed;
 +    out.zWritten = zWritten;
 +
-+    GsGpuPrim p;
-+    p.x0 = fx0; p.y0 = fy0; p.x1 = fx1; p.y1 = fy1; p.x2 = fx2; p.y2 = fy2;
++    GsGpuState stt;
++    GsGpuGeom g;
++    g.x0 = fx0; g.y0 = fy0; g.x1 = fx1; g.y1 = fy1; g.x2 = fx2; g.y2 = fy2;
 +    auto splitDouble = [](double d, uint32_t &lo, uint32_t &hi)
 +    {
 +        uint64_t bits = 0;
@@ -990,37 +1096,46 @@ index 9c39ae2..242fb95 100644
 +        lo = static_cast<uint32_t>(bits);
 +        hi = static_cast<uint32_t>(bits >> 32);
 +    };
-+    splitDouble(v0.z, p.z0lo, p.z0hi);
-+    splitDouble(v1.z, p.z1lo, p.z1hi);
-+    splitDouble(v2.z, p.z2lo, p.z2hi);
++    splitDouble(v0.z, g.z0lo, g.z0hi);
++    splitDouble(v1.z, g.z1lo, g.z1hi);
++    splitDouble(v2.z, g.z2lo, g.z2hi);
 +    auto packRgba = [](const GSVertex &v)
 +    {
 +        return static_cast<uint32_t>(v.r) | (static_cast<uint32_t>(v.g) << 8) |
 +               (static_cast<uint32_t>(v.b) << 16) | (static_cast<uint32_t>(v.a) << 24);
 +    };
-+    p.rgba0 = packRgba(v0); p.rgba1 = packRgba(v1); p.rgba2 = packRgba(v2);
-+    p.q0 = v0.q; p.q1 = v1.q; p.q2 = v2.q;
-+    p.s0 = v0.s; p.s1 = v1.s; p.s2 = v2.s;
-+    p.t0 = v0.t; p.t1 = v1.t; p.t2 = v2.t;
-+    p.uv0 = v0.u | (static_cast<uint32_t>(v0.v) << 16);
-+    p.uv1 = v1.u | (static_cast<uint32_t>(v1.v) << 16);
-+    p.uv2 = v2.u | (static_cast<uint32_t>(v2.v) << 16);
-+    p.fog0 = v0.fog; p.fog1 = v1.fog; p.fog2 = v2.fog;
++    g.rgba0 = packRgba(v0); g.rgba1 = packRgba(v1); g.rgba2 = packRgba(v2);
++    g.q0 = v0.q; g.q1 = v1.q; g.q2 = v2.q;
++    g.s0 = v0.s; g.s1 = v1.s; g.s2 = v2.s;
++    g.t0 = v0.t; g.t1 = v1.t; g.t2 = v2.t;
++    g.uv0 = v0.u | (static_cast<uint32_t>(v0.v) << 16);
++    g.uv1 = v1.u | (static_cast<uint32_t>(v1.v) << 16);
++    g.uv2 = v2.u | (static_cast<uint32_t>(v2.v) << 16);
++    g.fog0 = v0.fog; g.fog1 = v1.fog; g.fog2 = v2.fog;
 +
-+    p.winding = (denom < 0.0f) ? -1.0f : 1.0f;
-+    p.invAbsDenom = 1.0f / std::fabs(denom);
-+    p.minX = static_cast<uint32_t>(minX); p.minY = static_cast<uint32_t>(minY);
-+    p.maxX = static_cast<uint32_t>(maxX); p.maxY = static_cast<uint32_t>(maxY);
++    g.winding = (denom < 0.0f) ? -1.0f : 1.0f;
++    g.invAbsDenom = 1.0f / std::fabs(denom);
++    g.minX = static_cast<uint32_t>(minX); g.minY = static_cast<uint32_t>(minY);
++    g.maxX = static_cast<uint32_t>(maxX); g.maxY = static_cast<uint32_t>(maxY);
 +
 +    // Same LOD the oracle will resolve for this triangle (shared helper, cannot drift).
-+    gs2FillCommonPrimState(batch, p, gs2TriangleMip(batch, denom));
-+    p.primType = st.prim.type;
++    gs2FillCommonPrimState(batch, stt, gs2TriangleMip(batch, denom));
++    stt.primType = st.prim.type;
 +
++    // Tag = the census key, so a mismatch names the draw-state combo directly.
++    if (buildOnly)
++    {
++        // Batch mode: hand back the built primitive; the accumulator owns seeding/posting.
++        *bs = stt;
++        *bg = std::move(g);
++        ++g_rvStats[kRvOk];
++        return true;
++    }
 +    // Tag = the census key, so a mismatch names the draw-state combo directly.
 +    out.tag = stateCensusKey(batch);
 +    out.active = true;
 +    ++g_rvStats[kRvOk];
-+    rasterSeedAndPost(std::move(p), out);
++    rasterSeedAndPost(stt, std::move(g), out);
 +    return true;
 +}
 +
@@ -1036,6 +1151,337 @@ index 9c39ae2..242fb95 100644
 +        dev->MirrorVerifyRange(ctx.zOff,
 +                               std::vector<uint8_t>(m_vram + ctx.zOff, m_vram + ctx.zOff + ctx.zLen),
 +                               ctx.tag);
++}
++
++namespace
++{
++    uint64_t gs2StateBytesHash(const GsGpuState &st)
++    {
++        // GsGpuState is a POD of 4-byte scalars with no padding, so its bytes ARE its value.
++        const unsigned char *b = reinterpret_cast<const unsigned char *>(&st);
++        uint64_t h = 1469598103934665603ull;
++        for (size_t i = 0; i < sizeof(GsGpuState); ++i)
++            h = (h ^ b[i]) * 1099511628211ull;
++        return h;
++    }
++}
++
++// Append one primitive to the current batch, flushing first if it cannot join.
++void GSCpuBackend::gpuBatchAppend(const GSPrimitiveBatch &batch)
++{
++    GsGpuState stt;
++    GsGpuGeom g;
++    RasterVerifyCtx unused;
++    if (!rasterVerifyBegin(batch, unused, &stt, &g))
++    {
++        // The oracle still draws this primitive, so the batch is no longer a faithful
++        // whole -- unless it draws nothing at all (a degenerate triangle or a fully
++        // off-screen sprite), which is the only rejection that costs nothing.
++        if (g_rvStats[kRvDegenerate] != m_lastDegen || g_rvStats[kRvOffscreen] != m_lastOffscr)
++        {
++            m_lastDegen = g_rvStats[kRvDegenerate];
++            m_lastOffscr = g_rvStats[kRvOffscreen];
++            return;
++        }
++        ++m_gpuBatch.skipped;
++        return;
++    }
++
++    // --- read-after-write hazard check (see GpuBatchAccum::writtenPages) ---
++    auto pageSpan = [&](uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x0, uint32_t y0,
++                        uint32_t x1, uint32_t y1, uint32_t &p0, uint32_t &p1) -> bool
++    {
++        uint32_t off = 0, len = 0;
++        if (!gs2PageRange(psm, bp, bw, x0, y0, x1, y1, m_vramSize, off, len))
++            return false;
++        p0 = off / 8192u;
++        p1 = (off + len - 1u) / 8192u;
++        return true;
++    };
++    auto anyMarked = [&](uint32_t p0, uint32_t p1) -> bool
++    {
++        for (uint32_t q = p0; q <= p1 && q < 512u; ++q)
++            if (m_gpuBatch.writtenPages[q >> 6] & (1ull << (q & 63)))
++                return true;
++        return false;
++    };
++    auto mark = [&](uint32_t p0, uint32_t p1)
++    {
++        for (uint32_t q = p0; q <= p1 && q < 512u; ++q)
++            m_gpuBatch.writtenPages[q >> 6] |= (1ull << (q & 63));
++    };
++    bool hazard = false;
++    if (!m_gpuBatch.prims.empty() && stt.tme != 0u)
++    {
++        uint32_t p0 = 0, p1 = 0;
++        if (!pageSpan(stt.tpsm, stt.tbp, stt.tbw, 0u, 0u,
++                      stt.texW ? stt.texW - 1u : 0u, stt.texH ? stt.texH - 1u : 0u, p0, p1))
++            hazard = true; // unknown extent: be conservative
++        else if (anyMarked(p0, p1))
++            hazard = true;
++        const bool paletted = stt.tpsm == GS_PSM_T4 || stt.tpsm == GS_PSM_T8 ||
++                              stt.tpsm == GS_PSM_T4HL || stt.tpsm == GS_PSM_T4HH ||
++                              stt.tpsm == GS_PSM_T8H;
++        if (!hazard && paletted)
++        {
++            if (!pageSpan(stt.cpsm, stt.cbp, 1u, 0u, 0u, 15u, 15u, p0, p1))
++                hazard = true;
++            else if (anyMarked(p0, p1))
++                hazard = true;
++        }
++    }
++    if (hazard)
++    {
++        ++g_bvFlushHazard;
++        gpuBatchFlush();
++    }
++
++    const uint64_t targetKey = uint64_t(stt.fbp) | (uint64_t(stt.fbw) << 20) |
++                               (uint64_t(stt.fpsm) << 26) | (uint64_t(stt.zbp) << 32) |
++                               (uint64_t(stt.zpsm) << 52);
++    GpuBatchAccum &acc = m_gpuBatch;
++    if (!acc.prims.empty())
++    {
++        if (targetKey != acc.targetKey)                { ++g_bvFlushTarget;   gpuBatchFlush(); }
++        else if (g_vramMutationSeq != acc.mutSeq)      { ++g_bvFlushMutation; gpuBatchFlush(); }
++        else if (acc.prims.size() >= size_t(s_gsGpuBatchMax)) { ++g_bvFlushCap; gpuBatchFlush(); }
++    }
++    if (acc.prims.empty())
++    {
++        acc.targetKey = targetKey;
++        acc.mutSeq = g_vramMutationSeq;
++        acc.maxX = acc.maxY = 0;
++        acc.skipped = 0;
++        acc.writtenPages.fill(0ull);
++        // Seed the WHOLE mirror from CPU VRAM at batch start when this batch will be
++        // verified: only some batches are, so the mirror otherwise lacks every earlier
++        // draw. After this the mirror == CPU VRAM, and the batch is the only difference.
++        static unsigned long s_bvN = 0;
++        acc.verifying = ((++s_bvN % static_cast<unsigned long>(s_gsGpuBatchVerify)) == 0u);
++        if (acc.verifying)
++        {
++            if (GsGpuPresentDevice *dev = gs2GpuDevice())
++            {
++                mirrorFlushPokes();
++                acc.preVram.assign(m_vram, m_vram + m_vramSize);
++                dev->MirrorPatchRaw(0u, std::vector<uint8_t>(acc.preVram));
++            }
++        }
++    }
++
++    // Dedup the state (measured: mean 3.9 distinct states per run, max 61 -- a linear scan
++    // over <=128 entries is cheaper than a hash map at this size).
++    const uint64_t hh = gs2StateBytesHash(stt);
++    uint32_t idx = 0xFFFFFFFFu;
++    for (size_t i = 0; i < acc.stateHashes.size(); ++i)
++        if (acc.stateHashes[i] == hh)
++        {
++            idx = static_cast<uint32_t>(i);
++            break;
++        }
++    if (idx == 0xFFFFFFFFu)
++    {
++        if (acc.states.size() >= 128u)
++        {
++            ++g_bvFlushStates;
++            gpuBatchFlush();
++            return gpuBatchAppend(batch); // re-append into the fresh batch
++        }
++        idx = static_cast<uint32_t>(acc.states.size());
++        acc.states.push_back(stt);
++        acc.stateHashes.push_back(hh);
++    }
++    g.stateIndex = idx;
++    {
++        // Record what this primitive writes, for the next primitive's hazard check.
++        uint32_t p0 = 0, p1 = 0;
++        if (pageSpan(stt.fpsm, stt.fbp, stt.fbw, g.minX, g.minY, g.maxX, g.maxY, p0, p1))
++            mark(p0, p1);
++        if (stt.zmsk == 0u &&
++            pageSpan(stt.zpsm, stt.zbp, stt.fbw, g.minX, g.minY, g.maxX, g.maxY, p0, p1))
++            mark(p0, p1);
++    }
++    acc.maxX = std::max(acc.maxX, g.maxX);
++    acc.maxY = std::max(acc.maxY, g.maxY);
++    acc.prims.push_back(std::move(g));
++}
++
++// Bin the accumulated primitives into 16x16 screen tiles and hand the batch to the device.
++// Binning is done HERE, on the host, for two reasons: it is trivially cheap at these sizes,
++// and it is naturally in SUBMISSION ORDER -- which a GPU atomic append would not be, and
++// per-pixel submission order is the entire correctness requirement.
++void GSCpuBackend::gpuBatchFlush()
++{
++    GpuBatchAccum &acc = m_gpuBatch;
++    if (acc.prims.empty())
++    {
++        acc.states.clear();
++        acc.stateHashes.clear();
++        return;
++    }
++    GsGpuPresentDevice *dev = gs2GpuDevice();
++    if (dev)
++    {
++        GsGpuBatch b;
++        b.states = std::move(acc.states);
++        b.prims = std::move(acc.prims);
++        b.tilesX = (acc.maxX >> 4) + 1u;
++        b.tilesY = (acc.maxY >> 4) + 1u;
++        const size_t tiles = size_t(b.tilesX) * b.tilesY;
++        std::vector<uint32_t> counts(tiles + 1u, 0u);
++        auto tileSpan = [&](const GsGpuGeom &g, uint32_t &tx0, uint32_t &ty0, uint32_t &tx1, uint32_t &ty1)
++        {
++            tx0 = g.minX >> 4; ty0 = g.minY >> 4;
++            tx1 = std::min<uint32_t>(g.maxX >> 4, b.tilesX - 1u);
++            ty1 = std::min<uint32_t>(g.maxY >> 4, b.tilesY - 1u);
++        };
++        for (const GsGpuGeom &g : b.prims)
++        {
++            uint32_t tx0, ty0, tx1, ty1;
++            tileSpan(g, tx0, ty0, tx1, ty1);
++            for (uint32_t ty = ty0; ty <= ty1; ++ty)
++                for (uint32_t tx = tx0; tx <= tx1; ++tx)
++                    ++counts[size_t(ty) * b.tilesX + tx];
++        }
++        b.binOffsets.resize(tiles + 1u);
++        uint32_t running = 0;
++        for (size_t t = 0; t < tiles; ++t)
++        {
++            b.binOffsets[t] = running;
++            if (counts[t] != 0u)
++                b.tileList.push_back(static_cast<uint32_t>(t));
++            running += counts[t];
++        }
++        b.binOffsets[tiles] = running;
++        b.binEntries.resize(running);
++        std::vector<uint32_t> cursor(b.binOffsets.begin(), b.binOffsets.end() - 1);
++        for (size_t i = 0; i < b.prims.size(); ++i)
++        {
++            uint32_t tx0, ty0, tx1, ty1;
++            tileSpan(b.prims[i], tx0, ty0, tx1, ty1);
++            for (uint32_t ty = ty0; ty <= ty1; ++ty)
++                for (uint32_t tx = tx0; tx <= tx1; ++tx)
++                    b.binEntries[cursor[size_t(ty) * b.tilesX + tx]++] = static_cast<uint32_t>(i);
++        }
++
++        ++g_bvBatches;
++        g_bvPrims += b.prims.size();
++        g_bvBinEntries += b.binEntries.size();
++        g_bvMaxPrims = std::max<unsigned long>(g_bvMaxPrims, (unsigned long)b.prims.size());
++        g_bvMaxStates = std::max<unsigned long>(g_bvMaxStates, (unsigned long)b.states.size());
++        // Only verify a batch the GPU rendered in full (see GpuBatchAccum::skipped).
++        // Descriptor snapshot for the log line below (b is moved into the device call).
++        const size_t verifyStates = b.states.size();
++        const uint32_t verifyTilesX = b.tilesX, verifyTilesY = b.tilesY;
++        const uint32_t verifyFbp = b.states[0].fbp, verifyFbw = b.states[0].fbw;
++        const uint32_t verifyFpsm = b.states[0].fpsm, verifyZbp = b.states[0].zbp;
++        unsigned long verifyOverwide = 0;
++        uint32_t verifyMaxScisX = 0;
++        for (const GsGpuState &st : b.states)
++            verifyMaxScisX = std::max(verifyMaxScisX, st.scissorX1);
++        for (const GsGpuGeom &g : b.prims)
++            if (g.maxX >= b.states[g.stateIndex].fbw * 64u)
++                ++verifyOverwide;
++        const bool verify = acc.verifying && acc.skipped == 0u;
++        // Keep copies for the replay A/B (b is moved into the device call below).
++        std::vector<GsGpuState> replayStates;
++        std::vector<GsGpuGeom> replayPrims;
++        if (verify)
++        {
++            replayStates = b.states;
++            replayPrims = b.prims;
++        }
++        if (acc.verifying && acc.skipped != 0u)
++            ++g_bvSkippedBatches;
++        const size_t verifyPrims = b.prims.size();
++        dev->RasterBatch(std::move(b));
++        if (verify)
++        {
++            // Whole-VRAM compare: the mirror was seeded at batch start and the batch is the
++            // only thing that touched it since, so it must now equal CPU VRAM exactly --
++            // no draw-page mask, nothing excused.
++            ++g_bvVerified;
++            g_bvVerifiedPrims += verifyPrims;
++            // Log the batch right before its compare, so a failing [gsgpu:mverify] line is
++            // always preceded by the descriptor of the batch that produced it. `overwide`
++            // is the tile-disjointness check: screen tiles only map to disjoint VRAM while
++            // x stays inside the buffer (fbw*64) -- past that, PageId wraps a pixel into
++            // the next page row, where a DIFFERENT tile can alias the same word.
++            std::fprintf(stderr,
++                         "[gsgpu:bverify] #%lu prims=%zu states=%zu tiles=%ux%u bbox=(%u,%u) "
++                         "target{fbp=%u fbw=%u fpsm=0x%x zbp=%u} overwide=%lu maxScisX=%u\n",
++                         g_bvVerified, verifyPrims, verifyStates, verifyTilesX, verifyTilesY,
++                         acc.maxX, acc.maxY, verifyFbp, verifyFbw, verifyFpsm, verifyZbp,
++                         verifyOverwide, verifyMaxScisX);
++            g_bvVerifiedMaxPrims = std::max<unsigned long>(g_bvVerifiedMaxPrims,
++                                                           (unsigned long)verifyPrims);
++            const bool tiledOk = dev->MirrorVerifyFull(m_vram, m_vramSize, nullptr);
++            if (!tiledOk)
++            {
++                // A/B: replay the SAME primitives, in order, one batch of one each -- the
++                // single-primitive entry point that cont.169/170 proved bit-exact. If this
++                // passes, the divergence is in tiling/ordering; if it fails too, some
++                // primitive in here shades wrong and the per-primitive sampling missed it.
++                ++g_bvReplays;
++                dev->MirrorPatchRaw(0u, std::vector<uint8_t>(acc.preVram));
++                for (const GsGpuGeom &one : replayPrims)
++                {
++                    GsGpuBatch sb;
++                    sb.states.push_back(replayStates[one.stateIndex < replayStates.size()
++                                                         ? one.stateIndex : 0]);
++                    GsGpuGeom g1 = one;
++                    g1.stateIndex = 0u;
++                    sb.prims.push_back(g1);
++                    dev->RasterBatch(std::move(sb)); // tileList empty => per-prim path
++                }
++                const bool serialOk = dev->MirrorVerifyFull(m_vram, m_vramSize, nullptr);
++                if (serialOk)
++                    ++g_bvReplayTilingBug;
++                else
++                {
++                    ++g_bvReplayPrimBug;
++                    // The bad primitive's state is one of these. The whole game is only 49
++                    // draw-state combos, so dumping the batch's (<=31) states is enough to
++                    // spot the one the shader gets wrong.
++                    if (g_bvReplayPrimBug <= 2u)
++                        for (size_t si = 0; si < replayStates.size(); ++si)
++                        {
++                            const GsGpuState &q = replayStates[si];
++                            unsigned long uses = 0;
++                            for (const GsGpuGeom &gg : replayPrims)
++                                if (gg.stateIndex == si)
++                                    ++uses;
++                            std::fprintf(stderr,
++                                         "[gsgpu:bstate] s%zu uses=%lu prim=%u iip=%u tme=%u fge=%u "
++                                         "fst=%u abe=%u | f{psm=0x%x msk=%08x} z{psm=0x%x msk=%u} "
++                                         "test{ate=%u atst=%u aref=%u afail=%u ztst=%u} "
++                                         "blend{%u%u%u%u fix=%u} tex{psm=0x%x tw=%u th=%u lin=%u "
++                                         "tfx=%u tcc=%u cpsm=0x%x csm=%u csa=%u wms=%u wmt=%u "
++                                         "minU=%u maxU=%u minV=%u maxV=%u} texa{%u,%u,aem=%u} "
++                                         "fba=%u shadow=%u\n",
++                                         si, uses, q.primType, q.iip, q.tme, q.fge, q.fst, q.abe,
++                                         q.fpsm, q.fbmsk, q.zpsm, q.zmsk,
++                                         q.ate, q.atst, q.aref, q.afail, q.ztst,
++                                         q.blendA, q.blendB, q.blendC, q.blendD, q.blendFix,
++                                         q.tpsm, q.texW, q.texH, q.linear, q.tfx, q.tcc,
++                                         q.cpsm, q.csm, q.csa, q.wms, q.wmt,
++                                         q.minU, q.maxU, q.minV, q.maxV,
++                                         q.ta0, q.ta1, q.aem, q.fba, q.clutShadowHave);
++                        }
++                }
++                std::fprintf(stderr,
++                             "[gsgpu:bverify]   REPLAY verdict: serial=%s => %s\n",
++                             serialOk ? "OK" : "FAIL",
++                             serialOk ? "TILING/ORDERING" : "PER-PRIMITIVE");
++            }
++        }
++    }
++    acc.states.clear();
++    acc.stateHashes.clear();
++    acc.prims.clear();
++    acc.preVram.clear();
++    acc.stateHashes.shrink_to_fit();
++    acc.verifying = false;
 +}
 +
 +void GSCpuBackend::markDrawPages(uint32_t psm, uint32_t bp, uint32_t bw,
@@ -1174,24 +1620,30 @@ index 9c39ae2..242fb95 100644
 +    std::memcpy(out.data(), m_vram, m_vramSize);
 +}
 +
- void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
- {
++void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
 +    drainQueue();
-     std::lock_guard<std::mutex> lock(m_mutex);
-     if (!m_vram || m_vramSize == 0u)
-     {
-@@ -627,6 +1699,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
- 
- GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
- {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    if (!m_vram || m_vramSize == 0u)
++    {
++        out.clear();
++        return;
++    }
++    out.resize(m_vramSize);
++    std::memcpy(out.data(), m_vram, m_vramSize);
++}
++
++GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
++{
 +    drainQueue();
-     std::lock_guard<std::mutex> lock(m_mutex);
-     GSTransferSnapshot result = m_transferState;
-     result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
-@@ -635,10 +1708,465 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
-     return result;
- }
- 
++    std::lock_guard<std::mutex> lock(m_mutex);
++    GSTransferSnapshot result = m_transferState;
++    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
++                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
++                                         : 0u;
++    return result;
++}
++
 +// ---- Level-era GS census (PS2X_GS_CENSUS2, default OFF): uncapped AGGREGATE counters printed
 +// every N events, so the population is measurable in any era (a capped trace exhausts before the
 +// level — the old rule-11/16 trap). Draw side: total/textured split + per-psm counts of textured
@@ -1275,8 +1727,221 @@ index 9c39ae2..242fb95 100644
 +        return static_cast<uint32_t>(std::clamp(lod, 0, static_cast<int>(std::min(mxl, 6u))));
 +    }
 +
-+    uint64_t stateCensusKey(const GSPrimitiveBatch &batch)
++    // Phase-2b scouting census (PS2X_GS_BATCHCENSUS). Run = a maximal span of consecutive
++    // primitives sharing one (fbp,fbw,fpsm,zbp,zpsm) render target.
++    struct Gs2BatchCensus
 +    {
++        uint64_t curKey = ~0ull;
++        unsigned long curRun = 0;
++        unsigned long runs = 0;
++        unsigned long long prims = 0;
++        unsigned long long tilesTotal = 0;   // 64x64 tiles touched, summed over prims
++        unsigned long long pixelsTotal = 0;  // bbox pixels, summed over prims
++        unsigned long long tiles16Total = 0; // same, for 16x16 tiles
++        unsigned long runHist[20] = {};      // log2 buckets of run length
++        unsigned long tileHist[20] = {};     // log2 buckets of 64x64 tiles per prim
++        unsigned long tile16Hist[20] = {};   // log2 buckets of 16x16 tiles per prim
++        unsigned long maxRun = 0;
++        // "eff" = the run a GPU batch could ACTUALLY take: broken by a target change AND
++        // by any non-draw VRAM mutation (see g_vramMutationSeq).
++        unsigned long lastMutSeq = 0;
++        unsigned long effRun = 0, effRuns = 0, effMax = 0;
++        unsigned long effHist[20] = {};
++        unsigned long long effPrims = 0;
++        uint64_t lastDumpMs = 0;
++        // Distinct draw STATES within the current run -- sizes the dedup'd state table the
++        // device needs (shipping ~200B of GSDrawState per primitive is not an option).
++        static constexpr unsigned kStateSlots = 4096;
++        uint64_t stateSlot[kStateSlots] = {};
++        unsigned long statesInRun = 0;
++        unsigned long statesTotal = 0;
++        unsigned long stateHist[20] = {};
++        unsigned long maxStates = 0;
++    } g_batch;
++
++    // FNV-1a over exactly the state the rasterizer consumes (the GsGpuState fields).
++    uint64_t gs2DrawStateHash(const GSDrawState &st)
++    {
++        const GSContext &c = st.context;
++        uint64_t h = 1469598103934665603ull;
++        auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
++        mix(c.frame.fbp); mix(c.frame.fbw); mix(c.frame.psm); mix(c.frame.fbmsk);
++        mix(c.zbuf.zbp); mix(c.zbuf.psm); mix(c.zbuf.zmask ? 1u : 0u);
++        mix(c.scissor.x0); mix(c.scissor.x1); mix(c.scissor.y0); mix(c.scissor.y1);
++        mix(c.xyoffset.ofx); mix(c.xyoffset.ofy);
++        mix(c.test); mix(c.alpha); mix(c.fba); mix(c.clamp); mix(c.tex1);
++        mix(c.miptbp1); mix(c.miptbp2);
++        mix(c.tex0.tbp0); mix(c.tex0.tbw); mix(c.tex0.psm); mix(c.tex0.tw); mix(c.tex0.th);
++        mix(c.tex0.tcc); mix(c.tex0.tfx); mix(c.tex0.cbp); mix(c.tex0.cpsm);
++        mix(c.tex0.csm); mix(c.tex0.csa);
++        mix(st.texa.ta0); mix(st.texa.ta1); mix(st.texa.aem ? 1u : 0u);
++        mix(st.fogR); mix(st.fogG); mix(st.fogB);
++        mix(st.textureWidth); mix(st.textureHeight); mix(st.linearFilter ? 1u : 0u);
++        const GSPrimReg &pr = st.prim;
++        mix((pr.type) | (pr.iip << 3) | (pr.tme << 4) | (pr.fge << 5) |
++            (pr.abe << 6) | (pr.fst << 7) | (pr.ctxt << 8));
++        return h ? h : 1ull;
++    }
++
++    unsigned gs2Log2Bucket(unsigned long v)
++    {
++        unsigned b = 0;
++        while (v > 1u && b < 19u) { v >>= 1; ++b; }
++        return b;
++    }
++
++    void gs2PrintBatchCensus()
++    {
++        const Gs2BatchCensus &c = g_batch;
++        std::fprintf(stderr,
++                     "[gs2:batch] prims=%llu runs=%lu mean-run=%.1f max-run=%lu | "
++                     "tiles/prim 64=%.2f 16=%.2f | mean-bbox-px=%.0f | "
++                     "states/run mean=%.1f max=%lu | EFF-batch mean=%.1f max=%lu\n",
++                     c.prims, c.runs,
++                     c.runs ? double(c.prims) / double(c.runs) : 0.0, c.maxRun,
++                     c.prims ? double(c.tilesTotal) / double(c.prims) : 0.0,
++                     c.prims ? double(c.tiles16Total) / double(c.prims) : 0.0,
++                     c.prims ? double(c.pixelsTotal) / double(c.prims) : 0.0,
++                     c.runs ? double(c.statesTotal) / double(c.runs) : 0.0, c.maxStates,
++                     c.effRuns ? double(c.effPrims) / double(c.effRuns) : 0.0, c.effMax);
++        std::fprintf(stderr, "[gs2:batch]   run-len 2^n:");
++        for (unsigned i = 0; i < 20u; ++i)
++            if (c.runHist[i])
++                std::fprintf(stderr, " %u:%lu", i, c.runHist[i]);
++        std::fprintf(stderr, "\n[gs2:batch]   tiles64/prim 2^n:");
++        for (unsigned i = 0; i < 20u; ++i)
++            if (c.tileHist[i])
++                std::fprintf(stderr, " %u:%lu", i, c.tileHist[i]);
++        std::fprintf(stderr, "\n[gs2:batch]   tiles16/prim 2^n:");
++        for (unsigned i = 0; i < 20u; ++i)
++            if (c.tile16Hist[i])
++                std::fprintf(stderr, " %u:%lu", i, c.tile16Hist[i]);
++        std::fprintf(stderr, "\n[gs2:batch]   EFF-batch 2^n:");
++        for (unsigned i = 0; i < 20u; ++i)
++            if (c.effHist[i])
++                std::fprintf(stderr, " %u:%lu", i, c.effHist[i]);
++        std::fprintf(stderr, "\n[gs2:batch]   states/run 2^n:");
++        for (unsigned i = 0; i < 20u; ++i)
++            if (c.stateHist[i])
++                std::fprintf(stderr, " %u:%lu", i, c.stateHist[i]);
++        std::fprintf(stderr, "\n");
++    }
++
++    void gs2BatchCensusRecord(const GSPrimitiveBatch &batch, uint32_t fbp, uint32_t fbw, uint32_t zbp)
++    {
++        Gs2BatchCensus &c = g_batch;
++        const GSContext &ctx = batch.state.context;
++        const uint64_t key = uint64_t(fbp) | (uint64_t(fbw) << 20) |
++                             (uint64_t(ctx.frame.psm & 0x3Fu) << 26) |
++                             (uint64_t(zbp) << 32) | (uint64_t(ctx.zbuf.psm & 0x3Fu) << 52);
++        if (key != c.curKey)
++        {
++            if (c.curRun != 0u)
++            {
++                ++c.runs;
++                ++c.runHist[gs2Log2Bucket(c.curRun)];
++                if (c.curRun > c.maxRun)
++                    c.maxRun = c.curRun;
++                c.statesTotal += c.statesInRun;
++                ++c.stateHist[gs2Log2Bucket(c.statesInRun ? c.statesInRun : 1u)];
++                if (c.statesInRun > c.maxStates)
++                    c.maxStates = c.statesInRun;
++            }
++            c.curKey = key;
++            c.curRun = 0u;
++            c.statesInRun = 0u;
++            std::memset(c.stateSlot, 0, sizeof(c.stateSlot));
++        }
++        // Distinct-state count for this run (open addressing; saturates at the table size,
++        // which is itself the answer we care about -- "does it fit in a small table?").
++        {
++            const uint64_t h = gs2DrawStateHash(batch.state);
++            unsigned idx = unsigned(h % Gs2BatchCensus::kStateSlots);
++            for (unsigned probe = 0; probe < 64u; ++probe)
++            {
++                uint64_t &slot = c.stateSlot[(idx + probe) % Gs2BatchCensus::kStateSlots];
++                if (slot == h)
++                    break;
++                if (slot == 0ull)
++                {
++                    slot = h;
++                    ++c.statesInRun;
++                    break;
++                }
++            }
++        }
++        ++c.curRun;
++        ++c.prims;
++
++        // effective batch run: also broken by any interleaved non-draw VRAM mutation
++        const bool mutated = (g_vramMutationSeq != c.lastMutSeq);
++        c.lastMutSeq = g_vramMutationSeq;
++        if (mutated || c.curRun == 1u)
++        {
++            if (c.effRun != 0u)
++            {
++                ++c.effRuns;
++                ++c.effHist[gs2Log2Bucket(c.effRun)];
++                if (c.effRun > c.effMax)
++                    c.effMax = c.effRun;
++            }
++            c.effRun = 0u;
++        }
++        ++c.effRun;
++        ++c.effPrims;
+ 
+-void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+-{
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    WriteVramUnlocked(psm, base, bw, x, y, value);
+-}
++        // bbox -> tile count (64x64 screen tiles), scissor-clipped like the raster is
++        const int ofx = ctx.xyoffset.ofx >> 4, ofy = ctx.xyoffset.ofy >> 4;
++        int minX = INT32_MAX, minY = INT32_MAX, maxX = INT32_MIN, maxY = INT32_MIN;
++        for (uint8_t i = 0; i < batch.vertexCount && i < batch.vertices.size(); ++i)
++        {
++            const int vx = int(batch.vertices[i].x) - ofx, vy = int(batch.vertices[i].y) - ofy;
++            minX = std::min(minX, vx); minY = std::min(minY, vy);
++            maxX = std::max(maxX, vx); maxY = std::max(maxY, vy);
++        }
++        minX = std::max(minX, int(ctx.scissor.x0)); minY = std::max(minY, int(ctx.scissor.y0));
++        maxX = std::min(maxX, int(ctx.scissor.x1)); maxY = std::min(maxY, int(ctx.scissor.y1));
++        if (minX <= maxX && minY <= maxY)
++        {
++            const unsigned long tiles = (unsigned long)((maxX >> 6) - (minX >> 6) + 1) *
++                                        (unsigned long)((maxY >> 6) - (minY >> 6) + 1);
++            const unsigned long tiles16 = (unsigned long)((maxX >> 4) - (minX >> 4) + 1) *
++                                          (unsigned long)((maxY >> 4) - (minY >> 4) + 1);
++            c.tilesTotal += tiles;
++            c.tiles16Total += tiles16;
++            c.pixelsTotal += (unsigned long long)(maxX - minX + 1) * (maxY - minY + 1);
++            ++c.tileHist[gs2Log2Bucket(tiles)];
++            ++c.tile16Hist[gs2Log2Bucket(tiles16)];
++        }
+ 
+-void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+-{
+-    if (!m_vram)
+-        return;
+-    m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
+-}
++        if ((c.prims & 1023u) != 0u)
++            return;
++        const uint64_t now = gs2NowMs();
++        if (c.lastDumpMs == 0u) { c.lastDumpMs = now; return; }
++        if (now - c.lastDumpMs < 10000u) return;
++        c.lastDumpMs = now;
++        gs2PrintBatchCensus();
++    }
+ 
+-void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+-{
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    if (!m_vram || m_vramSize == 0u)
++    uint64_t stateCensusKey(const GSPrimitiveBatch &batch)
+     {
+-        out.clear();
+-        return;
 +        const GSDrawState &st = batch.state;
 +        const GSContext &ctx = st.context;
 +        uint64_t k = 0;
@@ -1316,8 +1981,19 @@ index 9c39ae2..242fb95 100644
 +        k |= static_cast<uint64_t>((st.scanmsk & 3u) != 0u ? 1u : 0u) << 62;
 +        k |= static_cast<uint64_t>(g_gs2EraOpen ? 1u : 0u) << 63;
 +        return k;
-+    }
-+
+     }
+-    out.resize(m_vramSize);
+-    std::memcpy(out.data(), m_vram, m_vramSize);
+-}
+ 
+-GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+-{
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    GSTransferSnapshot result = m_transferState;
+-    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
+-                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
+-                                         : 0u;
+-    return result;
 +    void stateCensusDump()
 +    {
 +        std::vector<std::pair<uint64_t, uint64_t>> rows(g_stateCensus.begin(), g_stateCensus.end());
@@ -1413,8 +2089,8 @@ index 9c39ae2..242fb95 100644
 +                     g_gs2Xfer.lastDbp, g_gs2Xfer.lastDbw, g_gs2Xfer.lastDpsm,
 +                     g_gs2Xfer.lastRrw, g_gs2Xfer.lastRrh);
 +    }
-+}
-+
+ }
+ 
  void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
  {
      const GSDrawState &state = batch.state;
@@ -1654,7 +2330,7 @@ index 9c39ae2..242fb95 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,6 +2273,108 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,6 +2901,115 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -1672,6 +2348,9 @@ index 9c39ae2..242fb95 100644
 +    m_draw.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
 +    m_draw.fbw = std::max<u32>(ctx.frame.fbw, 1u);
 +    m_draw.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++
++    if (s_gsBatchCensus)
++        gs2BatchCensusRecord(batch, m_draw.fbp, m_draw.fbw, m_draw.zbp);
 +
 +#if PS2X_HAS_GS_GPU_DEVICE
 +    // cont.168: record the VRAM pages this draw could write, so the full-mirror verify can
@@ -1752,7 +2431,11 @@ index 9c39ae2..242fb95 100644
 +    // Phase 2a: hand a sampled primitive to the GPU rasterizer BEFORE the CPU draws it
 +    // (the mirror is seeded with the pre-draw bytes here), then compare after.
 +    RasterVerifyCtx rvCtx;
-+    if (s_gsGpuRasterVerify > 0)
++    if (s_gsGpuBatchVerify > 0)
++    {
++        gpuBatchAppend(batch); // batch mode owns the GPU path; the per-prim gate stands down
++    }
++    else if (s_gsGpuRasterVerify > 0)
 +    {
 +        static unsigned long s_rvN = 0;
 +        if ((++s_rvN % static_cast<unsigned long>(s_gsGpuRasterVerify)) == 0u)
@@ -1763,7 +2446,7 @@ index 9c39ae2..242fb95 100644
      switch (state.prim.type)
      {
      case GS_PRIM_SPRITE:
-@@ -762,15 +2392,29 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -762,15 +3027,29 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
      case GS_PRIM_POINT:
      {
          const GSVertex &v = batch.vertices[0];
@@ -1796,7 +2479,7 @@ index 9c39ae2..242fb95 100644
  }
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
-@@ -792,11 +2436,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +3071,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -1811,7 +2494,7 @@ index 9c39ae2..242fb95 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -817,7 +2460,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -817,7 +3095,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      u32 fbrgba = 0;
      if (frmw)
      {
@@ -1820,7 +2503,7 @@ index 9c39ae2..242fb95 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +2490,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +3125,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -1834,7 +2517,7 @@ index 9c39ae2..242fb95 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +2573,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +3208,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -1868,7 +2551,7 @@ index 9c39ae2..242fb95 100644
      }
  }
  
-@@ -947,15 +2609,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +3244,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -1917,7 +2600,7 @@ index 9c39ae2..242fb95 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,26 +2660,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,26 +3295,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -1971,7 +2654,7 @@ index 9c39ae2..242fb95 100644
      }
      else
      {
-@@ -1002,7 +2711,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +3346,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -1980,7 +2663,7 @@ index 9c39ae2..242fb95 100644
  
          switch (tex.psm)
          {
-@@ -1024,7 +2733,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +3368,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -1995,7 +2678,7 @@ index 9c39ae2..242fb95 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +2940,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,6 +3575,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -2004,7 +2687,7 @@ index 9c39ae2..242fb95 100644
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +2998,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +3633,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -2013,7 +2696,7 @@ index 9c39ae2..242fb95 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +3016,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +3651,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -2046,7 +2729,7 @@ index 9c39ae2..242fb95 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1376,7 +3119,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +3754,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -2067,7 +2750,7 @@ index 9c39ae2..242fb95 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +3141,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +3776,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -2089,7 +2772,7 @@ index 9c39ae2..242fb95 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,7 +3164,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,9 +3799,30 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -2111,8 +2794,16 @@ index 9c39ae2..242fb95 100644
 +{
      if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
          return;
++    ++g_vramMutationSeq;
++    // A batch is rasterized at flush time, so it has to reach the device BEFORE this
++    // mutation's own mirror op does -- otherwise the GPU sees the upload ahead of draws the
++    // oracle already applied. Flush eagerly here, not lazily at the next primitive.
++    if (s_gsGpuBatchVerify > 0 && !m_gpuBatch.prims.empty())
++    { ++g_bvFlushExplicit; gpuBatchFlush(); }
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-@@ -1406,6 +3192,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         return;
+ 
+@@ -1406,6 +3833,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -2264,7 +2955,7 @@ index 9c39ae2..242fb95 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1496,6 +3427,39 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1496,12 +4068,48 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
              return;
          }
      }
@@ -2304,7 +2995,16 @@ index 9c39ae2..242fb95 100644
  }
  
  void GSCpuBackend::PerformLocalToLocalTransfer()
-@@ -1536,6 +3500,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+ {
+     if (!m_vram)
+         return;
++    ++g_vramMutationSeq;
++    if (s_gsGpuBatchVerify > 0 && !m_gpuBatch.prims.empty())
++    { ++g_bvFlushExplicit; gpuBatchFlush(); }
+ 
+     const uint32_t rrw = m_transfer.trxreg.rrw;
+     const uint32_t rrh = m_transfer.trxreg.rrh;
+@@ -1536,6 +4144,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  
      m_transferState.copiedPixels = total;
      m_transferState.direction = 3u;
@@ -2327,7 +3027,7 @@ index 9c39ae2..242fb95 100644
  }
  
  void GSCpuBackend::PerformLocalToHostTransfer()
-@@ -1610,6 +3590,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +4234,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -2335,7 +3035,7 @@ index 9c39ae2..242fb95 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,6 +3603,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,9 +4247,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -2345,7 +3045,13 @@ index 9c39ae2..242fb95 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || context.frame.fbw == 0u)
          return false;
-@@ -1656,6 +3640,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++    ++g_vramMutationSeq;
++    if (s_gsGpuBatchVerify > 0 && !m_gpuBatch.prims.empty())
++    { ++g_bvFlushExplicit; gpuBatchFlush(); }
+ 
+     const uint32_t x0 = context.scissor.x0;
+     const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
+@@ -1656,6 +4287,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -2356,7 +3062,7 @@ index 9c39ae2..242fb95 100644
          return true;
      }
  
-@@ -1674,11 +3662,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1674,11 +4309,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -2438,7 +3144,7 @@ index 9c39ae2..242fb95 100644
  bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         uint32_t width,
                                         uint32_t height,
-@@ -1688,6 +3746,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1688,6 +4393,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         bool frameBaseIsPages,
                                         uint32_t sourceOriginX,
                                         uint32_t sourceOriginY) const
@@ -2485,7 +3191,7 @@ index 9c39ae2..242fb95 100644
  {
      if (!m_vram || m_vramSize == 0u)
          return false;
-@@ -1759,16 +3857,62 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +4504,62 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -2552,7 +3258,7 @@ index 9c39ae2..242fb95 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +3956,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +4603,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;

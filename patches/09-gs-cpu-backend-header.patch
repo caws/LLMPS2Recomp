@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..602e279 100644
+index 71e8032..89a0184 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-@@ -3,14 +3,23 @@
+@@ -3,14 +3,24 @@
  #include "runtime/gs/gs_backend.h"
  
  #include <array>
@@ -16,7 +16,8 @@ index 71e8032..602e279 100644
  #include <vector>
  
 +class GsGpuPresentDevice;
-+struct GsGpuPrim; // gs_gpu_device.h -- only referenced here, never laid out
++struct GsGpuState; // gs_gpu_device.h -- only referenced here, never laid out
++struct GsGpuGeom;
 +
  class GSCpuBackend final : public GSRasterBackend
  {
@@ -26,7 +27,7 @@ index 71e8032..602e279 100644
  
      void Initialize(uint8_t *vram, uint32_t vramSize) override;
      void Reset() override;
-@@ -22,6 +31,13 @@ public:
+@@ -22,6 +32,13 @@ public:
      void Flush() override;
      void TextureFlush() override;
      void Sync(GSSyncReason reason) override;
@@ -40,7 +41,7 @@ index 71e8032..602e279 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +52,118 @@ private:
+@@ -36,18 +53,158 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -117,14 +118,54 @@ index 71e8032..602e279 100644
 +        uint32_t zOff = 0, zLen = 0;
 +        uint64_t tag = 0;
 +    };
-+    bool rasterVerifyBegin(const GSPrimitiveBatch &batch, RasterVerifyCtx &out);
++    // With bs/bg non-null the primitive is only BUILT (state + geometry filled) and
++    // nothing is seeded or posted -- that is how the batch accumulator reuses exactly the
++    // same, already-verified setup code as the single-primitive gate.
++    bool rasterVerifyBegin(const GSPrimitiveBatch &batch, RasterVerifyCtx &out,
++                           GsGpuState *bs = nullptr, GsGpuGeom *bg = nullptr);
 +    // cont.170: DrawSprite is not a degenerate triangle (flat colour/Z/fog from v1, an
 +    // axis-aligned rect, screen-space UV lerp), so it gets its own setup; everything that
 +    // does not depend on the primitive's SHAPE lives in gs2FillCommonPrimState, and the
 +    // seed-then-raster sequence in rasterSeedAndPost, shared by both.
-+    bool rasterVerifyBeginSprite(const GSPrimitiveBatch &batch, RasterVerifyCtx &out);
-+    void gs2FillCommonPrimState(const GSPrimitiveBatch &batch, GsGpuPrim &p, uint32_t mip);
-+    void rasterSeedAndPost(GsGpuPrim &&p, const RasterVerifyCtx &out);
++    bool rasterVerifyBeginSprite(const GSPrimitiveBatch &batch, RasterVerifyCtx &out,
++                                 GsGpuState *bs = nullptr, GsGpuGeom *bg = nullptr);
++
++    // cont.171 (phase 2b step 2): the BATCH accumulator. A batch is a run of consecutive
++    // primitives sharing one render target with no non-draw VRAM mutation between them --
++    // both boundaries are load-bearing. Tiles are only VRAM-disjoint within one target
++    // (change fbp/fbw and two screen tiles can alias the same word), and a batch is
++    // rasterized at FLUSH time, so an upload landing mid-batch would be visible to every
++    // primitive in it while the oracle shows it only to those that follow.
++    struct GpuBatchAccum
++    {
++        std::vector<GsGpuState> states;
++        std::vector<GsGpuGeom> prims;
++        std::vector<uint64_t> stateHashes; // parallel to states; linear scan (<=128)
++        uint64_t targetKey = ~0ull;
++        unsigned long mutSeq = 0;
++        bool verifying = false;
++        // Primitives the GPU path declined since this batch began. A batch that
++        // skipped ANY primitive cannot be verified: the oracle drew it and the GPU
++        // did not, so a mismatch would say nothing about ordering.
++        unsigned long skipped = 0;
++        // Pages this batch has already WRITTEN (frame + Z of every primitive so far), as a
++        // 512-bit map over the 8KB GS pages. A primitive that SAMPLES one of these is a
++        // read-after-write hazard: within a tile the walk is ordered, but two tiles are
++        // separate workgroups with no ordering between them, so the reader could run before
++        // the writer. Such a primitive has to start a new batch.
++        std::array<uint64_t, 8> writtenPages{};
++        // Verified batches keep the PRE-batch VRAM so a failure can be replayed one
++        // primitive at a time -- the decisive A/B between "tiling/ordering is wrong" and
++        // "one primitive in here shades wrong".
++        std::vector<uint8_t> preVram;
++        uint32_t maxX = 0, maxY = 0; // batch bbox, sizes the tile grid
++    };
++    GpuBatchAccum m_gpuBatch;
++    unsigned long m_lastDegen = 0, m_lastOffscr = 0; // draws-nothing rejections
++    void gpuBatchAppend(const GSPrimitiveBatch &batch);
++    void gpuBatchFlush();
++    void gs2FillCommonPrimState(const GSPrimitiveBatch &batch, GsGpuState &p, uint32_t mip);
++    void rasterSeedAndPost(const GsGpuState &st, GsGpuGeom &&g, const RasterVerifyCtx &out);
 +    void rasterVerifyEnd(const RasterVerifyCtx &ctx);
 +
 +    // Off-thread rasterization (PS2X_GS_THREAD, default OFF): draw/transfer/upload
@@ -160,7 +201,7 @@ index 71e8032..602e279 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +173,36 @@ private:
+@@ -57,9 +214,36 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -199,7 +240,7 @@ index 71e8032..602e279 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +210,52 @@ private:
+@@ -67,9 +251,52 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};

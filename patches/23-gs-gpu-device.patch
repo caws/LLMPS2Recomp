@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
 new file mode 100644
-index 0000000..f071ec2
+index 0000000..1dd0544
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
-@@ -0,0 +1,1965 @@
+@@ -0,0 +1,2076 @@
 +#include "runtime/gs/gs_gpu_device.h"
 +#include "runtime/gs/ps2_gs_memory.h"
 +
@@ -16,6 +16,7 @@ index 0000000..f071ec2
 +#include <cstring>
 +#include <deque>
 +#include <mutex>
++#include <string>
 +#include <thread>
 +
 +// GPU presentation-decode device (cont.166, phase 0 of the GPU-backend arc).
@@ -452,25 +453,18 @@ index 0000000..f071ec2
 +    // combineTexture, classifyAlphaTest, the Z test, the ALPHA blend equation and
 +    // WritePixel's FBMSK/FBA/preserve-alpha write-out. Where the CPU uses double (the Z
 +    // interpolation) so does this; where the CPU divides, the host pre-divided (see
-+    // GsGpuPrim) -- except SampleTexture's per-pixel 1/q, which is done in double and
++    // GsGpuState/GsGpuGeom) -- except SampleTexture's per-pixel 1/q, which is in double and
 +    // rounded once, since GLSL only guarantees ~2.5 ULP for float division.
-+    const char *kRasterShader = R"GLSL(#version 430
++    // Shared pixel pipeline: one source of truth for both entry points below.
++    const char *kRasterCommon = R"GLSL(#version 430
 +#extension GL_ARB_gpu_shader_fp64 : enable
-+layout(local_size_x = 8, local_size_y = 8) in;
 +layout(std430, binding = 0) buffer Mirror { uint vram[]; };
 +layout(std430, binding = 1) readonly buffer PageTab { uint ptab[]; };
-+layout(std430, binding = 2) readonly buffer PrimBuf
++
++// Mirrors GsGpuState / GsGpuGeom field-for-field (all 4-byte scalars, so the std430
++// layout is unambiguous and matches the C++ structs byte for byte).
++struct GsState
 +{
-+    float x0, y0, x1, y1, x2, y2;
-+    uint z0lo, z0hi, z1lo, z1hi, z2lo, z2hi;
-+    uint rgba0, rgba1, rgba2;
-+    float q0, q1, q2;
-+    float s0, s1, s2;
-+    float t0, t1, t2;
-+    uint uv0, uv1, uv2;
-+    uint fog0, fog1, fog2;
-+    float winding, invAbsDenom, fstDiv;
-+    uint minX, minY, maxX, maxY;
 +    uint fbp, fbw, fpsm, fbmsk;
 +    uint zbp, zpsm, zmsk;
 +    uint scissorX0, scissorY0, scissorX1, scissorY1;
@@ -484,13 +478,44 @@ index 0000000..f071ec2
 +    uint texW, texH, linear;
 +    uint wms, wmt, minU, maxU, minV, maxV;
 +    uint ta0, ta1, aem;
++    float fstDiv;
++    uint clutShadowHave;
++    uint pad0, pad1, pad2;
++    uint clutShadow[16];
++};
++
++struct GsGeom
++{
++    float x0, y0, x1, y1, x2, y2;
++    uint z0lo, z0hi, z1lo, z1hi, z2lo, z2hi;
++    uint rgba0, rgba1, rgba2;
++    float q0, q1, q2;
++    float s0, s1, s2;
++    float t0, t1, t2;
++    uint uv0, uv1, uv2;
++    uint fog0, fog1, fog2;
++    float winding, invAbsDenom;
++    uint minX, minY, maxX, maxY;
 +    uint spriteZ;
 +    uint unclipX0, unclipY0;
 +    float spriteW, spriteH;
 +    float su0, sv0, su1, sv1;
-+    uint clutShadowHave;
-+    uint clutShadow[16];
-+} P;
++    uint stateIndex;
++    uint pad0, pad1, pad2;
++};
++
++layout(std430, binding = 2) readonly buffer StateBuf { GsState states[]; };
++layout(std430, binding = 3) readonly buffer GeomBuf { GsGeom prims[]; };
++layout(std430, binding = 4) readonly buffer BinOff { uint binOffsets[]; };
++layout(std430, binding = 5) readonly buffer BinEnt { uint binEntries[]; };
++layout(std430, binding = 6) readonly buffer TileLst { uint tileList[]; };
++
++// Set once per primitive; the S./G. macros read through them so the pixel pipeline below
++// is written exactly once and serves both the single-primitive and the tiled entry point.
++uint gStateIdx = 0u;
++uint gPrimIdx = 0u;
++#define S states[gStateIdx]
++#define G prims[gPrimIdx]
 +
 +// Page-table offsets, in halfwords, matching the host's kTabOff* constants.
 +const uint TAB_C32  = 0u;
@@ -604,24 +629,24 @@ index 0000000..f071ec2
 +    bool rgbZero = (texel & 0x00FFFFFFu) == 0u;
 +    uint a = (texel >> 24u) & 0xFFu;
 +    if (psm == 1u) // CT24
-+        a = (P.aem != 0u && rgbZero) ? 0u : P.ta0;
++        a = (S.aem != 0u && rgbZero) ? 0u : S.ta0;
 +    else if (psm == 2u || psm == 10u) // CT16 / CT16S
-+        a = ((a & 0x80u) != 0u) ? P.ta1 : ((P.aem != 0u && rgbZero) ? 0u : P.ta0);
++        a = ((a & 0x80u) != 0u) ? S.ta1 : ((S.aem != 0u && rgbZero) ? 0u : S.ta0);
 +    return (texel & 0x00FFFFFFu) | (a << 24u);
 +}
 +
 +uint resolveClutIndex(uint index)
 +{
-+    if (P.csm != 0u)
-+        return (P.tpsm == 20u || P.tpsm == 44u || P.tpsm == 36u) ? (index & 0x0Fu) : index;
-+    bool is16 = (P.cpsm == 2u || P.cpsm == 10u);
++    if (S.csm != 0u)
++        return (S.tpsm == 20u || S.tpsm == 44u || S.tpsm == 36u) ? (index & 0x0Fu) : index;
++    bool is16 = (S.cpsm == 2u || S.cpsm == 10u);
 +    uint csaMask = is16 ? 0x1Fu : 0x0Fu;
 +    uint idxMask = is16 ? 0x1FFu : 0x0FFu;
-+    uint clutBase = (P.csa & csaMask) << 4u;
++    uint clutBase = (S.csa & csaMask) << 4u;
 +    uint ci;
-+    if (P.tpsm == 20u || P.tpsm == 44u || P.tpsm == 36u)
++    if (S.tpsm == 20u || S.tpsm == 44u || S.tpsm == 36u)
 +        ci = clutBase + (index & 0x0Fu);
-+    else if (P.tpsm == 19u || P.tpsm == 27u)
++    else if (S.tpsm == 19u || S.tpsm == 27u)
 +        ci = clutBase + index;
 +    else
 +        return index;
@@ -633,28 +658,28 @@ index 0000000..f071ec2
 +uint lookupClut(uint index)
 +{
 +    uint ci = resolveClutIndex(index);
-+    bool csm2 = (P.csm != 0u);
++    bool csm2 = (S.csm != 0u);
 +    uint clutWidth = 1u; // CSM1 ignores TEXCLUT; CSM2 does not occur in this game
 +    uint clutX = ci & 0x0Fu;
 +    uint clutY = ci >> 4u;
-+    if (P.cpsm == 0u)
++    if (S.cpsm == 0u)
 +    {
-+        uint entry = readVram(0u, P.cbp, clutWidth, clutX, clutY);
++        uint entry = readVram(0u, S.cbp, clutWidth, clutX, clutY);
 +        // CLUT shadow: an entry whose RGB was zeroed by a colliding render target while
 +        // its alpha still matches the uploaded payload is served from the upload.
-+        if (P.clutShadowHave != 0u && !csm2 && (entry & 0x00FFFFFFu) == 0u &&
++        if (S.clutShadowHave != 0u && !csm2 && (entry & 0x00FFFFFFu) == 0u &&
 +            clutX < 8u && clutY < 2u)
 +        {
-+            uint up = P.clutShadow[clutY * 8u + clutX];
++            uint up = S.clutShadow[clutY * 8u + clutX];
 +            if ((up & 0xFF000000u) == (entry & 0xFF000000u) && (up & 0x00FFFFFFu) != 0u)
 +                entry = up;
 +        }
 +        return applyTexa(0u, entry);
 +    }
-+    if (P.cpsm == 1u)
-+        return applyTexa(1u, readVram(1u, P.cbp, clutWidth, clutX, clutY));
-+    if (P.cpsm == 2u || P.cpsm == 10u)
-+        return applyTexa(P.cpsm, rgba5551to8888(readVram(P.cpsm, P.cbp, clutWidth, clutX, clutY)));
++    if (S.cpsm == 1u)
++        return applyTexa(1u, readVram(1u, S.cbp, clutWidth, clutX, clutY));
++    if (S.cpsm == 2u || S.cpsm == 10u)
++        return applyTexa(S.cpsm, rgba5551to8888(readVram(S.cpsm, S.cbp, clutWidth, clutX, clutY)));
 +    return 0xFFFF00FFu;
 +}
 +
@@ -671,14 +696,14 @@ index 0000000..f071ec2
 +
 +uint samplePoint(int su, int sv)
 +{
-+    su = wrapCoord(su, int(P.texW), P.wms, P.minU, P.maxU);
-+    sv = wrapCoord(sv, int(P.texH), P.wmt, P.minV, P.maxV);
-+    uint raw = readVram(P.tpsm, P.tbp, P.tbw, uint(su), uint(sv));
-+    if (P.tpsm == 0u || P.tpsm == 48u || P.tpsm == 1u || P.tpsm == 49u)
-+        return applyTexa(P.tpsm, raw);
-+    if (P.tpsm == 2u || P.tpsm == 10u || P.tpsm == 50u || P.tpsm == 58u)
-+        return applyTexa(P.tpsm, rgba5551to8888(raw));
-+    if (P.tpsm == 19u || P.tpsm == 27u || P.tpsm == 20u || P.tpsm == 36u || P.tpsm == 44u)
++    su = wrapCoord(su, int(S.texW), S.wms, S.minU, S.maxU);
++    sv = wrapCoord(sv, int(S.texH), S.wmt, S.minV, S.maxV);
++    uint raw = readVram(S.tpsm, S.tbp, S.tbw, uint(su), uint(sv));
++    if (S.tpsm == 0u || S.tpsm == 48u || S.tpsm == 1u || S.tpsm == 49u)
++        return applyTexa(S.tpsm, raw);
++    if (S.tpsm == 2u || S.tpsm == 10u || S.tpsm == 50u || S.tpsm == 58u)
++        return applyTexa(S.tpsm, rgba5551to8888(raw));
++    if (S.tpsm == 19u || S.tpsm == 27u || S.tpsm == 20u || S.tpsm == 36u || S.tpsm == 44u)
 +        return lookupClut(raw);
 +    return applyTexa(0u, raw); // undefined psm decodes as CT32
 +}
@@ -708,20 +733,20 @@ index 0000000..f071ec2
 +uint sampleTexture(float s, float t, float q, uint uu, uint vv)
 +{
 +    precise float texUf, texVf;
-+    if (P.fst != 0u)
++    if (S.fst != 0u)
 +    {
-+        texUf = float(uu) / P.fstDiv;
-+        texVf = float(vv) / P.fstDiv;
++        texUf = float(uu) / S.fstDiv;
++        texVf = float(vv) / S.fstDiv;
 +    }
 +    else
 +    {
 +        float aq = (abs(q) > 1.0e-8) ? q : 1.0;
 +        float invQ = exactDiv(1.0, aq);
-+        texUf = s * invQ * float(P.texW);
-+        texVf = t * invQ * float(P.texH);
++        texUf = s * invQ * float(S.texW);
++        texVf = t * invQ * float(S.texH);
 +        // (both already `precise` by declaration -- see lerpChan's note)
 +    }
-+    if (P.linear == 0u)
++    if (S.linear == 0u)
 +        return samplePoint(int(texUf), int(texVf));
 +
 +    precise float su = texUf - 0.5;
@@ -743,16 +768,16 @@ index 0000000..f071ec2
 +
 +bool passesAlphaTest(uint a)
 +{
-+    if (P.ate == 0u)
++    if (S.ate == 0u)
 +        return true;
-+    if (P.atst == 0u) return false;
-+    if (P.atst == 1u) return true;
-+    if (P.atst == 2u) return a < P.aref;
-+    if (P.atst == 3u) return a <= P.aref;
-+    if (P.atst == 4u) return a == P.aref;
-+    if (P.atst == 5u) return a >= P.aref;
-+    if (P.atst == 6u) return a > P.aref;
-+    return a != P.aref;
++    if (S.atst == 0u) return false;
++    if (S.atst == 1u) return true;
++    if (S.atst == 2u) return a < S.aref;
++    if (S.atst == 3u) return a <= S.aref;
++    if (S.atst == 4u) return a == S.aref;
++    if (S.atst == 5u) return a >= S.aref;
++    if (S.atst == 6u) return a > S.aref;
++    return a != S.aref;
 +}
 +
 +int pickRGB(uint sel, int cs, int cd)
@@ -769,26 +794,26 @@ index 0000000..f071ec2
 +// coverage is decided.
 +void writePixel(uint px_i, uint py_i, uint r, uint g, uint b, uint a, uint fog, uint zval)
 +{
-+    if (px_i < P.scissorX0 || px_i > P.scissorX1 || py_i < P.scissorY0 || py_i > P.scissorY1)
++    if (px_i < S.scissorX0 || px_i > S.scissorX1 || py_i < S.scissorY0 || py_i > S.scissorY1)
 +        return;
 +
-+    if (P.fge != 0u)
++    if (S.fge != 0u)
 +    {
 +        uint inv = 255u - fog;
-+        r = (((fog * r) >> 8u) + ((inv * P.fogR) >> 8u)) & 0xFFu;
-+        g = (((fog * g) >> 8u) + ((inv * P.fogG) >> 8u)) & 0xFFu;
-+        b = (((fog * b) >> 8u) + ((inv * P.fogB) >> 8u)) & 0xFFu;
++        r = (((fog * r) >> 8u) + ((inv * S.fogR) >> 8u)) & 0xFFu;
++        g = (((fog * g) >> 8u) + ((inv * S.fogG) >> 8u)) & 0xFFu;
++        b = (((fog * b) >> 8u) + ((inv * S.fogB) >> 8u)) & 0xFFu;
 +    }
 +
 +    // classifyAlphaTest
 +    bool writeRgb = true, writeAlpha = true, writeDepth = true;
 +    if (!passesAlphaTest(a))
 +    {
-+        if (P.afail == 1u)      { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
-+        else if (P.afail == 2u) { writeRgb = false; writeAlpha = false; writeDepth = true;  }
-+        else if (P.afail == 3u)
++        if (S.afail == 1u)      { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
++        else if (S.afail == 2u) { writeRgb = false; writeAlpha = false; writeDepth = true;  }
++        else if (S.afail == 3u)
 +        {
-+            if (P.fpsm == 0u)   { writeRgb = true;  writeAlpha = false; writeDepth = false; }
++            if (S.fpsm == 0u)   { writeRgb = true;  writeAlpha = false; writeDepth = false; }
 +            else                { writeRgb = true;  writeAlpha = true;  writeDepth = false; }
 +        }
 +        else                    { writeRgb = false; writeAlpha = false; writeDepth = false; }
@@ -797,50 +822,50 @@ index 0000000..f071ec2
 +    if (!writesFb && !writeDepth)
 +        return;
 +
-+    bool preserveDstAlpha = writeRgb && !writeAlpha && P.fpsm == 0u;
-+    bool frmw = writesFb && ((P.fbmsk != 0u) || P.abe != 0u || preserveDstAlpha);
++    bool preserveDstAlpha = writeRgb && !writeAlpha && S.fpsm == 0u;
++    bool frmw = writesFb && ((S.fbmsk != 0u) || S.abe != 0u || preserveDstAlpha);
 +    uint fbrgba = 0u;
 +    if (frmw)
 +    {
-+        uint raw = readVram(P.fpsm, P.fbp, P.fbw, px_i, py_i);
++        uint raw = readVram(S.fpsm, S.fbp, S.fbw, px_i, py_i);
 +        fbrgba = raw;
-+        if (P.fpsm == 2u || P.fpsm == 10u)
++        if (S.fpsm == 2u || S.fpsm == 10u)
 +            fbrgba = rgba5551to8888(raw);
-+        else if (P.fpsm == 1u)
++        else if (S.fpsm == 1u)
 +            fbrgba = raw | 0x80000000u; // the GS supplies 0x80 dest alpha for RGB24
 +    }
 +
 +    bool zpass = false;
-+    if (P.ztst == 1u)
++    if (S.ztst == 1u)
 +        zpass = true;
-+    else if (P.ztst == 2u || P.ztst == 3u)
++    else if (S.ztst == 2u || S.ztst == 3u)
 +    {
-+        uint stored = readVram(P.zpsm, P.zbp, P.fbw, px_i, py_i);
-+        zpass = (P.ztst == 2u) ? (zval >= stored) : (zval > stored);
++        uint stored = readVram(S.zpsm, S.zbp, S.fbw, px_i, py_i);
++        zpass = (S.ztst == 2u) ? (zval >= stored) : (zval > stored);
 +    }
 +    if (!zpass)
 +        return;
 +
 +    if (writesFb)
 +    {
-+        if (P.abe != 0u)
++        if (S.abe != 0u)
 +        {
 +            int dr = int(fbrgba & 0xFFu), dg = int((fbrgba >> 8u) & 0xFFu);
 +            int db = int((fbrgba >> 16u) & 0xFFu), da = int((fbrgba >> 24u) & 0xFFu);
-+            int cAlpha = (P.blendC == 0u) ? int(a) : ((P.blendC == 1u) ? da : int(P.blendFix));
++            int cAlpha = (S.blendC == 0u) ? int(a) : ((S.blendC == 1u) ? da : int(S.blendFix));
 +            int sr = int(r), sg = int(g), sb = int(b);
-+            r = uint(clamp(((pickRGB(P.blendA, sr, dr) - pickRGB(P.blendB, sr, dr)) * cAlpha >> 7) + pickRGB(P.blendD, sr, dr), 0, 255));
-+            g = uint(clamp(((pickRGB(P.blendA, sg, dg) - pickRGB(P.blendB, sg, dg)) * cAlpha >> 7) + pickRGB(P.blendD, sg, dg), 0, 255));
-+            b = uint(clamp(((pickRGB(P.blendA, sb, db) - pickRGB(P.blendB, sb, db)) * cAlpha >> 7) + pickRGB(P.blendD, sb, db), 0, 255));
++            r = uint(clamp(((pickRGB(S.blendA, sr, dr) - pickRGB(S.blendB, sr, dr)) * cAlpha >> 7) + pickRGB(S.blendD, sr, dr), 0, 255));
++            g = uint(clamp(((pickRGB(S.blendA, sg, dg) - pickRGB(S.blendB, sg, dg)) * cAlpha >> 7) + pickRGB(S.blendD, sg, dg), 0, 255));
++            b = uint(clamp(((pickRGB(S.blendA, sb, db) - pickRGB(S.blendB, sb, db)) * cAlpha >> 7) + pickRGB(S.blendD, sb, db), 0, 255));
 +        }
-+        if (writeAlpha && (P.fba & 1u) != 0u && P.fpsm != 1u)
++        if (writeAlpha && (S.fba & 1u) != 0u && S.fpsm != 1u)
 +            a |= 0x80u;
 +        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
-+        if (P.fbmsk != 0u)
-+            pixel = (pixel & ~P.fbmsk) | (fbrgba & P.fbmsk);
++        if (S.fbmsk != 0u)
++            pixel = (pixel & ~S.fbmsk) | (fbrgba & S.fbmsk);
 +        if (preserveDstAlpha)
 +            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
-+        if (P.fpsm == 2u || P.fpsm == 10u)
++        if (S.fpsm == 2u || S.fpsm == 10u)
 +        {
 +            uint pr = ((pixel      ) & 0xFFu) >> 3u;
 +            uint pg = ((pixel >>  8) & 0xFFu) >> 3u;
@@ -848,40 +873,39 @@ index 0000000..f071ec2
 +            uint pa = ((pixel >> 24) & 0xFFu) >> 7u;
 +            pixel = pr | (pg << 5u) | (pb << 10u) | (pa << 15u);
 +        }
-+        writeVramPsm(P.fpsm, P.fbp, P.fbw, px_i, py_i, pixel);
++        writeVramPsm(S.fpsm, S.fbp, S.fbw, px_i, py_i, pixel);
 +    }
 +
-+    if (writeDepth && P.zmsk == 0u)
-+        writeVramPsm(P.zpsm, P.zbp, P.fbw, px_i, py_i, zval);
++    if (writeDepth && S.zmsk == 0u)
++        writeVramPsm(S.zpsm, S.zbp, S.fbw, px_i, py_i, zval);
 +}
 +
 +
-+void main()
++// Shade one pixel of the primitive currently selected by gPrimIdx / gStateIdx. The caller
++// has already established that the pixel lies inside that primitive's bbox. Written once
++// and shared by both entry points -- a duplicated pixel pipeline would drift, and
++// bit-exactness against the CPU oracle is the whole point.
++void shadePrimPixel(uint px_i, uint py_i)
 +{
-+    uint px_i = P.minX + gl_GlobalInvocationID.x;
-+    uint py_i = P.minY + gl_GlobalInvocationID.y;
-+    if (px_i > P.maxX || py_i > P.maxY)
-+        return;
-+
 +    // ---- SPRITE (DrawSprite): axis-aligned, flat shaded, screen-space UV lerp ----
 +    // The host already clamped minX/minY/maxX/maxY to the scissor-intersected rect and
 +    // rejected a fully-off-screen sprite, so every invocation here is covered.
-+    if (P.primType == 6u)
++    if (S.primType == 6u)
 +    {
 +        uint sr, sg, sb, sa;
-+        sr = P.rgba1 & 0xFFu;
-+        sg = (P.rgba1 >> 8u) & 0xFFu;
-+        sb = (P.rgba1 >> 16u) & 0xFFu;
-+        sa = (P.rgba1 >> 24u) & 0xFFu;
-+        if (P.tme != 0u)
++        sr = G.rgba1 & 0xFFu;
++        sg = (G.rgba1 >> 8u) & 0xFFu;
++        sb = (G.rgba1 >> 16u) & 0xFFu;
++        sa = (G.rgba1 >> 24u) & 0xFFu;
++        if (S.tme != 0u)
 +        {
-+            precise float tx = exactDiv(float(px_i - P.unclipX0) + 0.5, P.spriteW);
-+            precise float ty = exactDiv(float(py_i - P.unclipY0) + 0.5, P.spriteH);
-+            precise float texUf = P.su0 + (P.su1 - P.su0) * tx;
-+            precise float texVf = P.sv0 + (P.sv1 - P.sv0) * ty;
++            precise float tx = exactDiv(float(px_i - G.unclipX0) + 0.5, G.spriteW);
++            precise float ty = exactDiv(float(py_i - G.unclipY0) + 0.5, G.spriteH);
++            precise float texUf = G.su0 + (G.su1 - G.su0) * tx;
++            precise float texVf = G.sv0 + (G.sv1 - G.sv0) * ty;
 +            float is = 0.0, it = 0.0, iq = 1.0;
 +            uint iu = 0u, iv = 0u;
-+            if (P.fst != 0u)
++            if (S.fst != 0u)
 +            {
 +                // DrawSprite re-quantizes to 4.4 fixed point and hands SampleTexture a UV,
 +                // which divides by 16 again -- replicate the round trip, not a shortcut.
@@ -892,26 +916,26 @@ index 0000000..f071ec2
 +            {
 +                // ...and in the non-FST case it divides by the texture size, which
 +                // SampleTexture then multiplies back. Not identity in float: do both.
-+                is = exactDiv(texUf, float(P.texW));
-+                it = exactDiv(texVf, float(P.texH));
++                is = exactDiv(texUf, float(S.texW));
++                it = exactDiv(texVf, float(S.texH));
 +            }
 +            uint texel = sampleTexture(is, it, iq, iu, iv);
 +            uint tr = texel & 0xFFu, tg = (texel >> 8u) & 0xFFu;
 +            uint tb = (texel >> 16u) & 0xFFu, ta = (texel >> 24u) & 0xFFu;
-+            bool hasAlpha = P.tcc != 0u;
++            bool hasAlpha = S.tcc != 0u;
 +            uint nr, ng, nb, na;
-+            if (P.tfx == 0u)
++            if (S.tfx == 0u)
 +            {
 +                nr = uint(clamp(int((tr * sr) >> 7u), 0, 255));
 +                ng = uint(clamp(int((tg * sg) >> 7u), 0, 255));
 +                nb = uint(clamp(int((tb * sb) >> 7u), 0, 255));
 +                na = hasAlpha ? uint(clamp(int((ta * sa) >> 7u), 0, 255)) : sa;
 +            }
-+            else if (P.tfx == 1u)
++            else if (S.tfx == 1u)
 +            {
 +                nr = tr; ng = tg; nb = tb; na = hasAlpha ? ta : sa;
 +            }
-+            else if (P.tfx == 2u)
++            else if (S.tfx == 2u)
 +            {
 +                nr = uint(clamp(int(((tr * sr) >> 7u) + sa), 0, 255));
 +                ng = uint(clamp(int(((tg * sg) >> 7u) + sa), 0, 255));
@@ -928,7 +952,7 @@ index 0000000..f071ec2
 +            sr = nr; sg = ng; sb = nb; sa = na;
 +        }
 +        // Flat Z and fog from v1; note DrawSprite truncates v1.z with no +0.5 rounding.
-+        writePixel(px_i, py_i, sr, sg, sb, sa, P.fog1, P.spriteZ);
++        writePixel(px_i, py_i, sr, sg, sb, sa, G.fog1, G.spriteZ);
 +        return;
 +    }
 +
@@ -936,25 +960,25 @@ index 0000000..f071ec2
 +    float py = float(py_i) + 0.5;
 +
 +    // DrawTriangle's barycentric coverage test, on the same floats in the same order.
-+    precise float w0 = (((P.y1 - P.y2) * (px - P.x2) + (P.x2 - P.x1) * (py - P.y2)) * P.winding) * P.invAbsDenom;
-+    precise float w1 = (((P.y2 - P.y0) * (px - P.x2) + (P.x0 - P.x2) * (py - P.y2)) * P.winding) * P.invAbsDenom;
++    precise float w0 = (((G.y1 - G.y2) * (px - G.x2) + (G.x2 - G.x1) * (py - G.y2)) * G.winding) * G.invAbsDenom;
++    precise float w1 = (((G.y2 - G.y0) * (px - G.x2) + (G.x0 - G.x2) * (py - G.y2)) * G.winding) * G.invAbsDenom;
 +    precise float w2 = 1.0 - w0 - w1;
 +    const float kEdgeEpsilon = 1.0e-4;
 +    if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
 +        return;
 +
 +    // The oracle interpolates Z in double from float weights; match exactly.
-+    double zd = packDouble2x32(uvec2(P.z0lo, P.z0hi)) * double(w0) +
-+                packDouble2x32(uvec2(P.z1lo, P.z1hi)) * double(w1) +
-+                packDouble2x32(uvec2(P.z2lo, P.z2hi)) * double(w2);
++    double zd = packDouble2x32(uvec2(G.z0lo, G.z0hi)) * double(w0) +
++                packDouble2x32(uvec2(G.z1lo, G.z1hi)) * double(w1) +
++                packDouble2x32(uvec2(G.z2lo, G.z2hi)) * double(w2);
 +
 +    uint r, g, b, a;
-+    if (P.iip != 0u)
++    if (S.iip != 0u)
 +    {
-+        precise float ir = float((P.rgba0      ) & 0xFFu) * w0 + float((P.rgba1      ) & 0xFFu) * w1 + float((P.rgba2      ) & 0xFFu) * w2;
-+        precise float ig = float((P.rgba0 >>  8u) & 0xFFu) * w0 + float((P.rgba1 >>  8u) & 0xFFu) * w1 + float((P.rgba2 >>  8u) & 0xFFu) * w2;
-+        precise float ib = float((P.rgba0 >> 16u) & 0xFFu) * w0 + float((P.rgba1 >> 16u) & 0xFFu) * w1 + float((P.rgba2 >> 16u) & 0xFFu) * w2;
-+        precise float ia = float((P.rgba0 >> 24u) & 0xFFu) * w0 + float((P.rgba1 >> 24u) & 0xFFu) * w1 + float((P.rgba2 >> 24u) & 0xFFu) * w2;
++        precise float ir = float((G.rgba0      ) & 0xFFu) * w0 + float((G.rgba1      ) & 0xFFu) * w1 + float((G.rgba2      ) & 0xFFu) * w2;
++        precise float ig = float((G.rgba0 >>  8u) & 0xFFu) * w0 + float((G.rgba1 >>  8u) & 0xFFu) * w1 + float((G.rgba2 >>  8u) & 0xFFu) * w2;
++        precise float ib = float((G.rgba0 >> 16u) & 0xFFu) * w0 + float((G.rgba1 >> 16u) & 0xFFu) * w1 + float((G.rgba2 >> 16u) & 0xFFu) * w2;
++        precise float ia = float((G.rgba0 >> 24u) & 0xFFu) * w0 + float((G.rgba1 >> 24u) & 0xFFu) * w1 + float((G.rgba2 >> 24u) & 0xFFu) * w2;
 +        r = uint(clamp(int(ir), 0, 255));
 +        g = uint(clamp(int(ig), 0, 255));
 +        b = uint(clamp(int(ib), 0, 255));
@@ -962,20 +986,20 @@ index 0000000..f071ec2
 +    }
 +    else
 +    {
-+        r = P.rgba2 & 0xFFu;
-+        g = (P.rgba2 >> 8u) & 0xFFu;
-+        b = (P.rgba2 >> 16u) & 0xFFu;
-+        a = (P.rgba2 >> 24u) & 0xFFu;
++        r = G.rgba2 & 0xFFu;
++        g = (G.rgba2 >> 8u) & 0xFFu;
++        b = (G.rgba2 >> 16u) & 0xFFu;
++        a = (G.rgba2 >> 24u) & 0xFFu;
 +    }
 +
-+    if (P.tme != 0u)
++    if (S.tme != 0u)
 +    {
 +        precise float is = 0.0, it = 0.0, iq = 1.0;
 +        uint iu = 0u, iv = 0u;
-+        if (P.fst != 0u)
++        if (S.fst != 0u)
 +        {
-+            precise float fu = float(P.uv0 & 0xFFFFu) * w0 + float(P.uv1 & 0xFFFFu) * w1 + float(P.uv2 & 0xFFFFu) * w2;
-+            precise float fv = float(P.uv0 >> 16u) * w0 + float(P.uv1 >> 16u) * w1 + float(P.uv2 >> 16u) * w2;
++            precise float fu = float(G.uv0 & 0xFFFFu) * w0 + float(G.uv1 & 0xFFFFu) * w1 + float(G.uv2 & 0xFFFFu) * w2;
++            precise float fv = float(G.uv0 >> 16u) * w0 + float(G.uv1 >> 16u) * w1 + float(G.uv2 >> 16u) * w2;
 +            iu = uint(fu) & 0xFFFFu;
 +            iv = uint(fv) & 0xFFFFu;
 +        }
@@ -983,27 +1007,27 @@ index 0000000..f071ec2
 +        {
 +            // The GS DDA interpolates homogeneous S/T/Q; texel coords come from S/Q, T/Q
 +            // only AFTER interpolation.
-+            is = P.s0 * w0 + P.s1 * w1 + P.s2 * w2;
-+            it = P.t0 * w0 + P.t1 * w1 + P.t2 * w2;
-+            iq = P.q0 * w0 + P.q1 * w1 + P.q2 * w2;
++            is = G.s0 * w0 + G.s1 * w1 + G.s2 * w2;
++            it = G.t0 * w0 + G.t1 * w1 + G.t2 * w2;
++            iq = G.q0 * w0 + G.q1 * w1 + G.q2 * w2;
 +        }
 +        uint texel = sampleTexture(is, it, iq, iu, iv);
 +        uint tr = texel & 0xFFu, tg = (texel >> 8u) & 0xFFu;
 +        uint tb = (texel >> 16u) & 0xFFu, ta = (texel >> 24u) & 0xFFu;
-+        bool hasAlpha = P.tcc != 0u;
++        bool hasAlpha = S.tcc != 0u;
 +        uint nr, ng, nb, na;
-+        if (P.tfx == 0u) // MODULATE
++        if (S.tfx == 0u) // MODULATE
 +        {
 +            nr = uint(clamp(int((tr * r) >> 7u), 0, 255));
 +            ng = uint(clamp(int((tg * g) >> 7u), 0, 255));
 +            nb = uint(clamp(int((tb * b) >> 7u), 0, 255));
 +            na = hasAlpha ? uint(clamp(int((ta * a) >> 7u), 0, 255)) : a;
 +        }
-+        else if (P.tfx == 1u) // DECAL
++        else if (S.tfx == 1u) // DECAL
 +        {
 +            nr = tr; ng = tg; nb = tb; na = hasAlpha ? ta : a;
 +        }
-+        else if (P.tfx == 2u) // HIGHLIGHT
++        else if (S.tfx == 2u) // HIGHLIGHT
 +        {
 +            nr = uint(clamp(int(((tr * r) >> 7u) + a), 0, 255));
 +            ng = uint(clamp(int(((tg * g) >> 7u) + a), 0, 255));
@@ -1023,14 +1047,57 @@ index 0000000..f071ec2
 +    // Fog is interpolated per pixel for a triangle (a sprite takes v1's flat value), and
 +    // Z carries the +0.5 rounding DrawTriangle applies at its WritePixel call site.
 +    uint fogv = 0u;
-+    if (P.fge != 0u)
++    if (S.fge != 0u)
 +    {
-+        precise float ifog = float(P.fog0) * w0 + float(P.fog1) * w1 + float(P.fog2) * w2;
++        precise float ifog = float(G.fog0) * w0 + float(G.fog1) * w1 + float(G.fog2) * w2;
 +        fogv = uint(clamp(int(ifog), 0, 255));
 +    }
 +    writePixel(px_i, py_i, r, g, b, a, fogv, uint(zd + 0.5lf));
 +}
 +)GLSL";
++
++    // Entry point A -- ONE primitive, dispatched over its bbox (the phase-2a shadow-verify
++    // path). A batch of one.
++    const char *kRasterMainPrim = R"GLSL(
++layout(local_size_x = 8, local_size_y = 8) in;
++void main()
++{
++    gPrimIdx = 0u;
++    gStateIdx = prims[0].stateIndex;
++    uint px_i = G.minX + gl_GlobalInvocationID.x;
++    uint py_i = G.minY + gl_GlobalInvocationID.y;
++    if (px_i > G.maxX || py_i > G.maxY)
++        return;
++    shadePrimPixel(px_i, py_i);
++}
++)GLSL";
++
++    // Entry point B -- a BATCH, one workgroup per non-empty 16x16 tile, one thread per
++    // pixel. Each thread walks its tile's primitive list in SUBMISSION ORDER, which is the
++    // only ordering the GS actually requires: pixels are independent of one another, so
++    // there is no barrier here at all. Tiles are VRAM-disjoint because a batch never spans
++    // a render-target change (enforced host-side).
++    const char *kRasterMainTile = R"GLSL(
++layout(local_size_x = 16, local_size_y = 16) in;
++uniform uint uTilesX;
++void main()
++{
++    uint tile = tileList[gl_WorkGroupID.x];
++    uint px_i = (tile % uTilesX) * 16u + gl_LocalInvocationID.x;
++    uint py_i = (tile / uTilesX) * 16u + gl_LocalInvocationID.y;
++    uint b = binOffsets[tile];
++    uint e = binOffsets[tile + 1u];
++    for (uint i = b; i < e; ++i)
++    {
++        gPrimIdx = binEntries[i];
++        if (px_i < G.minX || px_i > G.maxX || py_i < G.minY || py_i > G.maxY)
++            continue;
++        gStateIdx = G.stateIndex;
++        shadePrimPixel(px_i, py_i);
++    }
++}
++)GLSL";
++
 +
 +#ifndef EGL_PLATFORM_SURFACELESS_MESA
 +#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
@@ -1090,14 +1157,14 @@ index 0000000..f071ec2
 +            Verify,
 +            PatchRaw,
 +            VerifyFull,
-+            RasterPrim,
++            RasterBatch,
 +            VerifyRange
 +        } kind = Kind::Decode;
 +        DecodeDesc decode{};      // Decode / VerifyFull (vram+vramSize; out unused for the latter)
 +        GsGpuUploadChunk chunk{}; // Upload/Verify only
 +        std::vector<uint8_t> raw; // PatchRaw / VerifyRange: CPU VRAM bytes
 +        uint32_t rawOffset = 0;   // PatchRaw / VerifyRange: mirror byte offset
-+        GsGpuPrim prim{};         // RasterPrim only
++        GsGpuBatch batch{};       // RasterBatch only
 +        uint64_t tag = 0;         // VerifyRange only: echoed on divergence
 +        const uint8_t *drawPageMask = nullptr; // VerifyFull only (caller-owned, 512 bytes)
 +        bool *done = nullptr;     // Decode / VerifyFull (caller-stack completion flags)
@@ -1146,11 +1213,17 @@ index 0000000..f071ec2
 +    unsigned long prPatches = 0;
 +    unsigned long long prBytes = 0;
 +    // Phase-2a raster state (lazily created with the first raster job).
-+    GLuint rasterProgram = 0;
-+    GLuint primBuf = 0;
-+    // The FIFO puts a VerifyRange immediately behind the RasterPrim it checks, so the last
-+    // rastered prim IS the one being verified -- enough to name a divergence precisely.
-+    GsGpuPrim lastPrim{};
++    GLuint rasterPrimProgram = 0;  // one primitive, dispatched over its bbox
++    GLuint rasterTileProgram = 0;  // a batch, one workgroup per 16x16 tile
++    GLint locTilesX = -1;
++    GLuint stateBuf = 0, geomBuf = 0, binOffBuf = 0, binEntBuf = 0, tileListBuf = 0;
++    // The FIFO puts a VerifyRange immediately behind the batch it checks, so the last
++    // rastered primitive IS the one being verified -- enough to name a divergence precisely
++    // for the single-primitive gate.
++    GsGpuState lastState{};
++    GsGpuGeom lastGeom{};
++    unsigned long rasterBatches = 0;
++    unsigned long long rasterBatchPrims = 0;
 +    unsigned long rasterPrims = 0, rasterVerifies = 0, rasterMismRanges = 0;
 +    unsigned long long rasterMismWords = 0;
 +
@@ -1206,8 +1279,8 @@ index 0000000..f071ec2
 +            case Job::Kind::PatchRaw:
 +                patchRawOnThread(j.rawOffset, j.raw);
 +                break;
-+            case Job::Kind::RasterPrim:
-+                rasterPrimOnThread(j.prim);
++            case Job::Kind::RasterBatch:
++                rasterBatchOnThread(j.batch);
 +                break;
 +            case Job::Kind::VerifyRange:
 +                verifyRangeOnThread(j.rawOffset, j.raw, j.tag);
@@ -1595,37 +1668,73 @@ index 0000000..f071ec2
 +
 +    bool ensureRaster()
 +    {
-+        if (rasterProgram != 0u)
++        if (rasterPrimProgram != 0u)
 +            return true;
-+        rasterProgram = buildProgram(kRasterShader, "raster");
-+        if (!rasterProgram)
++        // One shared pixel-pipeline source, two entry points -- a duplicated pipeline
++        // would drift, and bit-exactness is the whole point.
++        const std::string common(kRasterCommon);
++        rasterPrimProgram = buildProgram((common + kRasterMainPrim).c_str(), "raster-prim");
++        rasterTileProgram = buildProgram((common + kRasterMainTile).c_str(), "raster-tile");
++        if (!rasterPrimProgram || !rasterTileProgram)
 +            return false;
-+        gl.GenBuffers(1, &primBuf);
-+        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, primBuf);
-+        gl.BufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GsGpuPrim), nullptr, GL_DYNAMIC_DRAW);
++        locTilesX = gl.GetUniformLocation(rasterTileProgram, "uTilesX");
++        gl.GenBuffers(1, &stateBuf);
++        gl.GenBuffers(1, &geomBuf);
++        gl.GenBuffers(1, &binOffBuf);
++        gl.GenBuffers(1, &binEntBuf);
++        gl.GenBuffers(1, &tileListBuf);
 +        return gl.GetError() == 0u;
 +    }
 +
-+    // Phase 2a: rasterize one primitive into the mirror. The caller has already seeded the
-+    // mirror's frame/Z pages with the CPU's PRE-draw bytes (FIFO order guarantees those
-+    // patches landed), so what this leaves behind is directly comparable with the CPU's
-+    // post-draw VRAM.
-+    void rasterPrimOnThread(const GsGpuPrim &prim)
++    // Rasterize a batch into the mirror. The caller seeded the mirror with the CPU's
++    // PRE-batch bytes (FIFO order guarantees those patches landed), so what this leaves
++    // behind is directly comparable with the CPU's post-batch VRAM.
++    void rasterBatchOnThread(const GsGpuBatch &b)
 +    {
-+        if (!ensureRaster() || prim.maxX < prim.minX || prim.maxY < prim.minY)
++        if (!ensureRaster() || b.prims.empty() || b.states.empty())
 +            return;
-+        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, primBuf);
-+        gl.BufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GsGpuPrim), &prim, GL_DYNAMIC_DRAW);
-+        gl.UseProgram(rasterProgram);
++        auto upload = [&](GLuint buf, const void *data, size_t bytes)
++        {
++            gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
++            gl.BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), data,
++                          GL_DYNAMIC_DRAW); // orphan + refill per batch
++        };
++        upload(stateBuf, b.states.data(), b.states.size() * sizeof(GsGpuState));
++        upload(geomBuf, b.prims.data(), b.prims.size() * sizeof(GsGpuGeom));
 +        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, mirrorBuf);
 +        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, tabBuf);
-+        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, primBuf);
-+        const uint32_t w = prim.maxX - prim.minX + 1u;
-+        const uint32_t h = prim.maxY - prim.minY + 1u;
-+        gl.DispatchCompute((w + 7u) / 8u, (h + 7u) / 8u, 1u);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, stateBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, geomBuf);
++
++        if (b.tileList.empty())
++        {
++            // Single-primitive path: dispatch straight over the bbox, no binning.
++            const GsGpuGeom &g = b.prims[0];
++            if (g.maxX < g.minX || g.maxY < g.minY)
++                return;
++            gl.UseProgram(rasterPrimProgram);
++            const uint32_t w = g.maxX - g.minX + 1u;
++            const uint32_t h = g.maxY - g.minY + 1u;
++            gl.DispatchCompute((w + 7u) / 8u, (h + 7u) / 8u, 1u);
++        }
++        else
++        {
++            upload(binOffBuf, b.binOffsets.data(), b.binOffsets.size() * 4u);
++            upload(binEntBuf, b.binEntries.data(), b.binEntries.size() * 4u);
++            upload(tileListBuf, b.tileList.data(), b.tileList.size() * 4u);
++            gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, binOffBuf);
++            gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, binEntBuf);
++            gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, tileListBuf);
++            gl.UseProgram(rasterTileProgram);
++            gl.Uniform1ui(locTilesX, b.tilesX);
++            gl.DispatchCompute(static_cast<GLuint>(b.tileList.size()), 1u, 1u);
++        }
 +        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
-+        lastPrim = prim;
-+        ++rasterPrims;
++        lastGeom = b.prims.back();
++        lastState = b.states[lastGeom.stateIndex < b.states.size() ? lastGeom.stateIndex : 0];
++        ++rasterBatches;
++        rasterBatchPrims += b.prims.size();
++        rasterPrims += static_cast<unsigned long>(b.prims.size());
 +    }
 +
 +    // Phase 2a shadow verify: mirror[offset..] vs the CPU's post-draw bytes for the same
@@ -1665,7 +1774,8 @@ index 0000000..f071ec2
 +            rasterMismWords += res[0];
 +            if (rasterMismRanges <= 16u || (rasterMismRanges % 4096u) == 0u)
 +            {
-+                const GsGpuPrim &q = lastPrim;
++                const GsGpuState &q = lastState;
++                const GsGpuGeom &gg = lastGeom;
 +                std::fprintf(stderr,
 +                             "[gsgpu:raster] MISMATCH #%lu tag=%016llx off=0x%06x words=%u: "
 +                             "%u differ, first i=%u gpu=%08x cpu=%08x\n"
@@ -1678,14 +1788,14 @@ index 0000000..f071ec2
 +                             "uv=(%.2f,%.2f)-(%.2f,%.2f) z=%u}\n",
 +                             rasterMismRanges, static_cast<unsigned long long>(tag),
 +                             offset, words, res[0], res[1], res[2], res[3],
-+                             q.primType, q.minX, q.minY, q.maxX, q.maxY,
++                             q.primType, gg.minX, gg.minY, gg.maxX, gg.maxY,
 +                             q.fbp, q.fbw, q.fpsm, q.fbmsk, q.zbp, q.zpsm, q.zmsk,
 +                             q.tbp, q.tbw, q.tpsm, q.texW, q.texH, q.linear, q.tfx, q.tcc,
 +                             q.cbp, q.cpsm, q.csa, q.ta0, q.ta1, q.aem,
 +                             q.ate, q.atst, q.aref, q.afail, q.ztst,
 +                             q.blendA, q.blendB, q.blendC, q.blendD, q.blendFix, q.abe,
-+                             q.unclipX0, q.unclipY0, q.spriteW, q.spriteH,
-+                             q.su0, q.sv0, q.su1, q.sv1, q.spriteZ);
++                             gg.unclipX0, gg.unclipY0, gg.spriteW, gg.spriteH,
++                             gg.su0, gg.sv0, gg.su1, gg.sv1, gg.spriteZ);
 +            }
 +        }
 +        const GLenum err = gl.GetError();
@@ -1916,13 +2026,13 @@ index 0000000..f071ec2
 +    m_impl->enqueue(std::move(j));
 +}
 +
-+void GsGpuPresentDevice::RasterPrim(GsGpuPrim &&prim)
++void GsGpuPresentDevice::RasterBatch(GsGpuBatch &&batch)
 +{
-+    if (!EnsureInitialized())
++    if (batch.prims.empty() || !EnsureInitialized())
 +        return;
 +    Impl::Job j;
-+    j.kind = Impl::Job::Kind::RasterPrim;
-+    j.prim = std::move(prim);
++    j.kind = Impl::Job::Kind::RasterBatch;
++    j.batch = std::move(batch);
 +    m_impl->enqueue(std::move(j));
 +}
 +
@@ -1951,11 +2061,11 @@ index 0000000..f071ec2
 +    mismatchWords = m_impl->rasterMismWords;
 +}
 +
-+void GsGpuPresentDevice::MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
++bool GsGpuPresentDevice::MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
 +                                          const uint8_t *drawPageMask)
 +{
 +    if (!vram || !EnsureInitialized())
-+        return;
++        return false;
 +    Impl &d = *m_impl;
 +    bool done = false, result = false;
 +    Impl::Job j;
@@ -1968,4 +2078,5 @@ index 0000000..f071ec2
 +    d.enqueue(std::move(j));
 +    std::unique_lock<std::mutex> lk(d.mx);
 +    d.cvDone.wait(lk, [&] { return done || d.stop; });
++    return result;
 +}
