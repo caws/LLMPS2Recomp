@@ -78,12 +78,34 @@ scripts/03_build_game.sh <game_dir> --skip-regen --changed-recomp # fast: overri
 timeout 20 scripts/04_run_game.sh <game_dir>                       # run → log at <game_dir>/tmp/run.txt
 ```
 
+**Invocation gotcha — run from the ENGINE repo dir, not the game dir.** `scripts/` lives in
+this engine repo (the tool's default working dir), NOT in `<game_dir>` (which has no
+`scripts/`). So invoke `scripts/03_build_game.sh <game_dir> …` from the engine dir; do **not**
+`cd <game_dir>` first — `cd <game_dir> && scripts/03_build_game.sh …` fails with
+`scripts/03_build_game.sh: No such file or directory`. Because the Bash tool's cwd **resets to
+the engine dir between calls**, also pass an **absolute** log path when backgrounding
+(`> <game_dir>/tmp/build.log`), and prefer absolute `<game_dir>` over relative paths. Canonical
+launch + verify (override-only fast path):
+
+```
+# from the engine dir (default cwd); background, ~110s for an override-only change
+nohup scripts/03_build_game.sh <game_dir> --skip-regen --changed-recomp > <game_dir>/tmp/build.log 2>&1 & disown
+# poll: not running AND log says complete
+… until: ! pgrep -f 03_build_game.sh && grep -q "Build complete" <game_dir>/tmp/build.log
+# VERIFY the binary is current — the embedded BUILD_TAG must match the source you just edited:
+strings <game_dir>/tmp/ps2EntryRunner | grep -oE 'bld-eur-[a-z0-9-]+'   # then also confirm tag= in run.txt after a run
+```
+
 - `--skip-regen` reuses the game's `tmp/generated/` (skips ps2_recomp). **Any
   `functions.csv` change needs a FULL regen** — do not use `--skip-regen` after editing it.
-- `--changed-recomp` installs only changed files so cmake recompiles fewer unity files.
+- `--changed-recomp` installs only changed files so cmake recompiles fewer unity files (an
+  override-only edit recompiles just one unity unit + links ≈ 110s; a full regen is many minutes).
 - ps2_recomp runs with the game dir as CWD, so the config's relative paths resolve.
 - The built runner is **moved** to `<game_dir>/tmp/ps2EntryRunner` (per-game, no cross-game
   clash); `04` runs that binary and writes the log to `<game_dir>/tmp/run.txt`.
+- **Bump `BUILD_TAG` in `register_overrides.cpp` before every build and confirm the embedded
+  tag** (`strings … tmp/ps2EntryRunner`) **+ `tag=` in `run.txt`** — `strings` on the binary
+  proves which build is on disk *without* a run, catching the stale-binary trap directly.
 
 ## The dominant bug class: truncated / missing functions
 
