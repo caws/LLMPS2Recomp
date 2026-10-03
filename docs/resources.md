@@ -19,6 +19,20 @@ override, and cite the file/function you mirrored.
 > Reading it fixed the decoder in one pass. Treat "I've checked the spec/tables and I'm still stuck" as
 > a sign to go read PCSX2's actual code for that exact path, not as a stopping point.
 
+> ★ **BINDING: whenever you CHANGE the runtime, sanity-check the change against PCSX2's source before
+> finalizing the patch.** Any edit to `tools/<game>/PS2Recomp/ps2xRuntime/` (i.e. any new/updated
+> `patches/NN-*.patch`) is a change to how we model PS2 hardware — so before you capture the patch,
+> read the corresponding PCSX2 subsystem code and confirm your change matches how PCSX2 handles that
+> case: table **sizing**, **fallbacks** for undefined/edge values, and the exact command/mode path.
+> This is the *proactive* companion to the when-stuck rule above — do it on every runtime change, not
+> only when blocked. **A patch that compiles and stops a crash can still be subtly unfaithful.**
+> Concrete case: the GS `ReadVram` psm-bounds fix (a real out-of-bounds read at
+> `psm & 0x3F == 0x3F`) was correct on *sizing* — PCSX2's table is exactly `m_psm[64]`, confirming the
+> array had to grow `0x3F`→`0x40` — but the first-draft *fallback* routed an undefined PSM to
+> `ReadNull`(→0), whereas PCSX2 defaults every undefined slot to **`PSMCT32`** (`GSLocalMemory.cpp`
+> ctor). The compile-and-run check could never have surfaced that; only reading PCSX2 did. Cite the
+> PCSX2 file/function in the patch's `README.md` row.
+
 - **ps2tek** — comprehensive PS2 hardware reference (register maps, DMA channels, and per-subsystem
   behavior/quirks for the EE, IOP, GS, GIF/VIF, IPU, SPU2, CDVD, etc.):
   https://psi-rockin.github.io/ps2tek
