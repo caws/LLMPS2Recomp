@@ -1,0 +1,63 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 3d59328..55980e6 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1403,6 +1403,58 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     processPendingTransfers();
+                 }
+             }
++            // ---- Scratchpad (SPR) DMA: ch8 fromSPR @0x1000D000, ch9 toSPR @0x1000D400 ----
++            // These copy between the 16KB EE scratchpad (SADR) and main RAM (MADR). They were NOT
++            // implemented: the CHCR STR write fell through with no transfer, and since CHCR reads back
++            // with STR clear, the guest's completion poll exits immediately -- so the copy SILENTLY
++            // never happened and the destination kept stale data.
++            //
++            // This is load-bearing for text. LOTR builds each text GIF packet in the scratchpad and
++            // copies it to the display list in 13F030, which forks on size (0x13f05c: slti at,s1,0x41):
++            //   qwc <= 64  -> plain memcpy (13D990)        -- worked, so SHORT strings rendered
++            //   qwc >= 65  -> fromSPR DMA (this channel)   -- silently did nothing
++            // A glyph costs 5 qw (+8 qw header), so every string over ~11 glyphs was dropped: the
++            // language-select header "Please select your language." (25 glyphs = 133 qw) and the whole
++            // legal-screen paragraph. Short single words (English/Polski/... <= 58 qw) took the memcpy
++            // path and drew fine -- which is exactly the "only short strings render" symptom.
++            else if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
++            {
++                const uint32_t sadr = m_ioRegisters[channelBase + 0x80];
++                if (qwc > 0 && m_scratchpad && m_rdram)
++                {
++                    const bool fromSpr = (channelBase == 0x1000D000u);
++                    const uint32_t sprOff = sadr & (PS2_SCRATCHPAD_SIZE - 1u);
++                    uint32_t memPhys = 0;
++                    bool ok = true;
++                    try
++                    {
++                        memPhys = translateAddress(madr);
++                    }
++                    catch (...)
++                    {
++                        ok = false;
++                    }
++                    if (ok && memPhys < PS2_RAM_SIZE && sprOff < PS2_SCRATCHPAD_SIZE)
++                    {
++                        const uint64_t want64 = static_cast<uint64_t>(qwc) * 16ull;
++                        uint32_t bytes = (want64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu
++                                                                  : static_cast<uint32_t>(want64);
++                        bytes = std::min<uint32_t>(bytes, PS2_RAM_SIZE - memPhys);
++                        bytes = std::min<uint32_t>(bytes, PS2_SCRATCHPAD_SIZE - sprOff);
++                        if (bytes > 0)
++                        {
++                            if (fromSpr)
++                                std::memcpy(m_rdram + memPhys, m_scratchpad + sprOff, bytes);
++                            else
++                                std::memcpy(m_scratchpad + sprOff, m_rdram + memPhys, bytes);
++                        }
++                    }
++                }
++                // Report the transfer as finished: clear STR and drain QWC, so the guest's
++                // `poll CHCR & 0x100` loop (13F030 @0x13f0d0) terminates.
++                m_ioRegisters[channelBase] = value & ~0x100u;
++                m_ioRegisters[channelBase + 0x20] = 0u;
++            }
+         }
+         return true;
+     }
