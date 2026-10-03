@@ -44,4 +44,7 @@ fi
 #   timeout 20 scripts/04_run_game.sh <game_dir>
 mkdir -p "$GAME_DIR/tmp"
 echo "log: $RUN_LOG"
+# Game-side overrides (e.g. DBCMAN HLE serving) read gamefiles/ from this env var, so the
+# path is never hardcoded and survives a game-folder rename.
+export PS2_GAMEFILES="$GAME_DIR/gamefiles"
 exec "$RUNNER" "$ELF" > "$RUN_LOG" 2>&1

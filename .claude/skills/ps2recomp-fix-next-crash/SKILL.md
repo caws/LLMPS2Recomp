@@ -11,7 +11,7 @@ first disc/file read) by fixing one frontier issue per cycle. **Fix incrementall
 do not mass-rewrite `functions.csv`.
 
 Everything below operates on a `<game_dir>` (e.g. the LOTR game at
-`~/Documents/projects/decompilations/lotr_decomp`). The engine scripts take the game
+`~/Documents/projects/decompilations/rotk_decomp`). The engine scripts take the game
 dir; the game repo also has `scripts/build.sh` / `scripts/run.sh` wrappers.
 
 ## Hard rules (do not violate)

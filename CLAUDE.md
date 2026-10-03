@@ -26,7 +26,7 @@ first disc/file read, fixing crashes/stalls one frontier at a time. Readability 
 `config.toml`, `functions.csv`, the ELF, and `gamefiles/` are **provided per game** — never
 generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored: the ELF
 (copyright), `gamefiles/`, `tmp/`. The example game lives at
-`~/Documents/projects/decompilations/lotr_decomp`.
+`~/Documents/projects/decompilations/rotk_decomp`.
 
 ## Hard constraints (do not violate)
 
