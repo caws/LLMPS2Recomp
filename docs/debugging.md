@@ -124,3 +124,24 @@ free run (a breakpoint per dispatch), so an 18 s window catches a couple of fram
 Cheaper variants: a `ctx->pc`-sampling override on a suspect function, or just `bt` on a
 per-frame anchor (e.g. the render fn) — but those give one sample; the dispatch-log gives the
 whole loop. Prefer this over static guessing about "which loop am I in".
+
+## 5. Seeing the screen (what's actually rendered)
+
+When you need to know what the game is *displaying* (loading screen vs menu vs black), screenshot the
+**game window only** with [`scripts/05_screenshot.sh`](../scripts/05_screenshot.sh):
+
+```bash
+scripts/05_screenshot.sh --launch <game_dir> 16 0.3   # launch runner, then 16 shots 0.3s apart
+# or, against an already-running runner:
+scripts/05_screenshot.sh <game_dir> [count] [interval]
+```
+
+Two gotchas it handles, both learned the hard way:
+- **Capture method:** `import -window <id>` returns **black** for this GL/double-buffered window. The
+  reliable way is to crop the **composited root** by the window's geometry (so the window must be on
+  top of its screen region — raylib raises it on launch; capture soon after, hence `--launch`).
+- **Content detection:** file size does NOT tell you if a frame has content — a mostly-black frame with
+  a small solid-colour blob (e.g. the magenta "loading" texture) PNG-compresses as tiny as pure black
+  (~500 B). The script scores each shot by **mean brightness** (`fx:mean`>0.0005) and flags the ones
+  with something on screen. Textures **flicker** (on screen only a few frames), so always take a burst
+  and check the flagged frames.
