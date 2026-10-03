@@ -1,0 +1,39 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index c9f5029..87d98f2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1918,6 +1918,18 @@ namespace ps2_stubs
+         uint32_t frameCount = 0u;
+         bool haveFrame = false;
+         MpegDecodedFrame frame;
++
++        // Real libmpeg (guest 0x1175C8) clears the impl status word [impl+0x0] on entry
++        // (0x1175FC "sw zero,0(s0)"); guest-side pollers (sceMpegIsRefBeforePutPicture-style
++        // wrapper at 0x1172F0, NOT stubbed) read [[SceMpeg+0x40]+0]&0xFF as busy(0)/ready(1).
++        if (uint8_t *base = getMemPtr(rdram, mpegAddr))
++        {
++            const uint32_t implAddr = *reinterpret_cast<uint32_t *>(base + 0x40);
++            if (uint8_t *impl = getMemPtr(rdram, implAddr))
++            {
++                *reinterpret_cast<uint32_t *>(impl + 0x0) = 0;
++            }
++        }
+         {
+             PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
+             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+@@ -2079,6 +2091,15 @@ namespace ps2_stubs
+                 *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
+                 *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
+                 *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
++                // Real libmpeg signals picture-ready via [impl+0x0]=1 on the delivered path
++                // (guest 0x117684-88, after _sceMpegFlush). Games that drive decode through a
++                // poll loop on that word (LOTR ROTK job-engine pump 0x13B7B0 -> 0x143FD0 ->
++                // 0x1172F0) hang forever without it. Only signal when an image was actually
++                // written (decoded frame, duplicated frame, or the first-frame blank).
++                if (haveFrame || frameCount == 0u)
++                {
++                    *reinterpret_cast<uint32_t *>(inner + 0x0) = 1;
++                }
+             }
+         }
+ 
