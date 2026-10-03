@@ -38,6 +38,25 @@ and the disasm, then gdb, before asserting or acting.
 - **Resumable mid-function entries.** Generated code is `switch(ctx->pc){...goto...}` with entry
   labels at call-return addresses, so an override can set `ctx->pc` to a label *inside* a function
   to resume there (only at real resume points — verify against the `.cpp`).
+- **★ LAST REGISTRATION WINS — so a `registerFunction` line's POSITION AND GUARD ARE SEMANTICS, not
+  formatting.** `registerFunction` → `replaceFunction` does `table[slot] = fn` (unconditional
+  overwrite, one slot per address). An address is often registered several times, and many
+  registrations sit inside a conditional (`if (getenv(...)) { registerFunction(...); }`). Therefore:
+  - **Never relocate a registration** — not to tidy up, not into a per-module `install()` helper.
+    Moving one (or a call that installs a group) can put it under a *different* guard, or reorder
+    who wins the slot. Symptom: a hook silently stops running. Move the hook's **body**, and leave
+    the `registerFunction` call exactly where it is.
+  - **Keep `#define`s in the same translation unit as their `#if`.** If a `#define LOTR_X 1` drifts
+    into another file, the `#if LOTR_X` left behind quietly becomes 0, the guarded registration
+    disappears, and a *different* hook wins that address. Prefer **env vars** over compile-time
+    switches; they cannot drift.
+  - **A registration is DEAD if a later one for the same address is unconditional** — it can never
+    win. Dead registrations accumulate and hide broken debug switches (a probe that "does nothing"
+    when you enable it is usually this).
+  - After ANY control-plane change run
+    [`check_registrations.py`](../.claude/skills/ps2recomp-fix-next-crash/check_registrations.py)
+    `--game <game_dir>`: it asserts same address / same order / **same guard depth** / same body vs
+    a git ref, and audits every `#if`. `--dead` lists the registrations that can never win.
 
 ## Discipline
 
