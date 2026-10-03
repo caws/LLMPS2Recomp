@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..17506d5 100644
+index 9c39ae2..a295077 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,6 +10,7 @@
@@ -506,7 +506,7 @@ index 9c39ae2..17506d5 100644
 +            if (pd && g_gs2EraOpen && (s_presN % 32u) == 0u && !pixels.empty())
 +            {
 +                char path[512];
-+                std::snprintf(path, sizeof(path), "%s/present_%lu.ppm", pd, (s_presN / 512u) % 4u);
++                std::snprintf(path, sizeof(path), "%s/present_%02lu.ppm", pd, (s_presN / 32u) % 16u);
 +                if (FILE *f = std::fopen(path, "wb"))
 +                {
 +                    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
