@@ -1,0 +1,29 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index bd68b71..0d70a4b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -796,7 +796,13 @@ namespace ps2_stubs
+             return;
+         }
+ 
+-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
++        // LOCAL FIX (LOTR EUR): sceGsLoadImage's vramadr is in 64-word (256-byte)
++        // units, i.e. GS BLOCKS — pass it straight through as the BITBLTBUF DBP. The old
++        // *2048/256 (x8) conversion, truncated by the 14-bit DBP field, scattered every upload
++        // to (addr*8 mod 16384): fonts 8192/9237/10034/10781 landed at 0/8360/14736/4328 and
++        // the font CLUTs 12288/12289/12290 at 0/8/16, so the drawn TEX0s always sampled empty
++        // VRAM (invisible menu text). Verified against the game's own TEX0s and upload census.
++        uint32_t dbp = static_cast<uint32_t>(img.vram_addr);
+         uint32_t dsax = static_cast<uint32_t>(img.x);
+         uint32_t dsay = static_cast<uint32_t>(img.y);
+ 
+@@ -861,7 +867,8 @@ namespace ps2_stubs
+             return;
+         }
+ 
+-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
++        // LOCAL FIX (LOTR EUR): same block-units convention as ExecLoadImage above.
++        uint32_t sbp = static_cast<uint32_t>(img.vram_addr);
+         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
+                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
+                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |

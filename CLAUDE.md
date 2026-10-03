@@ -64,7 +64,10 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
 ## Engine layout
 
 - `scripts/01_setup.sh <game_dir>` — clone + build `ps2_recomp` (gcc-13, SSE4.1) into that
-  game's own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`).
+  game's own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`),
+  then apply **`patches/*.patch`** (our local upstream-PS2Recomp correctness fixes — see
+  `patches/README.md`; idempotent, warns on upstream drift). Keep new tools-clone fixes
+  captured as patches there, or a re-clone loses them.
 - `scripts/03_build_game.sh <game_dir> [flags]` — regen → install → cmake build.
 - `scripts/04_run_game.sh <game_dir>` — run the last-built runner (ELF read from config).
 - `scripts/05_screenshot.sh [--launch] <game_dir> [count] [interval]` — burst-screenshot the **game

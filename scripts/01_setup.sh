@@ -38,6 +38,24 @@ else
     echo "     for a clean slate: rm -rf \"$PS2RECOMP_DIR\" and re-run this.)"
 fi
 
+echo "[2b] Applying local PS2Recomp patches (patches/*.patch)..."
+# Correctness fixes not yet in upstream PS2Recomp (see patches/README.md). Idempotent:
+# skips patches already applied; warns (does not abort) on ones that no longer apply so
+# an upstream pull that absorbed or conflicted a fix is surfaced instead of silently lost.
+shopt -s nullglob
+for p in "$ROOT_DIR"/patches/*.patch; do
+    name="$(basename "$p")"
+    if git -C "$PS2RECOMP_DIR" apply --check "$p" 2>/dev/null; then
+        git -C "$PS2RECOMP_DIR" apply "$p"
+        echo "    applied:         $name"
+    elif git -C "$PS2RECOMP_DIR" apply --reverse --check "$p" 2>/dev/null; then
+        echo "    already applied: $name"
+    else
+        echo "    WARNING: does not apply (upstream drift? fixed upstream?): $name"
+    fi
+done
+shopt -u nullglob
+
 echo "[3/4] Configuring PS2Recomp..."
 cmake -B "$PS2RECOMP_DIR/out/build" -S "$PS2RECOMP_DIR" \
   -DCMAKE_C_COMPILER=/usr/bin/gcc-13 \

@@ -1,0 +1,194 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index 40acd76..51f2d24 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -2,6 +2,35 @@
+ #define PS2_VU1_DETAIL_H
+ 
+ #include <cstdint>
++#include <cstring>
++
++// FTOI float->fixed conversion.
++//
++// The VU saturates out-of-range results; a plain C cast does NOT.  `(int32_t)f` for an f
++// outside int32 range (or NaN) is undefined behaviour, and on x86 SSE (cvttss2si) it yields
++// the "integer indefinite" value 0x80000000 for EVERY out-of-range input -- including
++// positive ones.  Vertices near/behind the camera (huge q from DIV) therefore all collapsed
++// onto one sign-flipped coordinate instead of clamping to the screen edge, which is what
++// produced the streaked triangles radiating from a single point.
++//
++// Mirrors PCSX2 pcsx2/VUops.cpp `floatToInt<Offset>()`.
++static inline uint32_t vuFloatToInt(float f, uint32_t offset)
++{
++    uint32_t uvalue;
++    if (offset != 0u)
++    {
++        const uint32_t scaleBits = 0x3F800000u + (offset << 23); // 2^offset
++        float scale;
++        std::memcpy(&scale, &scaleBits, 4);
++        f *= scale;
++    }
++    std::memcpy(&uvalue, &f, 4);
++
++    if ((uvalue & 0x7F800000u) >= 0x4F000000u) // |f| >= 2^31, or Inf/NaN
++        return (uvalue & 0x80000000u) ? 0x80000000u : 0x7FFFFFFFu;
++
++    return static_cast<uint32_t>(static_cast<int32_t>(f));
++}
+ 
+ // Instruction field extraction helpers
+ static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index f89ba7b..d55091b 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -132,8 +132,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     case 0x10: // FCEQ
+     {
+         uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
++        m_state.vi[1] = ((m_state.clip & 0xFFFFFFu) == imm24) ? 1 : 0;
+         return;
+     }
+     case 0x11: // FCSET
+@@ -144,22 +143,28 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     case 0x12: // FCAND
+     {
+         uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
++        m_state.vi[1] = (((m_state.clip & 0xFFFFFFu) & imm24) != 0) ? 1 : 0;
+         return;
+     }
+     case 0x13: // FCOR
+     {
+         uint32_t imm24 = instr & 0xFFFFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
++        // Mask the clip register to its architectural 24 bits before the compare, exactly as
++        // PCSX2 `_vuFCOR()` does -- otherwise stale high bits make `== 0xFFFFFF` unreachable.
++        // FCAND/FCEQ/FCOR write VI01 by design (hardwired destination); that part is correct.
++        m_state.vi[1] = (((m_state.clip & 0xFFFFFFu) | imm24) == 0xFFFFFFu) ? 1 : 0;
+         return;
+     }
++    // FSEQ/FSAND/FSOR write the It register named by the instruction -- NOT VI01.  (Only the
++    // clip-flag ops FCEQ/FCAND/FCOR have a hardwired VI01 destination.)  Writing VI01 here both
++    // dropped the result the microprogram asked for and clobbered a live register.
++    // Mirrors PCSX2 pcsx2/VUops.cpp `_vuFSEQ()` / `_vuFSAND()` / `_vuFSOR()`.
+     case 0x14: // FSEQ
+     {
+         uint16_t imm12 = instr & 0xFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.status & 0xFFF) == imm12) ? 1 : 0;
++        uint8_t it = VIT(instr);
++        if (it != 0)
++            m_state.vi[it] = ((m_state.status & 0xFFFu) == imm12) ? 1 : 0;
+         return;
+     }
+     case 0x15: // FSSET
+@@ -170,15 +175,17 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     case 0x16: // FSAND
+     {
+         uint16_t imm12 = instr & 0xFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = (int32_t)(m_state.status & imm12);
++        uint8_t it = VIT(instr);
++        if (it != 0)
++            m_state.vi[it] = (int32_t)((m_state.status & 0xFFFu) & imm12);
+         return;
+     }
+     case 0x17: // FSOR
+     {
+         uint16_t imm12 = instr & 0xFFF;
+-        if (1 != 0)
+-            m_state.vi[1] = ((m_state.status | imm12) == 0xFFF) ? 1 : 0;
++        uint8_t it = VIT(instr);
++        if (it != 0)
++            m_state.vi[it] = (((m_state.status & 0xFFFu) | imm12) == 0xFFFu) ? 1 : 0;
+         return;
+     }
+     case 0x18: // FMAND
+@@ -648,11 +655,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                 return;
+             }
+             case 0x40: // RNEXT
+-                return;
+             case 0x41: // RGET
+-                return;
+             case 0x42: // RINIT
+-                return;
+             case 0x43: // RXOR
+                 return;
+             case 0x64: // MFP (Move From P register)
+@@ -677,7 +681,6 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                 doXgkick();
+                 return;
+             case 0x70: // ESADD
+-                return;
+             case 0x71: // ERSADD
+                 return;
+             case 0x72: // ELENG
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 27dde2d..52bf20d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -298,37 +298,22 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x14: // FTOI0
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = static_cast<int32_t>(vs[c]);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+         case 0x15: // FTOI4
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = static_cast<int32_t>(vs[c] * 16.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+         case 0x16: // FTOI12
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = static_cast<int32_t>(vs[c] * 4096.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+         case 0x17: // FTOI15
++        {
++            // Saturating conversion (see vuFloatToInt): a plain C cast is UB on overflow and
++            // collapses every out-of-range vertex onto 0x80000000.
++            static const uint32_t kFtoiOffset[4] = {0u, 4u, 12u, 15u};
++            const uint32_t offset = kFtoiOffset[specialOp - 0x14];
+             for (int c = 0; c < 4; c++)
+             {
+-                int32_t iv = static_cast<int32_t>(vs[c] * 32768.0f);
++                const uint32_t iv = vuFloatToInt(vs[c], offset);
+                 std::memcpy(&result[c], &iv, 4);
+             }
+             applyDest(vtDest, result, dest);
+             return;
++        }
+         case 0x18:
+         case 0x19:
+         case 0x1A:
+@@ -365,7 +350,12 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             if (vs[1] < -w) flags |= 0x08;
+             if (vs[2] > +w) flags |= 0x10;
+             if (vs[2] < -w) flags |= 0x20;
+-            m_state.clip = (m_state.clip << 6) | flags;
++            // The clip register is 24 bits (four generations of 6 flags).  Without this mask
++            // the << 6 pushes junk above bit 23 that never clears, and FCOR's `== 0xFFFFFF`
++            // test can then never match -- silently disabling the microprogram's trivial
++            // reject, so off-screen/near-plane triangles get drawn as streaks.
++            // Mirrors PCSX2 pcsx2/VUops.cpp `_vuCLIP()`.
++            m_state.clip = ((m_state.clip << 6) | flags) & 0xFFFFFFu;
+             return;
+         }
+         case 0x20: // ADDAq
