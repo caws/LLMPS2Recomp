@@ -75,6 +75,27 @@ A frame dispatched **directly by `dispatchLoop`** (no recompiled caller above it
 function the boot jumped to via the engine's dispatch — useful for spotting where an
 indirect (`jalr`) call landed.
 
+### Cross-referencing the generated C++
+
+When raw disasm is hard to follow, **read the generated recompiled C++** —
+`tools/<game>/PS2Recomp/ps2xRuntime/src/runner/FUN_<ADDR>_0x<addr>.cpp` (wiped + regenerated
+every build, so read the freshly-built copy). It is the third ground-truth source alongside
+disasm and gdb, and is often the clearest:
+
+- **Every guest instruction is a comment with its address**
+  (`// 0x12de98: 0x...  sw $v1,0x18($sp)`) — intent and exact guest addr together.
+- **Control flow is explicit**: a backward `goto label_<addr>` is a loop; `case 0x<addr>:` at
+  the top are resumable mid-function entry points; `branch_taken_0x<addr>` booleans show each
+  branch. A spin reads as an obvious `goto` cycle; a mem-op reads as `sltiu len,0x20` chunk loops.
+- **gdb maps a host PC straight to it**: a backtrace frame prints `... at FUN_<addr>.cpp:<line>`,
+  and that line is the exact guest instruction executing — pinpoints the spin with no host decode.
+- **Sample the guest `ctx->pc` over time** (the generated code sets `ctx->pc = 0x...` per block;
+  read it via gdb on the boot thread's frame). If it MOVES between samples, the thread is churning
+  a large workload (e.g. a memcpy over a garbage length), not stuck on a single instruction.
+
+Use it *with* disasm + gdb, not instead of: disasm for quick scans, generated cpp for
+control-flow/loops, gdb for live register/PC values.
+
 ## 3. One-shot override probes (when a guest address misbehaves)
 
 Register a temporary probe on the suspicious address in the game's
