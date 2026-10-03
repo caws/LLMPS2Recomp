@@ -1,8 +1,138 @@
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index c9f5029..87d98f2 100644
+index c9f5029..25dc5ee 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-@@ -1918,6 +1918,18 @@ namespace ps2_stubs
+@@ -502,6 +502,10 @@ namespace ps2_stubs
+         constexpr std::chrono::milliseconds kMpegGetPictureNoFrameWaitTimeout{64};
+         constexpr std::chrono::milliseconds kMpegNoFrameEndTimeout{500};
+         constexpr uint32_t kMpegMaxConsecutiveEmptyGetPicture = 60u;
++        // Data-empty (sceMpegAddCallback, non-stream) callback drive: max guest callback
++        // invocations per sceMpegGetPicture call while the decoder is starved.
++        constexpr uint32_t kMpegDataCallbackMaxCallsPerGetPicture = 512u;
++        constexpr uint32_t kMpegDataCallbackType = 1u;
+ 
+         uint32_t align16(uint32_t value)
+         {
+@@ -905,6 +909,32 @@ namespace ps2_stubs
+             return out;
+         }
+ 
++        // Non-stream callbacks registered via sceMpegAddCallback, matched by callback type.
++        // Type 1 is libmpeg's "bitstream empty" data-request callback: the decode driver calls
++        // it whenever it needs more elementary-stream bytes, and the game's handler answers by
++        // feeding queued sections through sceMpegAddBs (LOTR ROTK registers func=0x13B3A0 with
++        // data=the stream job; the handler pops one queued MPG2 section per call, returns 1, and
++        // on an empty queue sets the job's pump-bypass flag [job+0x102F]=1 and returns 0 so the
++        // game's own job engine ends the movie).
++        std::vector<MpegRegisteredCallback> matchingDataCallbacks(uint32_t mpegAddr, uint32_t callbackType)
++        {
++            std::vector<MpegRegisteredCallback> out;
++            auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
++            if (it == g_mpeg_stub_state.callbacksByMpeg.end())
++            {
++                return out;
++            }
++
++            for (const MpegRegisteredCallback &callback : it->second)
++            {
++                if (!callback.stream && callback.type == callbackType)
++                {
++                    out.push_back(callback);
++                }
++            }
++            return out;
++        }
++
+         void queueStreamCallbackEvent(uint32_t mpegAddr,
+                                       uint32_t streamType,
+                                       uint32_t dataAddr,
+@@ -1359,6 +1389,85 @@ namespace ps2_stubs
+             runtime->guestFree(cbDataAddr);
+         }
+ 
++        // Invoke one non-stream (sceMpegAddCallback) guest callback and return its guest
++        // return value (v0). Args mirror the real libmpeg driver's call into the registered
++        // handler: a0 = the SceMpeg handle, a1 = callback data block (unused by the known
++        // type-1 handlers, passed as 0), a2 = the data pointer given at registration.
++        // Caller must NOT hold g_mpeg_stub_mutex (the handler re-enters sceMpegAddBs).
++        uint32_t dispatchGuestDataCallback(uint8_t *rdram,
++                                           R5900Context *callerCtx,
++                                           PS2Runtime *runtime,
++                                           uint32_t mpegAddr,
++                                           const MpegRegisteredCallback &callback)
++        {
++            if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
++            {
++                return 0u;
++            }
++
++            thread_local PS2Runtime *s_dataCallbackStackRuntime = nullptr;
++            thread_local uint32_t s_dataCallbackStackTop = 0u;
++            if (s_dataCallbackStackRuntime != runtime || s_dataCallbackStackTop == 0u)
++            {
++                constexpr uint32_t kCallbackStackSize = 0x4000u;
++                s_dataCallbackStackRuntime = runtime;
++                s_dataCallbackStackTop = runtime->reserveAsyncCallbackStack(kCallbackStackSize, 16u);
++            }
++
++            R5900Context callbackCtx = *callerCtx;
++            SET_GPR_U32(&callbackCtx, 4, mpegAddr);
++            SET_GPR_U32(&callbackCtx, 5, 0u);
++            SET_GPR_U32(&callbackCtx, 6, callback.data);
++            SET_GPR_U32(&callbackCtx, 7, 0u);
++            SET_GPR_U32(&callbackCtx, 29, (s_dataCallbackStackTop != 0u) ? s_dataCallbackStackTop : (PS2_RAM_SIZE - 0x10u));
++            SET_GPR_U32(&callbackCtx, 31, 0u);
++            callbackCtx.pc = callback.func;
++
++            uint32_t steps = 0u;
++            while (callbackCtx.pc != 0u && !runtime->isStopRequested() && steps < kMpegCallbackMaxSteps)
++            {
++                if (!runtime->hasFunction(callbackCtx.pc))
++                {
++                    static uint32_t badPcLogCount = 0u;
++                    if (badPcLogCount < 16u)
++                    {
++                        std::cerr << "[MPEG:data-callback:bad-pc] cb=0x" << std::hex << callback.func
++                                  << " pc=0x" << callbackCtx.pc
++                                  << " ra=0x" << getRegU32(&callbackCtx, 31)
++                                  << std::dec << std::endl;
++                        ++badPcLogCount;
++                    }
++                    return 0u;
++                }
++
++                PS2Runtime::RecompiledFunction step = runtime->lookupFunction(callbackCtx.pc);
++                if (!step)
++                {
++                    return 0u;
++                }
++
++                {
++                    PS2Runtime::GuestExecutionScope guestExecution(runtime);
++                    step(rdram, &callbackCtx, runtime);
++                }
++                ++steps;
++            }
++
++            if (steps >= kMpegCallbackMaxSteps)
++            {
++                static uint32_t stepLimitLogCount = 0u;
++                if (stepLimitLogCount < 16u)
++                {
++                    std::cerr << "[MPEG:data-callback:step-limit] cb=0x" << std::hex << callback.func
++                              << " pc=0x" << callbackCtx.pc << std::dec << std::endl;
++                    ++stepLimitLogCount;
++                }
++                return 0u;
++            }
++
++            return getRegU32(&callbackCtx, 2);
++        }
++
+         void dispatchStreamCallbacks(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+@@ -1918,6 +2027,18 @@ namespace ps2_stubs
          uint32_t frameCount = 0u;
          bool haveFrame = false;
          MpegDecodedFrame frame;
@@ -21,19 +151,97 @@ index c9f5029..87d98f2 100644
          {
              PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
              std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
-@@ -2079,6 +2091,15 @@ namespace ps2_stubs
+@@ -1948,8 +2069,56 @@ namespace ps2_stubs
+                     currentThreadInfo = it->second;
+             }
+ 
++            // Drive the registered "data empty" callbacks (sceMpegAddCallback type 1) while no
++            // frame is decodable. Real libmpeg's decode driver pulls its bitstream through this
++            // callback; the HLE previously stored the registration and never invoked it, so the
++            // decoder starved forever and only blank frames were ever produced (LOTR ROTK: the
++            // 240 queued MPG2 section records were never fed to sceMpegAddBs). A callback return
++            // of 0 means the game has no more data — the game's own handler then flags its job
++            // engine (bypass [job+0x102F]=1) so the movie ends naturally through guest code; we
++            // just stop waiting.
++            bool refillExhausted = false;
++            {
++                uint32_t refillCalls = 0u;
++                // No !streamEnded gate here: after the decoder reaches end-of-stream the game
++                // still must DISCOVER exhaustion through this callback — its handler finds its
++                // section queue empty, sets the job bypass flag [job+0x102F]=1, and returns 0,
++                // which is how the movie ends on real hardware. Gating on streamEnded left the
++                // player parked in state 4 forever after the last decoded frame.
++                while (refillCalls < kMpegDataCallbackMaxCallsPerGetPicture &&
++                       g_mpeg_stub_state.playbackByMpeg.find(mpegAddr) != g_mpeg_stub_state.playbackByMpeg.end() &&
++                       getPlaybackState(mpegAddr).decodedFrames.empty() &&
++                       !getPlaybackState(mpegAddr).decoderFailed &&
++                       !runtime->isStopRequested())
++                {
++                    const std::vector<MpegRegisteredCallback> dataCallbacks =
++                        matchingDataCallbacks(mpegAddr, kMpegDataCallbackType);
++                    if (dataCallbacks.empty())
++                    {
++                        break;
++                    }
++
++                    uint32_t fed = 0u;
++                    lock.unlock();
++                    for (const MpegRegisteredCallback &callback : dataCallbacks)
++                    {
++                        fed |= dispatchGuestDataCallback(rdram, ctx, runtime, mpegAddr, callback);
++                        ++refillCalls;
++                    }
++                    lock.lock();
++
++                    if (fed == 0u)
++                    {
++                        refillExhausted = true;
++                        break;
++                    }
++                    // Let the decoder worker chew the newly-fed bitstream before re-checking.
++                    g_mpeg_cv.wait_for(lock, std::chrono::milliseconds(2));
++                }
++            }
++
+             const auto noFrameWaitStart = std::chrono::steady_clock::now();
+-            while (runtime &&
++            while (runtime && !refillExhausted &&
+                    g_mpeg_stub_state.playbackByMpeg.find(mpegAddr) != g_mpeg_stub_state.playbackByMpeg.end() &&
+                    getPlaybackState(mpegAddr).decodedFrames.empty() &&
+                    !getPlaybackState(mpegAddr).streamEnded &&
+@@ -2079,6 +2248,14 @@ namespace ps2_stubs
                  *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
                  *reinterpret_cast<uint32_t *>(inner + 0xdc) = 0;
                  *reinterpret_cast<uint32_t *>(inner + 0xe0) = 0;
-+                // Real libmpeg signals picture-ready via [impl+0x0]=1 on the delivered path
-+                // (guest 0x117684-88, after _sceMpegFlush). Games that drive decode through a
-+                // poll loop on that word (LOTR ROTK job-engine pump 0x13B7B0 -> 0x143FD0 ->
-+                // 0x1172F0) hang forever without it. Only signal when an image was actually
-+                // written (decoded frame, duplicated frame, or the first-frame blank).
-+                if (haveFrame || frameCount == 0u)
-+                {
-+                    *reinterpret_cast<uint32_t *>(inner + 0x0) = 1;
-+                }
++                // [impl+0x0] is the WHOLE-JOB completion word the game's job-engine poll reads
++                // ([[job+0x10A0]] via 0x13B7B0 -> 0x143FD0): nonzero means "the movie decode job
++                // finished" and routes the player into its END path (0x2059C0 -> state 5 ->
++                // teardown 0x1E3520). An earlier revision set it =1 per delivered picture, which
++                // ended the movie after its first (blank) frame. Mid-movie continuation is
++                // governed by the data-empty callback above: on exhaustion the game's own
++                // handler flags [job+0x102F]=1 and the job engine completes the job through
++                // guest code, so the HLE must not write a completion here at all.
              }
          }
+ 
+@@ -2091,6 +2268,20 @@ namespace ps2_stubs
+             writeBlankMpegFrame(rdram, imageAddr, width, height);
+         }
+ 
++        {
++            static uint32_t s_serveLogCount = 0u;
++            ++s_serveLogCount;
++            if (s_serveLogCount <= 20u || (s_serveLogCount % 100u) == 0u)
++            {
++                std::cerr << "[MPEG:GetPicture:serve] #" << s_serveLogCount
++                          << " mpeg=0x" << std::hex << mpegAddr
++                          << " img=0x" << imageAddr << std::dec
++                          << " frame=" << frameCount
++                          << " size=" << width << "x" << height
++                          << " have=" << (haveFrame ? 1 : 0) << std::endl;
++            }
++        }
++
+         setReturnS32(ctx, 0);
+     }
  
