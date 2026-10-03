@@ -1,0 +1,37 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 2684ee5..5ad47b5 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -395,6 +395,32 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+ )
+ 
++# Keep the GAME's hand-written override sources OUT of the unity build.
++#
++# The runner mixes two very different kinds of source: machine-generated recompiled functions
++# (thousands of files, which unity batching exists to speed up) and a handful of hand-written
++# override modules copied in from the game repo. Unity-batching the latter is actively harmful:
++#
++#   1. Batches are formed from the source list, so ADDING or REMOVING one override module
++#      re-shuffles every batch after it and forces a near-full rebuild of the runner.
++#   2. Batched files are #include'd into one TU, so file-scope statics (and __LINE__-keyed
++#      names, as PS2_REGISTER_GAME_OVERRIDE generates) can collide across unrelated modules.
++#
++# The engine's scripts/03_build_game.sh writes this manifest when it installs the overrides; each
++# line is one basename in src/runner/. Absent manifest = no overrides to exclude (plain upstream).
++set(GAME_OVERRIDE_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/game_overrides.manifest")
++if(EXISTS "${GAME_OVERRIDE_MANIFEST}")
++    file(STRINGS "${GAME_OVERRIDE_MANIFEST}" GAME_OVERRIDE_BASENAMES)
++    foreach(override_base IN LISTS GAME_OVERRIDE_BASENAMES)
++        set(override_src "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/${override_base}")
++        if(EXISTS "${override_src}")
++            set_source_files_properties("${override_src}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++        endif()
++    endforeach()
++    list(LENGTH GAME_OVERRIDE_BASENAMES override_count)
++    message(STATUS "Game overrides excluded from unity build: ${override_count}")
++endif()
++
+ set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
+ set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+ 

@@ -135,13 +135,43 @@ install_if_changed() {
     fi
 }
 
+# The game's overrides may be organized into SUBFOLDERS (src/overrides/..., src/hle/..., etc.),
+# but the runner's CMake glob is FLAT and non-recursive ("src/runner/*.cpp", and headers are
+# included as "foo.h" from a single include dir), so we collect the tree recursively and install
+# by BASENAME. Two files sharing a basename would flatten onto each other and one would silently
+# vanish from the build — so that is a hard error, not a warning. Same for a basename that
+# collides with a generated file (ours would clobber the recompiled function, or vice versa).
+GAME_SRC_FILES=()
+while IFS= read -r -d '' f; do GAME_SRC_FILES+=("$f"); done \
+    < <(find "$GAME_DIR/src" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 | sort -z)
+
+declare -A GAME_SRC_BY_BASE=()
+for f in "${GAME_SRC_FILES[@]}"; do
+    base="$(basename "$f")"
+    if [[ -n "${GAME_SRC_BY_BASE[$base]:-}" ]]; then
+        echo "ERROR: duplicate override basename '$base' — the flat install would clobber one:"
+        echo "    ${GAME_SRC_BY_BASE[$base]}"
+        echo "    $f"
+        echo "  Override sources are installed into the runner by basename; keep them unique."
+        exit 1
+    fi
+    if [[ -f "$GENERATED/$base" ]]; then
+        echo "ERROR: override '$f' collides with generated file '$GENERATED/$base'."
+        echo "  Rename the override; it would overwrite a recompiled function."
+        exit 1
+    fi
+    GAME_SRC_BY_BASE[$base]="$f"
+done
+
 if [[ "$CHANGED_RECOMP" == true ]]; then
     # Smart install: only touch changed files. Remove stale runner files that are
-    # no longer in the game's generated/ or src/ overrides.
+    # no longer in the game's generated/ or src/ overrides. NOTE: the override check is
+    # against the recursive basename map above — testing "$GAME_DIR/src/$base" would treat
+    # every file living in an src/ SUBFOLDER as stale and delete it on each fast build.
     for f in "$RUNTIME_SRC"/*.cpp; do
         [[ -f "$f" ]] || continue
         base="$(basename "$f")"
-        if [[ ! -f "$GENERATED/$base" ]] && [[ ! -f "$GAME_DIR/src/$base" ]]; then
+        if [[ ! -f "$GENERATED/$base" ]] && [[ -z "${GAME_SRC_BY_BASE[$base]:-}" ]]; then
             echo "  removing stale: $base"
             rm "$f"
         fi
@@ -159,9 +189,29 @@ else
     cp "$GENERATED"/*.h "$RUNTIME_INCLUDE"/
 fi
 
-# Always install the game's overrides (they change independently of the recomp).
-for f in "$GAME_DIR/src/"*.cpp; do install_if_changed "$f" "$RUNTIME_SRC"; done
-for f in "$GAME_DIR/src/"*.h;   do [[ -f "$f" ]] && install_if_changed "$f" "$RUNTIME_INCLUDE"; done
+# Always install the game's overrides (they change independently of the recomp). Flattened by
+# basename from the whole src/ tree (see GAME_SRC_FILES above): .cpp -> runner/, .h -> include/.
+OVERRIDE_CPP_BASENAMES=()
+for f in "${GAME_SRC_FILES[@]}"; do
+    if [[ "${f##*.}" == "h" ]]; then install_if_changed "$f" "$RUNTIME_INCLUDE"
+    else                             install_if_changed "$f" "$RUNTIME_SRC"
+                                     OVERRIDE_CPP_BASENAMES+=("$(basename "$f")"); fi
+done
+
+# Tell the runtime's CMake which runner sources are hand-written game overrides, so it can keep them
+# OUT of the unity build (engine patch 08). Without this, adding/removing an override module
+# re-shuffles the unity batches and forces a near-full rebuild, and file-scope statics from separate
+# modules can collide inside a shared unity TU. Written via install_if_changed semantics (only
+# rewritten when the set changes) so an unchanged manifest never triggers a cmake reconfigure.
+MANIFEST_TMP="$(mktemp)"
+printf '%s\n' "${OVERRIDE_CPP_BASENAMES[@]}" > "$MANIFEST_TMP"
+MANIFEST="$RUNTIME_SRC/game_overrides.manifest"
+if [[ ! -f "$MANIFEST" ]] || ! cmp -s "$MANIFEST_TMP" "$MANIFEST"; then
+    mv "$MANIFEST_TMP" "$MANIFEST"
+    echo "  override manifest updated (${#OVERRIDE_CPP_BASENAMES[@]} module(s), excluded from unity build)"
+else
+    rm -f "$MANIFEST_TMP"
+fi
 
 # --------------------------------------------------
 # Build runner
