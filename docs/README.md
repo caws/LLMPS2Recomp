@@ -33,8 +33,8 @@ mass-rewrite the inputs.**
 
 - **[operating-manual.md](operating-manual.md)** — *the top-level playbook*: how the main agent
   operates — the role, the one-frontier work loop, the toolbox and when to use each, the
-  **verification rule** (ground truth = disassembly + generated recompiled C++ + gdb; everything
-  else is a hypothesis), what progress is and isn't, when to spawn read-only subagents, and when to
+  **verification rule** (ground truth = generated recompiled C++ AND disassembly, co-equal — cross-check
+  both, then validate with gdb; everything else is a hypothesis), what progress is and isn't, when to spawn read-only subagents, and when to
   stop and consult. **Read this first.**
 - **[working-rules.md](working-rules.md)** — *how to work*: verify-don't-trust (disasm is ground
   truth, notes are hypotheses), the dispatch model, the `BUILD_TAG`/incremental/build-% discipline,

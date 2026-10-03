@@ -6,13 +6,14 @@ These are *how to work*, complementing the *what to do* in [debugging.md](debugg
 
 ## Verify, don't trust
 
-**Ground truth ranking: generated C++ (PRIMARY) > disassembly (SECONDARY) > gdb (verifies
-load-bearing claims).** **Lead with the generated `tmp/generated/*.cpp`** — it is what actually runs
-(commented guest addresses, explicit `goto`/`switch(ctx->pc)` flow, resumable entries, visible
-dispatch); read it *first* for any control-flow question and drop to `funcs.py disasm/bounds` only to
-confirm raw bytes/bounds. Treat everything else — docs, this repo's notes, a game's `docs/progress.md`,
-prior findings, even the CSV's function *names* — as a **hypothesis to verify**, not fact. Re-check
-against the generated code (then disasm, then gdb) before asserting or acting.
+**Ground truth = generated C++ AND disassembly, co-equal — cross-check BOTH; then validate
+load-bearing claims with gdb.** The generated `tmp/generated/*.cpp` is what actually runs (commented
+guest addresses, explicit `goto`/`switch(ctx->pc)` flow, resumable entries, visible dispatch), so it's
+the natural entry point for any control-flow question — but corroborate it against `funcs.py
+disasm/bounds` (raw bytes/bounds/instructions), since each surfaces things the other hides. Treat
+everything else — docs, this repo's notes, a game's `docs/progress.md`, prior findings, even the CSV's
+function *names* — as a **hypothesis to verify**, not fact. Re-check against both the generated code
+and the disasm, then gdb, before asserting or acting.
 
 - Notes drift and are sometimes just wrong; the binary is authoritative.
 - **Runtime probes can lie too.** A classic trap: reading `v0` right after a tail-`jr` (e.g. the

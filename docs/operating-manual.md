@@ -79,23 +79,25 @@ workflow.
 
 ## 4. Ground truth and the verification rule
 
-**Ground truth is the generated recompiled C++ (PRIMARY), the disassembly (SECONDARY), and live
-gdb (MUST verify load-bearing claims).** Everything else — project notes, `docs/`, memory, prior
-findings, a subagent/workflow synthesis, even a runtime probe's printed value — is a **hypothesis to
-verify against ground truth, not a fact.**
+**Ground truth is the generated recompiled C++ AND the disassembly — co-equal; cross-check BOTH.
+Then validate load-bearing claims on live state with gdb.** Everything else — project notes, `docs/`,
+memory, prior findings, a subagent/workflow synthesis, even a runtime probe's printed value — is a
+**hypothesis to verify against ground truth, not a fact.**
 
-> **LEAD WITH THE GENERATED CODE.** The generated `tmp/generated/FUN_<addr>_0x<addr>.cpp` is the
-> *first* thing to read for any non-trivial control-flow question — it is what actually runs, with
-> every guest instruction as a commented address, explicit `goto`/`switch(ctx->pc)` control flow,
-> resumable entry labels, and dispatchability you can see. Drop to disasm to *confirm* raw bytes/
-> bounds/an instruction, not as the starting point. Reading disasm first (and skipping the generated
-> code) is a recurring mistake — it hides resumable entries and cross-unit dispatch that the
-> generated code makes obvious. Then **gdb to verify** any load-bearing claim on live state.
+> **USE BOTH THE GENERATED CODE AND THE DISASM.** The generated `tmp/generated/FUN_<addr>_0x<addr>.cpp`
+> is what actually runs, with every guest instruction as a commented address, explicit
+> `goto`/`switch(ctx->pc)` control flow, resumable entry labels, and dispatchability you can see — so
+> it's the natural entry point for any non-trivial control-flow question. But it is not the *only*
+> ground truth: corroborate against the disasm (`funcs.py disasm/bounds`) for raw bytes, bounds, and
+> exact instructions. Each surfaces what the other hides — reading *only* disasm hides resumable
+> entries and cross-unit dispatch; reading *only* the generated code can miss a truncated/over-bound
+> CSV bound that the disasm reveals. Then **gdb to verify** any load-bearing claim on live state.
 
-- **Cross-read all three, generated-code-first.** Start in the generated C++; corroborate against the
-  disassembly; verify on live state with gdb when it matters. The generated code often makes control
-  flow, resumable entries, and dispatchability clear where raw disasm is opaque. A claim that holds in
-  one but not another is not yet verified.
+- **Cross-read both, then verify with gdb.** Read the generated C++ and the disassembly together and
+  make sure they agree; verify on live state with gdb when it matters. The generated code often makes
+  control flow, resumable entries, and dispatchability clear where raw disasm is opaque, while the
+  disasm is authoritative on bytes/bounds. A claim that holds in one but not the other is not yet
+  verified.
 - **A confident analysis is still a hypothesis.** This session, three confidently-stated analyses
   (two from workflow syntheses, one from prior notes) were wrong and were caught only by checking the
   disasm / generated code / an empirical run. *Always re-derive a load-bearing claim from ground

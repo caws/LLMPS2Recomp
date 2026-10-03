@@ -117,8 +117,8 @@ frontier/override in the game repo's `docs/progress.md`.
 The **game-agnostic methodology** (the techniques, not this game's facts) is documented in
 [`docs/`](docs/README.md). Start with [`operating-manual.md`](docs/operating-manual.md) — the
 top-level playbook for how the main agent operates (the work loop, the toolbox, the **verification
-rule** — ground-truth ranking: **generated recompiled C++ (PRIMARY, read it FIRST) > disassembly
-(confirm bytes/bounds) > gdb (verify load-bearing claims)**; everything else is a hypothesis;
+rule** — ground truth = **generated recompiled C++ AND disassembly together (co-equal; cross-check
+BOTH), then validate load-bearing claims with gdb**; everything else is a hypothesis;
 what progress is; when to spawn read-only subagents; when to stop). Then [`working-rules.md`](docs/working-rules.md)
 (verify-don't-trust; the dispatch model; `BUILD_TAG` + incremental discipline) and: [`debugging.md`](docs/debugging.md) (run-log triage, the
 **gdb-under-parent** recipe, **dispatch-logging loop maps**, profiling), [`functions-csv.md`](docs/functions-csv.md) (the

@@ -159,6 +159,11 @@ if [ "$SKIP_BUILD" = false ]; then
     echo
     echo "[3/3] Building ps2EntryRunner..."
     echo "    build type: $BUILD_TYPE  (jobs: ${BUILD_JOBS:-6})"
+    # Remove the game's runnable binary BEFORE building, so a failed/incomplete build can't
+    # leave a STALE ps2EntryRunner that 04_run_game.sh would silently run as if it were fresh.
+    # The new binary is mv'd into place only after a successful cmake build below; if the build
+    # fails, tmp/ps2EntryRunner is simply absent (04 errors out) rather than running old code.
+    rm -f "$GAME_DIR/tmp/ps2EntryRunner"
     # Link with lld — the ~900MB runner relinks in seconds vs minutes on GNU ld.
     # Fallback if lld misbehaves: -fuse-ld=gold, or drop the flag entirely.
     # NOTE: debug info (-g, from RelWithDebInfo) is kept on purpose — gdb on the runner

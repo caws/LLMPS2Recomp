@@ -43,6 +43,11 @@ fi
 # tmp/run.txt, NOT the terminal. Wrap the invocation in `timeout` to cap a spin:
 #   timeout 20 scripts/04_run_game.sh <game_dir>
 mkdir -p "$GAME_DIR/tmp"
+# ALWAYS remove the old log first, so the run.txt that exists afterward is GUARANTEED to be
+# from THIS run. If the runner fails to launch/write, run.txt will be absent/empty rather than
+# a stale leftover that looks like a fresh result (this bit us: a stale run.txt was mistaken for
+# the current run, hiding a fresh binary's output).
+rm -f "$RUN_LOG"
 echo "log: $RUN_LOG"
 # Game-side overrides (e.g. DBCMAN HLE serving) read gamefiles/ from this env var, so the
 # path is never hardcoded and survives a game-folder rename.
