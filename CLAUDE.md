@@ -74,6 +74,13 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   loop + manual run) must use DISTINCT log files so they never interleave. Read the log after;
   never pipe a raw run into `head`/`tail`.
 - **Temp/scratch files go in the engine `tmp/`** (gitignored). Clean them up.
+- **★ NEVER DELETE FILES OUTSIDE THIS ENGINE FOLDER OR THE GAME REPO FOLDER.** Deletion is
+  confined to `LLMPS2Recomp/` and `<game_dir>/` (plus the session scratchpad). Anything else —
+  the user's home, other projects, system paths, sibling repos — is **off limits**, no matter how
+  stale, redundant, or "obviously junk" it looks, and regardless of disk pressure. If space is
+  needed or a file elsewhere looks removable, **say so and let the user decide** — do not delete
+  it yourself. Inside the two allowed folders, still prefer surfacing over deleting anything you
+  did not create (see the `.bak` runner binaries).
 - **No `git commit` / destructive git** unless explicitly asked.
 - No "auto mode" — only take actions the user has asked for.
 
