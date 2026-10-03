@@ -48,6 +48,9 @@ cmake -B "$PS2RECOMP_DIR/out/build" -S "$PS2RECOMP_DIR" \
 echo "[4/4] Building ps2_recomp..."
 cmake --build "$PS2RECOMP_DIR/out/build" --target ps2_recomp -j"$(nproc)"
 
+echo "[5/6] Building ps2_analyzer..."
+cmake --build "$PS2RECOMP_DIR/out/build" --target ps2_analyzer -j"$(nproc)"
+
 echo
 echo "Setup complete for $GAME."
 echo "  ps2_recomp: $PS2RECOMP_DIR/out/build/ps2xRecomp/ps2_recomp"
