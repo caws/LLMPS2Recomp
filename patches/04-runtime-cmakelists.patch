@@ -1,8 +1,16 @@
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 91a23c2..efd9a97 100644
+index 91a23c2..08f783d 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
-@@ -402,6 +402,32 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+@@ -351,6 +351,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_gs_memory.cpp
+     src/lib/ps2_gs_rasterizer.cpp
+     src/lib/ps2_iop_host.cpp
++    src/lib/ps2_dbcman_hle.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_runtime.cpp
+@@ -402,6 +403,32 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
  )
  

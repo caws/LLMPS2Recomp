@@ -1,0 +1,40 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index 40acd76..51f2d24 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -2,6 +2,35 @@
+ #define PS2_VU1_DETAIL_H
+ 
+ #include <cstdint>
++#include <cstring>
++
++// FTOI float->fixed conversion.
++//
++// The VU saturates out-of-range results; a plain C cast does NOT.  `(int32_t)f` for an f
++// outside int32 range (or NaN) is undefined behaviour, and on x86 SSE (cvttss2si) it yields
++// the "integer indefinite" value 0x80000000 for EVERY out-of-range input -- including
++// positive ones.  Vertices near/behind the camera (huge q from DIV) therefore all collapsed
++// onto one sign-flipped coordinate instead of clamping to the screen edge, which is what
++// produced the streaked triangles radiating from a single point.
++//
++// Mirrors PCSX2 pcsx2/VUops.cpp `floatToInt<Offset>()`.
++static inline uint32_t vuFloatToInt(float f, uint32_t offset)
++{
++    uint32_t uvalue;
++    if (offset != 0u)
++    {
++        const uint32_t scaleBits = 0x3F800000u + (offset << 23); // 2^offset
++        float scale;
++        std::memcpy(&scale, &scaleBits, 4);
++        f *= scale;
++    }
++    std::memcpy(&uvalue, &f, 4);
++
++    if ((uvalue & 0x7F800000u) >= 0x4F000000u) // |f| >= 2^31, or Inf/NaN
++        return (uvalue & 0x80000000u) ? 0x80000000u : 0x7FFFFFFFu;
++
++    return static_cast<uint32_t>(static_cast<int32_t>(f));
++}
+ 
+ // Instruction field extraction helpers
+ static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }

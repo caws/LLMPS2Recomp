@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index c9f5029..25dc5ee 100644
+index c9f5029..51df6e0 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 @@ -502,6 +502,10 @@ namespace ps2_stubs
@@ -224,7 +224,7 @@ index c9f5029..25dc5ee 100644
              }
          }
  
-@@ -2091,6 +2268,20 @@ namespace ps2_stubs
+@@ -2091,6 +2268,27 @@ namespace ps2_stubs
              writeBlankMpegFrame(rdram, imageAddr, width, height);
          }
  
@@ -238,6 +238,13 @@ index c9f5029..25dc5ee 100644
 +                          << " img=0x" << imageAddr << std::dec
 +                          << " frame=" << frameCount
 +                          << " size=" << width << "x" << height
++                          // `size` above is the DECLARED stream size (playback.width/height from
++                          // the sequence header). writeDecodedFrameToGuest() instead sizes the
++                          // column-strip store from frame.width -- strips beyond frame.width/16
++                          // are never touched -- so when the two disagree the right edge of the
++                          // picture is left unwritten. Log both.
++                          << " decoded=" << (haveFrame ? frame.width : -1)
++                          << "x" << (haveFrame ? frame.height : -1)
 +                          << " have=" << (haveFrame ? 1 : 0) << std::endl;
 +            }
 +        }

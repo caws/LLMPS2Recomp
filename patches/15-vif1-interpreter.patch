@@ -1,0 +1,529 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index c0af2a3..6b4e36d 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,5 +1,7 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ enum VIFCmd : uint8_t
+@@ -28,8 +30,108 @@ enum VIFCmd : uint8_t
+ 
+ namespace
+ {
++    // PS2X_VIF_STRIPLOG=1 (diagnostic, default OFF). Cycle 76: the FMV's 4th movie column quad
++    // never reaches GS; the arbiter is submitted only columns 0/1/2 on PATH2, so the shortfall is
++    // at or upstream of VIF1. Scan a buffer for movie-strip quad tags and report their columns.
++    //
++    // ⚠ A strip packet is TWO tags -- [A+D setup: nloop=1 flg=0 nreg=1][quad: nloop=4 flg=0
++    // nreg=3] -- so the quad tag is NOT at offset 0. Two earlier probes checked only offset 0,
++    // matched nothing, and produced two WRONG eliminations. This walks every tag. Validate any
++    // "found nothing" result against a known-positive before believing it.
++    void vifScanStripColumns(const char *what, const uint8_t *data, uint32_t sizeBytes)
++    {
++        static const bool on = [] {
++            const char *e = std::getenv("PS2X_VIF_STRIPLOG");
++            return e != nullptr && e[0] != '\0' && e[0] != '0';
++        }();
++        if (!on || !data || sizeBytes < 32u)
++            return;
++
++        int cols[8];
++        int nCols = 0;
++        uint32_t off = 0u;
++        while (off + 16u <= sizeBytes && nCols < 8)
++        {
++            uint64_t tlo = 0, thi = 0;
++            std::memcpy(&tlo, data + off, 8);
++            std::memcpy(&thi, data + off + 8, 8);
++            const uint32_t nl = static_cast<uint32_t>(tlo & 0x7FFFu);
++            const uint8_t fl = static_cast<uint8_t>((tlo >> 58) & 0x3u);
++            uint32_t nr = static_cast<uint32_t>((tlo >> 60) & 0xFu);
++            if (nr == 0u)
++                nr = 16u;
++            const uint64_t payload = (fl == 0u)   ? (uint64_t)nr * nl * 16ull
++                                     : (fl == 1u) ? (((uint64_t)nr * nl + 1ull) >> 1) * 16ull
++                                                  : (uint64_t)nl * 16ull;
++            if (fl == 0u && nl == 4u && nr == 3u)
++            {
++                int slot = -1;
++                for (uint32_t r = 0; r < nr; ++r)
++                {
++                    const uint8_t rd = static_cast<uint8_t>((thi >> (r * 4)) & 0xFu);
++                    if (rd == 0x05u || rd == 0x04u)
++                        slot = static_cast<int>(r);
++                }
++                const uint32_t voff = off + 16u + static_cast<uint32_t>(slot < 0 ? 0 : slot) * 16u;
++                if (slot >= 0 && voff + 16u <= sizeBytes)
++                {
++                    uint64_t vlo = 0;
++                    std::memcpy(&vlo, data + voff, 8);
++                    const float vx = static_cast<float>(vlo & 0xFFFFu) / 16.0f;
++                    if (vx >= 1700.0f && vx <= 2400.0f)
++                        cols[nCols++] = static_cast<int>((vx - 1792.0f) / 128.0f);
++                }
++            }
++            if (payload == 0ull && fl != 0u)
++                break;
++            off += 16u + static_cast<uint32_t>(payload);
++        }
++
++        if (nCols > 0)
++        {
++            static uint64_t n = 0;
++            ++n;
++            if (n <= 60ull || (n % 500ull) == 0ull)
++            {
++                std::fprintf(stderr, "[VIF:strips] #%llu %s size=%u count=%d cols=",
++                             (unsigned long long)n, what, sizeBytes, nCols);
++                for (int i = 0; i < nCols; ++i)
++                    std::fprintf(stderr, "%d%s", cols[i], (i + 1 < nCols) ? "," : "");
++                std::fprintf(stderr, "\n");
++            }
++        }
++    }
++
+     constexpr uint8_t kGifFmtImage = 2u;
+ 
++    // PS2X_VIF_DIRECTCARRY=0 kills the cycle-85 fix: consume a pending Path2 image continuation
++    // INSIDE the DIRECT handler (payload-aligned) instead of raw-eating stream bytes at the top
++    // of the parse loop. With PS2X_DMA_REFVIF embedding TTE tag words, the stream between DIRECT
++    // payloads is VIF COMMANDS (masked-tag NOPs + the ref's own DIRECT wrapper); the top-of-loop
++    // raw consume ate those embedded words as pixels -- one garbage qword per ref tag = the FMV
++    // dot lattice (cycle 85, run_c85C). On hardware the pending-image state lives in the GIF
++    // (current tag's remaining nloop, PCSX2 Gif_Path::gifTag / Gif_Unit), and the VIF stays in
++    // command state -- this reproduces that: commands parse, DIRECT payloads feed the image.
++    // Measured stream shape (run_c85D chain #3): [NOP NOP NOP DIRECT imm=1][GIFtag IMAGE
++    // nloop=0x7fff] then a ref of qwc=0x7fff raw pixels whose own DIRECT wrapper rides in its
++    // TTE tag words -- the game DEPENDS on the embed, and every continuation is DIRECT-wrapped.
++    const bool s_vifDirectCarry = [] {
++        const char *e = std::getenv("PS2X_VIF_DIRECTCARRY");
++        return !(e != nullptr && e[0] == '0'); // default ON (correctness fix)
++    }();
++
++    // PS2X_VIF_DIRECTSPAN=0 kills the cycle-86 fix: a DIRECT whose declared qword count exceeds
++    // the current chain buffer keeps consuming from the NEXT buffer(s). VIF is a state machine --
++    // PCSX2's `vif1.tag.size` persists across DMA transfers -- and the game issues DIRECT imm=0
++    // (= 65536 qw) spans that our per-buffer clamp cut short, leaving the remainder to be
++    // tag-parsed raw at the next entry (the 223984-B DESYNC packets, run_c86B). TU-static: one VIF1.
++    const bool s_vifDirectSpan = [] {
++        const char *e = std::getenv("PS2X_VIF_DIRECTSPAN");
++        return !(e != nullptr && e[0] == '0'); // default ON (correctness fix)
++    }();
++    uint32_t g_vif1DirectSpanRemainQw = 0u;
++    bool g_vif1DirectSpanHl = false;
++
+     uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
+     {
+         if (!data || sizeBytes < 16u)
+@@ -43,6 +145,53 @@ namespace
+ 
+         return static_cast<uint32_t>(tagLo & 0x7FFFu);
+     }
++
++    // Cycle 81/82: gifImageQwcFromTag reads ONLY the first tag, so it misses an IMAGE tag that
++    // sits BEHIND a BITBLTBUF/TRXREG/TRXDIR setup tag -- the normal texture-upload shape. When
++    // that image spans the DIRECT boundary the carry-over is never set and the NEXT DIRECT is
++    // submitted RAW starting mid-image, which processGIFPacket misreads as a bogus PACKED tag
++    // (measured 100% malformed level transfers, cont.137). Walk the DIRECT payload's GIFtags
++    // exactly as processGIFPacket does and return how many image qwords extend PAST this payload
++    // (0 if it ends on a tag boundary). Advances match processGIFPacket: PACKED nloop*nreg*16,
++    // REGLIST ceil(nloop*nreg/2)*16 (8B entries padded to qword), IMAGE nloop*16.
++    uint32_t directTrailingImageQwc(const uint8_t *data, uint32_t sizeBytes)
++    {
++        if (!data)
++            return 0u;
++        uint32_t off = 0u;
++        while (off + 16u <= sizeBytes)
++        {
++            uint64_t lo = 0u;
++            std::memcpy(&lo, data + off, sizeof(lo));
++            off += 16u;
++            const uint8_t flg = static_cast<uint8_t>((lo >> 58) & 0x3u);
++            const uint32_t nloop = static_cast<uint32_t>(lo & 0x7FFFu);
++            uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++            if (flg == 0u) // PACKED
++            {
++                off += nloop * nreg * 16u;
++            }
++            else if (flg == 1u) // REGLIST
++            {
++                off += ((nloop * nreg + 1u) / 2u) * 16u;
++            }
++            else if (flg == kGifFmtImage) // IMAGE
++            {
++                const uint32_t need = nloop * 16u;
++                if (off + need > sizeBytes)
++                    return nloop - (sizeBytes - off) / 16u; // image spills past this payload
++                off += need;
++            }
++            else // flg == 3 (disabled) -- no payload
++            {
++            }
++            if (off > sizeBytes) // a PACKED/REGLIST tag overran -> malformed payload, stop
++                break;
++        }
++        return 0u;
++    }
+ }
+ 
+ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
+@@ -244,6 +393,14 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+     }
+ }
+ 
++// External-linkage reset for the TU-static DIRECT-span state (called from the VIF1 reset
++// sites in ps2_memory.cpp; declared extern there -- no header change).
++void ps2xVif1ResetDirectSpan()
++{
++    g_vif1DirectSpanRemainQw = 0u;
++    g_vif1DirectSpanHl = false;
++}
++
+ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
+@@ -258,14 +415,90 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
++    // Count the movie strips PRESENT IN THE INPUT BUFFER, before any VIF parsing. If this shows
++    // 4 while the arbiter is submitted 3, VIF drops one; if it shows 3, the DMA that filled this
++    // buffer is already short and the search moves upstream to the chain walker.
++    vifScanStripColumns("INPUT", data, sizeBytes);
++
+     if (sizeBytes == 0u)
+         return;
+ 
+     uint32_t pos = 0;
+ 
++    // Cycle 86 (PS2X_VIF_DIRECTSPAN): an open DIRECT span from the previous buffer consumes
++    // FIRST -- this data is mid-span Path2 GIF payload, never VIF commands. Delivery mirrors the
++    // DIRECT handler: pending-image continuation (payload-aligned, cycle 85) first, then the
++    // remainder submitted for tag parse with carry detection.
++    if (s_vifDirectSpan && g_vif1DirectSpanRemainQw != 0u)
++    {
++        const uint32_t spanQw = std::min<uint32_t>(g_vif1DirectSpanRemainQw, sizeBytes / 16u);
++        if (spanQw != 0u)
++        {
++            static const bool s_spanLog = [] {
++                const char *e = std::getenv("PS2X_VIF_DCLOG");
++                return e != nullptr && e[0] != '\0' && e[0] != '0';
++            }();
++            if (s_spanLog)
++            {
++                static uint64_t s_n = 0ull;
++                if (++s_n <= 200ull || (s_n % 1000ull) == 0ull)
++                    std::fprintf(stderr,
++                                 "[VIF:dspan] #%llu remain=%u chunk=%u buf=%u pendImg=%u\n",
++                                 (unsigned long long)s_n, g_vif1DirectSpanRemainQw, spanQw,
++                                 sizeBytes, m_vif1PendingPath2ImageQwc);
++            }
++            uint32_t imgQw = 0u;
++            if (s_vifDirectCarry && m_vif1PendingPath2ImageQwc != 0u)
++            {
++                imgQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, spanQw);
++                uint32_t left = imgQw;
++                uint32_t off = 0u;
++                while (left > 0u)
++                {
++                    const uint32_t chunk = std::min<uint32_t>(left, 0x7FFFu);
++                    const bool final = (m_vif1PendingPath2ImageQwc == chunk);
++                    std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunk) * 16u, 0u);
++                    const uint64_t imageTag =
++                        static_cast<uint64_t>(chunk) |
++                        (final ? (1ull << 15) : 0ull) |
++                        (static_cast<uint64_t>(kGifFmtImage) << 58);
++                    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                    std::memcpy(imagePacket.data() + 16u, data + off,
++                                static_cast<size_t>(chunk) * 16u);
++                    submitGifPacket(GifPathId::Path2, imagePacket.data(),
++                                    static_cast<uint32_t>(imagePacket.size()), true,
++                                    m_vif1PendingPath2DirectHl);
++                    m_vif1PendingPath2ImageQwc -= chunk;
++                    left -= chunk;
++                    off += chunk * 16u;
++                }
++                if (m_vif1PendingPath2ImageQwc == 0u)
++                    m_vif1PendingPath2DirectHl = false;
++            }
++            const uint32_t restQw = spanQw - imgQw;
++            if (restQw > 0u)
++            {
++                const uint8_t *restData = data + static_cast<size_t>(imgQw) * 16u;
++                submitGifPacket(GifPathId::Path2, restData, restQw * 16u, true,
++                                g_vif1DirectSpanHl);
++                const uint32_t carry = directTrailingImageQwc(restData, restQw * 16u);
++                if (carry != 0u)
++                {
++                    m_vif1PendingPath2ImageQwc = carry;
++                    m_vif1PendingPath2DirectHl = g_vif1DirectSpanHl;
++                }
++            }
++            g_vif1DirectSpanRemainQw -= spanQw;
++            pos = spanQw * 16u;
++        }
++    }
++
+     while (pos + 4 <= sizeBytes)
+     {
+-        if (m_vif1PendingPath2ImageQwc != 0u)
++        // With PS2X_VIF_DIRECTCARRY the pending image is consumed inside the DIRECT handler
++        // (payload-aligned); this position-blind raw consume would eat the REFVIF-embedded tag
++        // words as pixels. Kept for the legacy (=0) path only.
++        if (!s_vifDirectCarry && m_vif1PendingPath2ImageQwc != 0u)
+         {
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             if (availableQw == 0u)
+@@ -274,6 +507,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             }
+ 
+             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
++
++            // PS2X_VIF_IMGCONSUME=1 (probe, cycle 82b). Disambiguate fix #1's failure: DETECTION
++            // (wrong carry amount) vs CONSUMPTION (this synthesized-image path). Log each consume:
++            // pending, availableQw, chunkQw, and the 16 bytes at data+pos being fed as image -- if
++            // they are NOT plausible image pixels (e.g. they look like a GIFtag / VIF command), the
++            // carry amount was wrong and we are eating real stream (detection bug). Correlate with
++            // TRXORIGIN: if the synthesized transfers are OK, consumption works and detection is the
++            // culprit; if they are BAD, the consumption/transfer-state continuation is itself broken.
++            static const bool s_imgConsumeLog = [] {
++                const char *e = std::getenv("PS2X_VIF_IMGCONSUME");
++                return e != nullptr && e[0] != '\0' && e[0] != '0';
++            }();
++            if (s_imgConsumeLog)
++            {
++                static uint64_t s_n = 0ull;
++                if (++s_n <= 60ull || (s_n % 500ull) == 0ull)
++                {
++                    char hb[52];
++                    hb[0] = '\0';
++                    for (int k = 0; k < 16 && (pos + k) < sizeBytes; ++k)
++                        std::snprintf(hb + k * 3, 4, "%02x ", data[pos + k]);
++                    std::fprintf(stderr,
++                                 "[VIF:imgconsume] #%llu pending=%u availQw=%u chunkQw=%u pos=%u/%u | img: %s\n",
++                                 (unsigned long long)s_n, m_vif1PendingPath2ImageQwc, availableQw,
++                                 chunkQw, pos, sizeBytes, hb);
++                }
++            }
++
+             std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+             const uint64_t imageTag =
+                 static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+@@ -460,31 +721,204 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             uint32_t qwCount = imm;
+             if (qwCount == 0)
+                 qwCount = 65536;
++            const uint32_t declaredQw = qwCount;
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             const bool truncated = qwCount > availableQw;
+             if (qwCount > availableQw)
+                 qwCount = availableQw;
+ 
++            // PS2X_VIF_DIRECTBIG=<qw> (diagnostic, default OFF). Cycle 77: the malformed post-FMV
++            // BITBLTBUF/TRXREG come from 164 KB - 902 KB buffers that are NOT GIF data (one holds
++            // a 4x4 float matrix, another a pixel gradient) and whose byte 0 is already not a
++            // GIFtag. This is the only site that can submit a slab that large: `imm == 0` means
++            // 65536 qw (1 MB) -- PCSX2-faithful (`Vif_Codes.cpp:148`,
++            // `vif1.tag.size = vifImm ? (vifImm*4) : (65536*4)`) -- clamped here to the rest of
++            // the buffer. So the question is whether we are REACHING this command on data that
++            // was never a VIF command stream. Dump the command in context: if the preceding bytes
++            // do not look like VIF commands, the chain buffer is carrying non-VIF payload and the
++            // desync is upstream, in what the chain walker concatenated.
++            static const uint32_t s_directBig = [] {
++                const char *e = std::getenv("PS2X_VIF_DIRECTBIG");
++                return (e != nullptr && e[0] != '\0') ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
++            }();
++            if (s_directBig != 0u && qwCount >= s_directBig)
++            {
++                static uint64_t s_n = 0ull;
++                if (++s_n <= 30ull)
++                {
++                    std::fprintf(stderr,
++                                 "[VIF:directbig] #%llu imm=%u qw=%u (%u B) pos=%u/%u trunc=%d hl=%d\n",
++                                 (unsigned long long)s_n, (unsigned)imm, qwCount, qwCount * 16u,
++                                 pos, sizeBytes, truncated ? 1 : 0,
++                                 (opcode == VIF_DIRECTHL) ? 1 : 0);
++                    const uint32_t from = (pos >= 32u) ? (pos - 32u) : 0u;
++                    for (uint32_t o = from; o < pos + 32u && o < sizeBytes; o += 16u)
++                    {
++                        std::fprintf(stderr, "    %s +%06X  ", (o < pos) ? "pre " : "pay ", o);
++                        for (uint32_t b = 0; b < 16u && (o + b) < sizeBytes; ++b)
++                            std::fprintf(stderr, "%02X", data[o + b]);
++                        std::fprintf(stderr, "\n");
++                    }
++                }
++            }
++
+             if (qwCount > 0)
+             {
+                 const bool directHl = (opcode == VIF_DIRECTHL);
+-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+ 
+-                const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
+-                if (imageQw != 0u)
++                // ★ Cycle-85 fix (PS2X_VIF_DIRECTCARRY): a pending Path2 image continuation is
++                // satisfied by THIS DIRECT's payload -- the game wraps every image chunk in its
++                // ref tag's TTE DIRECT (measured, run_c85D chain #3), so the payload IS the
++                // continuation. Synthesize the IMAGE-tagged packet exactly like the legacy
++                // top-of-loop consume did, but payload-aligned: the embedded tag words upstream
++                // were already parsed as VIF commands and never leak into the image.
++                uint32_t imgQw = 0u;
++                if (s_vifDirectCarry && m_vif1PendingPath2ImageQwc != 0u)
+                 {
+-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
+-                    if (imageQw > inlineImageQw)
++                    imgQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
++                    // PS2X_VIF_DCLOG=1 (probe, cycle 86, no behaviour change): each payload-aligned
++                    // consume with its pending/span/truncation context -- correlates a consume with
++                    // the gifwalk/TRXORIGIN records that follow it.
++                    static const bool s_dcLog = [] {
++                        const char *e = std::getenv("PS2X_VIF_DCLOG");
++                        return e != nullptr && e[0] != '\0' && e[0] != '0';
++                    }();
++                    if (s_dcLog)
++                    {
++                        static uint64_t s_n = 0ull;
++                        if (++s_n <= 200ull || (s_n % 1000ull) == 0ull)
++                            std::fprintf(stderr,
++                                         "[VIF:dcarry] #%llu pending=%u dirQw=%u imgQw=%u pos=%u/%u trunc=%d\n",
++                                         (unsigned long long)s_n, m_vif1PendingPath2ImageQwc,
++                                         qwCount, imgQw, pos, sizeBytes, truncated ? 1 : 0);
++                    }
++                    uint32_t left = imgQw;
++                    uint32_t off = 0u;
++                    while (left > 0u)
+                     {
+-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
+-                        m_vif1PendingPath2DirectHl = directHl;
++                        // nloop is 15-bit; a bigger chunk must be split or the tag under-declares.
++                        const uint32_t chunk = std::min<uint32_t>(left, 0x7FFFu);
++                        const bool final = (m_vif1PendingPath2ImageQwc == chunk);
++                        std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunk) * 16u, 0u);
++                        const uint64_t imageTag =
++                            static_cast<uint64_t>(chunk) |
++                            (final ? (1ull << 15) : 0ull) |
++                            (static_cast<uint64_t>(kGifFmtImage) << 58);
++                        std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                        std::memcpy(imagePacket.data() + 16u, data + pos + off,
++                                    static_cast<size_t>(chunk) * 16u);
++                        submitGifPacket(GifPathId::Path2, imagePacket.data(),
++                                        static_cast<uint32_t>(imagePacket.size()), true,
++                                        m_vif1PendingPath2DirectHl);
++                        m_vif1PendingPath2ImageQwc -= chunk;
++                        left -= chunk;
++                        off += chunk * 16u;
+                     }
++                    if (m_vif1PendingPath2ImageQwc == 0u)
++                        m_vif1PendingPath2DirectHl = false;
+                 }
++                const uint32_t restQw = qwCount - imgQw;
++                const uint8_t *restData = data + pos + static_cast<size_t>(imgQw) * 16u;
++
++                if (restQw > 0u)
++                {
++                // PS2X_GS_IMGCONT (cycle 83): sample the GS pending-image BEFORE this DIRECT so we
++                // can tell whether THIS DIRECT opened a fresh image that overran (before==0,
++                // after>0) vs a stale/pre-existing incomplete transfer (before>0) -- the latter must
++                // NOT trigger a carry or we false-fire on geometry DIRECTs (cycle 89 over-fired).
++                static const int s_imgCont = [] {
++                    const char *e = std::getenv("PS2X_GS_IMGCONT");
++                    return (e && e[0] && e[0] != '0') ? 1 : 0;
++                }();
++                const uint32_t pendBefore =
++                    (s_imgCont && m_gsPendingImageFn) ? m_gsPendingImageFn() : 0u;
++                vifScanStripColumns("DIRECT", restData, restQw * 16u);
++                submitGifPacket(GifPathId::Path2, restData, restQw * 16, true, directHl);
++
++                // Image-continuation carry-over. OLD detection (gifImageQwcFromTag) reads only the
++                // FIRST tag of the payload and misses an IMAGE tag behind a setup tag (cycle 81);
++                // NEW walks the payload's tags (directTrailingImageQwc). PS2X_GS_DIRECTIMGFIX=1
++                // selects NEW (default OFF -- unproven until the continuation is verified raw).
++                static const int s_dirImgFix = [] {
++                    const char *e = std::getenv("PS2X_GS_DIRECTIMGFIX");
++                    return (e && e[0] && e[0] != '0') ? 1 : 0;
++                }();
++                const uint32_t oldImageQw = gifImageQwcFromTag(restData, restQw * 16u);
++                const uint32_t oldCarry =
++                    (oldImageQw > (restQw - 1u)) ? (oldImageQw - (restQw - 1u)) : 0u;
++                const uint32_t newCarry = directTrailingImageQwc(restData, restQw * 16u);
++
++                // PS2X_GS_DIRECTIMGLOG=1 (probe, no behaviour change). Where NEW disagrees with OLD,
++                // dump qwCount, first-tag flg, both carries, AND the 16 bytes FOLLOWING this DIRECT
++                // (pos+qwCount*16): if the opcode byte (offset +3) is 0x50/0x51 the continuation is
++                // another DIRECT command (my raw-image assumption is WRONG); otherwise it is raw
++                // image data (assumption holds). This is the cycle-82 verify-before-fix gate.
++                static const bool s_dirImgLog = [] {
++                    const char *e = std::getenv("PS2X_GS_DIRECTIMGLOG");
++                    return e && e[0] && e[0] != '0';
++                }();
++                if (s_dirImgLog && newCarry != oldCarry)
++                {
++                    static uint64_t s_n = 0ull;
++                    if (++s_n <= 60ull || (s_n % 500ull) == 0ull)
++                    {
++                        uint64_t t0 = 0u;
++                        std::memcpy(&t0, restData, sizeof(t0));
++                        const uint32_t nextOff = pos + qwCount * 16u;
++                        char nb[64];
++                        nb[0] = '\0';
++                        if (nextOff + 16u <= sizeBytes)
++                            for (int k = 0; k < 16; ++k)
++                                std::snprintf(nb + k * 3, 4, "%02x ", data[nextOff + k]);
++                        else
++                            std::snprintf(nb, sizeof(nb), "(end of buffer)");
++                        std::fprintf(stderr,
++                                     "[VIF:dirimg] #%llu qw=%u firstFlg=%u oldCarry=%u newCarry=%u "
++                                     "trunc=%d | next: %s\n",
++                                     (unsigned long long)s_n, qwCount,
++                                     (unsigned)((t0 >> 58) & 0x3u), oldCarry, newCarry,
++                                     truncated ? 1 : 0, nb);
++                    }
++                }
++
++                // Carry ONLY when THIS DIRECT opened a fresh image that overran its payload
++                // (pendBefore==0 && pendAfter>0). A pre-existing incomplete transfer (pendBefore>0)
++                // is either already being carried or is stale garbage -- either way, do not fire a
++                // new carry on it. Reliable and false-positive-free at the SOURCE, unlike cycle 82's
++                // re-walk and cycle 89's stale-transfer over-fire. Default OFF pending validation.
++                uint32_t carry;
++                if (s_imgCont)
++                {
++                    const uint32_t pendAfter =
++                        m_gsPendingImageFn ? m_gsPendingImageFn() : 0u;
++                    carry = (pendBefore == 0u && pendAfter > 0u) ? pendAfter : 0u;
++                }
++                else
++                {
++                    // Under DIRECTCARRY the tag-walking detector is the correct one: it finds an
++                    // IMAGE tag sitting BEHIND setup tags (the normal texture-upload shape the
++                    // first-tag-only detector misses -- cycle 81's diagnosed gap, the level's
++                    // un-consumed 233 KB continuation family).
++                    carry = (s_vifDirectCarry || s_dirImgFix) ? newCarry : oldCarry;
++                }
++                if (carry != 0u)
++                {
++                    m_vif1PendingPath2ImageQwc = carry;
++                    m_vif1PendingPath2DirectHl = directHl;
++                }
++                } // restQw > 0
+             }
+ 
+             pos += qwCount * 16;
+             if (truncated)
+             {
++                // Cycle 86 (PS2X_VIF_DIRECTSPAN): the un-delivered remainder of this DIRECT
++                // continues at the next processVIF1Data entry instead of being forgotten.
++                if (s_vifDirectSpan)
++                {
++                    g_vif1DirectSpanRemainQw = declaredQw - qwCount;
++                    g_vif1DirectSpanHl = (opcode == VIF_DIRECTHL);
++                }
+                 pos = sizeBytes;
+                 break;
+             }

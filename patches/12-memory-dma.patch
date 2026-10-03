@@ -1,0 +1,371 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 3d59328..c642a5c 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2,6 +2,8 @@
+ #include "runtime/ps2_address.h"
+ #include "runtime/ps2_gs_gpu.h"
+ #include "ps2_log.h"
++#include <cstdio>
++#include <cstdlib>
+ #include <atomic>
+ #include <chrono>
+ #include <cstring>
+@@ -302,6 +304,10 @@ bool PS2Memory::initialize(size_t ramSize)
+     m_path3MaskedFifo.clear();
+     m_vif1PendingPath2ImageQwc = 0u;
+     m_vif1PendingPath2DirectHl = false;
++    {
++        extern void ps2xVif1ResetDirectSpan();
++        ps2xVif1ResetDirectSpan();
++    }
+     m_timer0LastHostNs = 0;
+     m_timer0FractionNs = 0;
+ 
+@@ -1072,6 +1078,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+                 m_vif1PendingPath2ImageQwc = 0u;
+                 m_vif1PendingPath2DirectHl = false;
++                {
++                    extern void ps2xVif1ResetDirectSpan();
++                    ps2xVif1ResetDirectSpan();
++                }
+             }
+             if (value & 0x8u) // STC
+             {
+@@ -1178,7 +1188,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    const bool tteEnabled = (chcr & (1u << 6)) != 0u; // Tag Transfer Enable
++                    // Cycle 76: 4096 was severing real chains mid-walk ([DMA:chain] end=maxtags
++                    // with strip refs still pending), silently dropping every descriptor after
++                    // the cut -- i.e. the TAIL of a long display list. PCSX2 walks a source
++                    // chain until its END/REFE tag (`DMAC` chain handlers in pcsx2/Dmac.cpp /
++                    // hwDmac*), with no arbitrary tag ceiling; the cap here exists only as a
++                    // runaway guard against a malformed self-referencing chain, so raise it far
++                    // above any legitimate display list rather than letting it truncate one.
++                    // PS2X_DMA_MAXCHAINTAGS overrides it for A/B.
++                    static const int kMaxChainTags = [] {
++                        if (const char *e = std::getenv("PS2X_DMA_MAXCHAINTAGS"))
++                        {
++                            const int v = std::atoi(e);
++                            if (v > 0)
++                                return v;
++                        }
++                        return 1 << 20;
++                    }();
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1216,6 +1243,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         }
+                     };
+ 
++                    // ★ Cycle-86 fix (PS2X_DMA_TTEQW, default ON, `=0` legacy): embed a TTE tag as a
++                    // FULL 16-byte qword [0,0,vif0,vif1] instead of the bare 8-byte upper half. The
++                    // EE DMAC transfers the whole 128-bit tag slot (the VIF reads the lower half as
++                    // two NOPs -- PCSX2 Vif1_Dma.cpp `masked_tag._u64[0] = 0`); a bare 8-byte embed
++                    // shifts the stream phase by HALF A QWORD per tag, which word-granular UNPACK
++                    // streams tolerate but qword-granular DIRECT framing does not. Measured
++                    // (run_c86A): a data word at half-phase pos=2104 parsed as DIRECT imm=0
++                    // (=65536 qw) and swallowed the remaining 199 KB of the level chain raw -- the
++                    // entire level texture-desync family. The game's dual-purpose tag words
++                    // ([FLUSH][DIRECT] that also decode as a harmless GIF nloop=0 tag) only work
++                    // with parity-preserving 16-byte slots.
++                    static const bool s_tteQw = [] {
++                        const char *e = std::getenv("PS2X_DMA_TTEQW");
++                        return !(e && e[0] == '0'); // default ON (correctness fix)
++                    }();
++
+                     auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
+                     {
+                         uint32_t tagPhys = 0u;
+@@ -1228,6 +1271,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             return;
+ 
+                         // VIF packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
++                        if (s_tteQw)
++                            chainBuf.insert(chainBuf.end(), 8u, uint8_t(0));
+                         chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
+                         appendData(localTagAddr + 16u, qwCount);
+                     };
+@@ -1235,6 +1280,32 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     int tagsProcessed = 0;
+                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+ 
++                    // PS2X_DMA_CHAINLOG=1 (diagnostic, default OFF). Cycle 76: the guest commits
++                    // a DMA `ref` tag for all FOUR movie strips (0x10 qw each) but only THREE
++                    // strip DIRECTs ever appear in the VIF1 command stream. Count the strip-sized
++                    // ref tags this walk actually consumes and record WHY the walk stopped -- a
++                    // chain severed one descriptor early drops exactly the last strip.
++                    int dbgStripRefs = 0;
++                    const char *dbgEndReason = "maxtags";
++
++                    // PS2X_VIF_CHAINSRC=<minBytes> (diagnostic, default OFF). Cycle 79: the VIF1
++                    // chain is well-formed (terminates id7-end, VU1 holds real data) yet its DIRECT
++                    // payloads decode as repeating DATA, not a VIF command stream -- so the fault is
++                    // in WHAT the descriptors POINT AT, not the walk. For any VIF1 chain whose
++                    // concatenated payload reaches minBytes, record every tag's source address + qwc
++                    // and, after the walk, dump a hexdump of what lives at each source so we can
++                    // classify the region (display list vs texture/vertex memory). Prime suspect:
++                    // the 692 parked descriptors at [gp+0xEA4].
++                    static const size_t s_chainSrc = [] {
++                        const char *e = std::getenv("PS2X_VIF_CHAINSRC");
++                        return (e != nullptr && e[0] != '\0')
++                                   ? static_cast<size_t>(std::strtoull(e, nullptr, 0))
++                                   : static_cast<size_t>(0);
++                    }();
++                    const bool chainSrcOn = (s_chainSrc != 0 && channelBase == 0x10009000u);
++                    struct ChainSrcRec { uint32_t tagAddr; uint32_t srcAddr; uint16_t qwc; uint8_t id; bool compact; };
++                    std::vector<ChainSrcRec> chainSrcRecs;
++
+                     while (tagsProcessed < kMaxChainTags)
+                     {
+                         const uint32_t currentTagAddr = tagAddr;
+@@ -1276,6 +1347,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         bool hasPayload = (tagQwc > 0);
+                         bool endChain = false;
+ 
++                        if ((id == 3u || id == 4u) && tagQwc == 0x10u)
++                            ++dbgStripRefs;
++
+                         switch (id)
+                         {
+                         case 0:
+@@ -1346,6 +1420,71 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         if (compactVifLocalTag)
+                             appendCompactVif1TagData(currentTagAddr, 0u);
+ 
++                        // ★ Cycle 84 FIX: VIF source-chain ref tags (id 3/4) with TTE carry 2 VIF
++                        // codes in the DMAtag's upper 64 bits -- for LOTR's display list that is the
++                        // `DIRECT imm=qwc` that WRAPS the ref'd GIF packet (probe: qwc==imm exactly).
++                        // Hardware sends those codes to VIF before the ref'd data (TTE, CHCR bit 6);
++                        // we were dropping them, feeding raw GIF data into the VIF command parser ->
++                        // the GIF parse desync that leaves level textures untextured (cont.137). This
++                        // is the compact-tag embed we already do for id 1/2/5/6/7, extended to refs.
++                        // PCSX2 sends qword-0 (the tag's VIF codes) when TTE is set for every chain
++                        // tag. Kill switch PS2X_DMA_REFVIF=0.
++                        static const bool s_refVif = [] {
++                            const char *e = std::getenv("PS2X_DMA_REFVIF");
++                            return !(e && e[0] == '0'); // default ON (correctness fix)
++                        }();
++                        if (s_refVif && tteEnabled &&
++                            (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
++                            (id == 3u || id == 4u) && (physTag + 16u <= tagMax))
++                        {
++                            if (s_tteQw)
++                                chainBuf.insert(chainBuf.end(), 8u, uint8_t(0)); // qword parity (see PS2X_DMA_TTEQW above)
++                            chainBuf.insert(chainBuf.end(), tp + 8, tp + 16);
++                        }
++
++                        // PS2X_DMA_TAGVIF=<N> (probe, cycle 84). Dump the DMAtag's UPPER 64 bits (the
++                        // 2 VIF codes that TTE transfers to VIF before the ref'd data) for VIF1
++                        // source-chain tags. We embed these for id 1/2/5/6/7 but NOT id 3/4 (ref).
++                        // Cycle 79 found the level list is ALL id=3 refs -- if those refs carry real
++                        // VIF codes (op 0x50 DIRECT / 0x60-7F UNPACK) and TTE is set, dropping 8 B per
++                        // tag shifts the whole VIF stream and is the GIF desync's upstream cause.
++                        if (channelBase == 0x10009000u)
++                        {
++                            static const uint32_t s_tagVif = [] {
++                                const char *e = std::getenv("PS2X_DMA_TAGVIF");
++                                return (e && e[0]) ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
++                            }();
++                            if (s_tagVif != 0u)
++                            {
++                                static uint64_t s_n = 0ull;
++                                if (++s_n <= s_tagVif || (s_n % 4000ull) == 0ull)
++                                {
++                                    uint64_t upper = 0u;
++                                    if (physTag + 16u <= tagMax)
++                                        std::memcpy(&upper, tp + 8, sizeof(upper));
++                                    const uint32_t vc0 = static_cast<uint32_t>(upper & 0xFFFFFFFFu);
++                                    const uint32_t vc1 = static_cast<uint32_t>(upper >> 32);
++                                    std::fprintf(stderr,
++                                                 "[DMA:tagvif] #%llu id=%u qwc=0x%x TTE=%u embed=%d | "
++                                                 "vif0=%08x(op=%02x) vif1=%08x(op=%02x)\n",
++                                                 (unsigned long long)s_n, id, tagQwc,
++                                                 (unsigned)((chcr >> 6) & 1u), compactVifLocalTag ? 1 : 0,
++                                                 vc0, (vc0 >> 24) & 0x7fu, vc1, (vc1 >> 24) & 0x7fu);
++                                }
++                            }
++                        }
++
++                        if (chainSrcOn)
++                        {
++                            ChainSrcRec r;
++                            r.tagAddr = currentTagAddr;
++                            r.srcAddr = compactVifLocalTag ? (currentTagAddr + 16u) : dataAddr;
++                            r.qwc = tagQwc;
++                            r.id = static_cast<uint8_t>(id);
++                            r.compact = compactVifLocalTag;
++                            chainSrcRecs.push_back(r);
++                        }
++
+                         if (hasPayload)
+                         {
+                             if (compactVifLocalTag)
+@@ -1354,11 +1493,103 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                                 appendData(dataAddr, tagQwc);
+                         }
+                         if (irq && tieEnabled)
++                        {
+                             endChain = true;
++                            dbgEndReason = "irq+tie";
++                        }
++                        else if (endChain)
++                        {
++                            dbgEndReason = (id == 0u) ? "id0-refe"
++                                           : (id == 7u) ? "id7-end"
++                                           : (id == 6u) ? "id6-ret"
++                                                        : "id-default";
++                        }
+                         if (endChain)
+                             break;
+                     }
+ 
++                    {
++                        static const bool s_chainLog = [] {
++                            const char *e = std::getenv("PS2X_DMA_CHAINLOG");
++                            return e != nullptr && e[0] != '\0' && e[0] != '0';
++                        }();
++                        if (s_chainLog && dbgStripRefs > 0)
++                        {
++                            static unsigned long n = 0;
++                            ++n;
++                            if (n <= 60ul || (n % 500ul) == 0ul)
++                                std::fprintf(stderr,
++                                             "[DMA:chain] #%lu ch=0x%x tags=%d stripRefs=%d end=%s "
++                                             "bytes=%zu\n",
++                                             n, channelBase, tagsProcessed, dbgStripRefs,
++                                             dbgEndReason, chainBuf.size());
++                        }
++
++                        // PS2X_DMA_CHAINBIG=<bytes> (diagnostic, default OFF). Cycle 77: the
++                        // malformed post-FMV descriptors come from 271 KB - 1.6 MB buffers handed
++                        // to GS by the VIF1 DIRECT handler. Those buffers are built HERE, by
++                        // concatenating the chain. The log above cannot see them -- it is gated on
++                        // `dbgStripRefs > 0` (cycle 76's movie-strip filter) and post-FMV chains
++                        // carry no strip refs. Trigger on SIZE instead, and print how the walk
++                        // ended: a chain that terminates on `maxtags` (or simply runs enormously
++                        // long) after FMV teardown means the walker is following a corrupt/stale
++                        // `next` pointer through unrelated memory, which is exactly how non-VIF
++                        // bytes end up in a VIF1 command stream.
++                        static const size_t s_chainBig = [] {
++                            const char *e = std::getenv("PS2X_DMA_CHAINBIG");
++                            return (e != nullptr && e[0] != '\0')
++                                       ? static_cast<size_t>(std::strtoull(e, nullptr, 0))
++                                       : static_cast<size_t>(0);
++                        }();
++                        if (s_chainBig != 0 && chainBuf.size() >= s_chainBig)
++                        {
++                            static unsigned long nb = 0;
++                            ++nb;
++                            if (nb <= 40ul || (nb % 200ul) == 0ul)
++                                std::fprintf(stderr,
++                                             "[DMA:chainbig] #%lu ch=0x%x tags=%d end=%s bytes=%zu\n",
++                                             nb, channelBase, tagsProcessed, dbgEndReason,
++                                             chainBuf.size());
++                        }
++
++                        if (chainSrcOn && chainBuf.size() >= s_chainSrc)
++                        {
++                            static unsigned long ns = 0;
++                            ++ns;
++                            if (ns <= 40ul || (ns % 200ul) == 0ul)
++                            {
++                                std::fprintf(stderr,
++                                             "[VIF1:chainsrc] #%lu ch=0x%x tags=%d end=%s bytes=%zu\n",
++                                             ns, channelBase, tagsProcessed, dbgEndReason,
++                                             chainBuf.size());
++                                for (size_t i = 0; i < chainSrcRecs.size(); ++i)
++                                {
++                                    const ChainSrcRec &r = chainSrcRecs[i];
++                                    char hex[100];
++                                    hex[0] = '\0';
++                                    if (r.qwc > 0)
++                                    {
++                                        const bool sp = isScratchpad(r.srcAddr);
++                                        uint32_t phys = 0;
++                                        bool ok = true;
++                                        try { phys = translateAddress(r.srcAddr); }
++                                        catch (...) { ok = false; }
++                                        const uint8_t *b = sp ? m_scratchpad : m_rdram;
++                                        const uint32_t mx = sp ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++                                        if (ok && phys + 32u <= mx)
++                                            for (int k = 0; k < 32; ++k)
++                                                std::snprintf(hex + k * 3, 4, "%02x ", b[phys + k]);
++                                    }
++                                    std::fprintf(stderr,
++                                                 "    [%2zu] tag=0x%08x id=%u%s qwc=0x%-4x src=0x%08x%s | %s\n",
++                                                 i, r.tagAddr, r.id, r.compact ? "c" : " ",
++                                                 r.qwc, r.srcAddr,
++                                                 isScratchpad(r.srcAddr) ? " SPR" : "", hex);
++                                }
++                            }
++                        }
++                    }
++
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+@@ -1403,6 +1634,58 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     processPendingTransfers();
+                 }
+             }
++            // ---- Scratchpad (SPR) DMA: ch8 fromSPR @0x1000D000, ch9 toSPR @0x1000D400 ----
++            // These copy between the 16KB EE scratchpad (SADR) and main RAM (MADR). They were NOT
++            // implemented: the CHCR STR write fell through with no transfer, and since CHCR reads back
++            // with STR clear, the guest's completion poll exits immediately -- so the copy SILENTLY
++            // never happened and the destination kept stale data.
++            //
++            // This is load-bearing for text. LOTR builds each text GIF packet in the scratchpad and
++            // copies it to the display list in 13F030, which forks on size (0x13f05c: slti at,s1,0x41):
++            //   qwc <= 64  -> plain memcpy (13D990)        -- worked, so SHORT strings rendered
++            //   qwc >= 65  -> fromSPR DMA (this channel)   -- silently did nothing
++            // A glyph costs 5 qw (+8 qw header), so every string over ~11 glyphs was dropped: the
++            // language-select header "Please select your language." (25 glyphs = 133 qw) and the whole
++            // legal-screen paragraph. Short single words (English/Polski/... <= 58 qw) took the memcpy
++            // path and drew fine -- which is exactly the "only short strings render" symptom.
++            else if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
++            {
++                const uint32_t sadr = m_ioRegisters[channelBase + 0x80];
++                if (qwc > 0 && m_scratchpad && m_rdram)
++                {
++                    const bool fromSpr = (channelBase == 0x1000D000u);
++                    const uint32_t sprOff = sadr & (PS2_SCRATCHPAD_SIZE - 1u);
++                    uint32_t memPhys = 0;
++                    bool ok = true;
++                    try
++                    {
++                        memPhys = translateAddress(madr);
++                    }
++                    catch (...)
++                    {
++                        ok = false;
++                    }
++                    if (ok && memPhys < PS2_RAM_SIZE && sprOff < PS2_SCRATCHPAD_SIZE)
++                    {
++                        const uint64_t want64 = static_cast<uint64_t>(qwc) * 16ull;
++                        uint32_t bytes = (want64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu
++                                                                  : static_cast<uint32_t>(want64);
++                        bytes = std::min<uint32_t>(bytes, PS2_RAM_SIZE - memPhys);
++                        bytes = std::min<uint32_t>(bytes, PS2_SCRATCHPAD_SIZE - sprOff);
++                        if (bytes > 0)
++                        {
++                            if (fromSpr)
++                                std::memcpy(m_rdram + memPhys, m_scratchpad + sprOff, bytes);
++                            else
++                                std::memcpy(m_scratchpad + sprOff, m_rdram + memPhys, bytes);
++                        }
++                    }
++                }
++                // Report the transfer as finished: clear STR and drain QWC, so the guest's
++                // `poll CHCR & 0x100` loop (13F030 @0x13f0d0) terminates.
++                m_ioRegisters[channelBase] = value & ~0x100u;
++                m_ioRegisters[channelBase + 0x20] = 0u;
++            }
+         }
+         return true;
+     }

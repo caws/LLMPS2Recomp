@@ -1,0 +1,88 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index f89ba7b..cbbda1e 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -5,6 +5,8 @@
+ #include "ps2_vu1_detail.h"
+ 
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <vector>
+@@ -397,6 +399,74 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                     break;
+ 
+                 totalBytes += pktSize;
++
++                // A PATH1 (XGKICK) packet cannot legitimately exceed VU1 data memory. When VU1
++                // memory holds garbage the tag walk never sees a valid EOP, wraps the 16 KB
++                // circularly, and accumulates without limit -- the `safety` counter below bounds
++                // ITERATIONS, not BYTES, and a single garbage tag with flg=0 contributes
++                // 16 + nloop*nreg*16 (megabytes). Measured post-FMV (cycle 77): 34 of 40
++                // oversized GS packets came from here, one being 229888 B = VU1's 16 KB repeated
++                // ~14x, full of 0xFFC00000 (float -NaN). Handing that to the GIF parser is what
++                // produces the malformed BITBLTBUF/TRXREG (dpsm=0x06/0x3F, dims like 2732x2013).
++                //
++                // PCSX2 does exactly this check and DROPS the packet -- `Gif_Unit.h`
++                // GetGSPacketSize(): `if (pathIdx == GIF_PATH_1 && curSize >= 0x4000) return 0;`
++                // with the comment "Bios does this...", i.e. a runaway walk is a normal condition
++                // and dropping is the hardware-faithful response, not a workaround.
++                // Kill switch: PS2X_VU1_XGKICK_LIMIT=0 restores the old unbounded behaviour.
++                static const uint32_t s_xgkickLimit = [] {
++                    const char *e = std::getenv("PS2X_VU1_XGKICK_LIMIT");
++                    return (e != nullptr && e[0] != '\0')
++                               ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0))
++                               : 0x4000u;
++                }();
++                if (s_xgkickLimit != 0u && totalBytes >= s_xgkickLimit)
++                {
++                    static uint64_t s_dropped = 0ull;
++                    ++s_dropped;
++                    if (s_dropped <= 20ull || (s_dropped % 1000ull) == 0ull)
++                    {
++                        // Characterise VU1 memory itself, not just this packet. The guard stops
++                        // garbage reaching GS, but the REAL question is why VU1 memory holds
++                        // garbage at all after FMV teardown. Count how much of it is float NaN /
++                        // zero: if the whole 16 KB is NaN the microprogram's data was never
++                        // uploaded (or was clobbered wholesale); if only the region at `addr` is
++                        // bad, the microprogram is writing garbage from bad inputs. Those two
++                        // point at completely different upstream bugs.
++                        uint32_t nanQw = 0u, zeroQw = 0u;
++                        const uint32_t totalQw = dataSize / 16u;
++                        for (uint32_t q = 0; q < totalQw; ++q)
++                        {
++                            uint32_t w[4];
++                            std::memcpy(w, vuData + q * 16u, 16);
++                            int nans = 0, zeros = 0;
++                            for (int c = 0; c < 4; ++c)
++                            {
++                                const uint32_t e = (w[c] >> 23) & 0xFFu;
++                                if (e == 0xFFu)
++                                    ++nans;
++                                if (w[c] == 0u)
++                                    ++zeros;
++                            }
++                            if (nans > 0)
++                                ++nanQw;
++                            if (zeros == 4)
++                                ++zeroQw;
++                        }
++                        std::fprintf(stderr,
++                                     "[VU1:xgkick] DROP #%llu packet exceeds VU1 memory: "
++                                     "totalBytes=%u limit=%u addr=%u iters=%d | vumem: "
++                                     "nan/inf qw=%u zero qw=%u of %u\n",
++                                     (unsigned long long)s_dropped, totalBytes, s_xgkickLimit,
++                                     addr, safety, nanQw, zeroQw, totalQw);
++                        std::fprintf(stderr, "    tag@%u  ", addr);
++                        for (uint32_t b = 0; b < 32u; ++b)
++                            std::fprintf(stderr, "%02X", vuData[wrapOffset(addr + b)]);
++                        std::fprintf(stderr, "\n");
++                    }
++                    return;
++                }
++
+                 pktOff = wrapOffset(pktOff + pktSize);
+                 if (eop)
+                     done = true;

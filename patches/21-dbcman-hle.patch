@@ -1,59 +1,3 @@
-diff --git a/ps2xRuntime/include/runtime/ps2_dbcman_hle.h b/ps2xRuntime/include/runtime/ps2_dbcman_hle.h
-new file mode 100644
-index 0000000..ecb33fd
---- /dev/null
-+++ b/ps2xRuntime/include/runtime/ps2_dbcman_hle.h
-@@ -0,0 +1,30 @@
-+#pragma once
-+
-+#include <cstdint>
-+
-+class PS2Runtime;
-+
-+// DBCMAN (DualShock controller manager) pad HLE — runtime side.
-+//
-+// Re-expressed for upstream ee14958, which deleted the old ps2_iop_dbcman.cpp and removed
-+// runtime->iop().handleRPC. The example game drives DBCMAN over the RAW SIF transport
-+// (guest 0x11bfa8/0x11c178) that native ee14958 (SID-routed off sceSifCallRpc) never sees, so the
-+// GAME OVERRIDE intercepts that transport and calls answerDbcManRpc() directly (a plain free
-+// function). deliverPadData() MUST be called at the vblank-interrupt-worker frequency
-+// (Interrupt.cpp) — a guest-side override hook fires far too rarely under present starvation, so
-+// the per-vblank work-table re-assertion is lost and the controller reads "removed" (self-exit).
-+namespace ps2_dbcman_hle
-+{
-+    // Answer a DBCMAN-family / event RPC (sid 0x80001300 family, or the 0x8000131b/c event
-+    // channels). Writes the reply into guest memory, sets resultPtr = recv, returns true (handled).
-+    bool answerDbcManRpc(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t rpcNum,
-+                         uint32_t sendBuf, uint32_t sendSize, uint32_t recvBuf, uint32_t recvSize,
-+                         uint32_t &resultPtr);
-+
-+    // Per-vblank: re-assert the per-port connection table + refresh the pad double-buffers. Call
-+    // from the runtime vblank interrupt worker (see Kernel/Syscalls/Interrupt.cpp).
-+    void deliverPadData(uint8_t *rdram, PS2Runtime *runtime);
-+
-+    // Reset all pad state (sockets, work addr, seq). Call on IOP reset.
-+    void reset();
-+}
-diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
-index 220eadf..2980113 100644
---- a/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
-+++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Interrupt.cpp
-@@ -2,6 +2,7 @@
- #include "Interrupt.h"
- #include "ps2_log.h"
- #include "Stubs/GS.h"
-+#include "runtime/ps2_dbcman_hle.h"
- 
- namespace ps2_syscalls
- {
-@@ -354,6 +355,7 @@ namespace ps2_syscalls
-             for (int i = 0; i < ticksToProcess; ++i)
-             {
-                 const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
-+                ps2_dbcman_hle::deliverPadData(rdram, runtime); // per-vblank pad delivery + work-table re-assertion
-                 ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
-                 dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
-                 std::this_thread::sleep_for(std::chrono::microseconds(500));
 diff --git a/ps2xRuntime/src/lib/ps2_dbcman_hle.cpp b/ps2xRuntime/src/lib/ps2_dbcman_hle.cpp
 new file mode 100644
 index 0000000..b3c8bfd
@@ -199,15 +143,3 @@ index 0000000..b3c8bfd
 +        g_padSeq = 0u;
 +    }
 +}
-diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 91a23c2..08f783d 100644
---- a/ps2xRuntime/CMakeLists.txt
-+++ b/ps2xRuntime/CMakeLists.txt
-@@ -351,6 +351,7 @@ add_library(ps2_runtime STATIC
-     src/lib/ps2_gs_memory.cpp
-     src/lib/ps2_gs_rasterizer.cpp
-     src/lib/ps2_iop_host.cpp
-+    src/lib/ps2_dbcman_hle.cpp
-     src/lib/ps2_memory.cpp
-     src/lib/ps2_pad.cpp
-     src/lib/ps2_runtime.cpp

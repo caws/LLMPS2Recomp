@@ -1,0 +1,63 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 27dde2d..52bf20d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -298,37 +298,22 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             applyDest(vtDest, result, dest);
+             return;
+         case 0x14: // FTOI0
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = static_cast<int32_t>(vs[c]);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+         case 0x15: // FTOI4
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = static_cast<int32_t>(vs[c] * 16.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+         case 0x16: // FTOI12
+-            for (int c = 0; c < 4; c++)
+-            {
+-                int32_t iv = static_cast<int32_t>(vs[c] * 4096.0f);
+-                std::memcpy(&result[c], &iv, 4);
+-            }
+-            applyDest(vtDest, result, dest);
+-            return;
+         case 0x17: // FTOI15
++        {
++            // Saturating conversion (see vuFloatToInt): a plain C cast is UB on overflow and
++            // collapses every out-of-range vertex onto 0x80000000.
++            static const uint32_t kFtoiOffset[4] = {0u, 4u, 12u, 15u};
++            const uint32_t offset = kFtoiOffset[specialOp - 0x14];
+             for (int c = 0; c < 4; c++)
+             {
+-                int32_t iv = static_cast<int32_t>(vs[c] * 32768.0f);
++                const uint32_t iv = vuFloatToInt(vs[c], offset);
+                 std::memcpy(&result[c], &iv, 4);
+             }
+             applyDest(vtDest, result, dest);
+             return;
++        }
+         case 0x18:
+         case 0x19:
+         case 0x1A:
+@@ -365,7 +350,12 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             if (vs[1] < -w) flags |= 0x08;
+             if (vs[2] > +w) flags |= 0x10;
+             if (vs[2] < -w) flags |= 0x20;
+-            m_state.clip = (m_state.clip << 6) | flags;
++            // The clip register is 24 bits (four generations of 6 flags).  Without this mask
++            // the << 6 pushes junk above bit 23 that never clears, and FCOR's `== 0xFFFFFF`
++            // test can then never match -- silently disabling the microprogram's trivial
++            // reject, so off-screen/near-plane triangles get drawn as streaks.
++            // Mirrors PCSX2 pcsx2/VUops.cpp `_vuCLIP()`.
++            m_state.clip = ((m_state.clip << 6) | flags) & 0xFFFFFFu;
+             return;
+         }
+         case 0x20: // ADDAq

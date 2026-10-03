@@ -57,9 +57,17 @@ if [[ $SKIP_PATCHES -eq 1 ]]; then
 else
 echo "[2b] Applying local PS2Recomp patches (patches/*.patch)..."
 # Correctness fixes not yet in upstream PS2Recomp (see patches/README.md). Idempotent:
-# skips patches already applied; warns (does not abort) on ones that no longer apply so
-# an upstream pull that absorbed or conflicted a fix is surfaced instead of silently lost.
+# skips patches already applied.
+#
+# ★ FAIL LOUD. This used to print "WARNING: does not apply" and CONTINUE, which meant a fresh
+# clone silently came up with a PARTIAL patch stack and a subtly wrong runtime -- measured
+#: patches 10 and 17 (an actual SIGSEGV fix and all the GS instruments) had been
+# failing on every fresh clone, unnoticed, because the old topical patches were overlapping
+# full-file diffs of the same file. A partial stack is not a usable toolchain, so any patch
+# that neither applies nor is already applied is now a hard error.
+# Patches are partitioned ONE PER FILE precisely so this cannot recur (patches/README.md).
 shopt -s nullglob
+patch_failures=()
 for p in "$ROOT_DIR"/patches/*.patch; do
     name="$(basename "$p")"
     if git -C "$PS2RECOMP_DIR" apply --check "$p" 2>/dev/null; then
@@ -68,10 +76,22 @@ for p in "$ROOT_DIR"/patches/*.patch; do
     elif git -C "$PS2RECOMP_DIR" apply --reverse --check "$p" 2>/dev/null; then
         echo "    already applied: $name"
     else
-        echo "    WARNING: does not apply (upstream drift? fixed upstream?): $name"
+        echo "    DOES NOT APPLY:  $name"
+        patch_failures+=("$name")
     fi
 done
 shopt -u nullglob
+if (( ${#patch_failures[@]} )); then
+    echo
+    echo "ERROR: ${#patch_failures[@]} patch(es) did not apply to $PS2RECOMP_DIR:"
+    for f in "${patch_failures[@]}"; do echo "         - $f"; done
+    echo
+    echo "  A PARTIAL PATCH STACK IS NOT A USABLE TOOLCHAIN -- refusing to continue."
+    echo "  Either upstream absorbed the fix (delete that patch deliberately) or upstream"
+    echo "  drifted (rebase it, regenerate, and re-run the reproducibility check in"
+    echo "  patches/README.md). To build BARE upstream on purpose, pass --no-patches."
+    exit 1
+fi
 fi
 
 echo "[3/4] Configuring PS2Recomp..."
