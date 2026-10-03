@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
 new file mode 100644
-index 0000000..8ca39d9
+index 0000000..a73b7bd
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,242 @@
 +#pragma once
 +
 +#include "runtime/gs/gs_types.h"
@@ -211,9 +211,12 @@ index 0000000..8ca39d9
 +    // remains -- stale pages the rasterizer cannot explain -- is the actual gate.
 +    // Returns true when the mirror matches vram exactly.
 +    // `quiet` suppresses the report line -- the bisect runs ~12 of these per failure and
-+    // only cares about the boolean.
++    // only cares about the boolean. `outFirstWord`/`outStaleWords`, when given, still return
++    // WHERE it failed: the bisect must not assume the divergence lies inside the culprit's
++    // rect (cont.173 -- that assumption is exactly what produced a contradiction).
 +    bool MirrorVerifyFull(const uint8_t *vram, uint32_t vramSize,
-+                          const uint8_t *drawPageMask = nullptr, bool quiet = false);
++                          const uint8_t *drawPageMask = nullptr, bool quiet = false,
++                          uint32_t *outFirstWord = nullptr, uint32_t *outStaleWords = nullptr);
 +
 +    // Phase 2a (cont.169): rasterize ONE primitive into the mirror. Async, FIFO-ordered
 +    // behind every prior mirror op, so the caller's seed patches are already applied.

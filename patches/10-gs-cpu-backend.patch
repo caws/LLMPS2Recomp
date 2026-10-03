@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..7656bc5 100644
+index 9c39ae2..43fe7c3 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,9 +10,20 @@
@@ -377,7 +377,7 @@ index 9c39ae2..7656bc5 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,72 +888,2147 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,72 +888,2228 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -1517,6 +1517,7 @@ index 9c39ae2..7656bc5 100644
 +    if (!dev || acc.preVram.size() != m_vramSize || acc.srcPrims.size() != prims.size())
 +        return;
 +
++    static uint32_t s_lastFirstWord = 0, s_lastStaleWords = 0;
 +    auto prefixMatches = [&](size_t k) -> bool
 +    {
 +        // Oracle: scratch = preVram, then draw the first k primitives into it.
@@ -1541,7 +1542,8 @@ index 9c39ae2..7656bc5 100644
 +            sb.prims.push_back(g1);
 +            dev->RasterBatch(std::move(sb));
 +        }
-+        return dev->MirrorVerifyFull(m_bisectScratch.data(), m_vramSize, nullptr, /*quiet*/ true);
++        return dev->MirrorVerifyFull(m_bisectScratch.data(), m_vramSize, nullptr, /*quiet*/ true,
++                                     &s_lastFirstWord, &s_lastStaleWords);
 +    };
 +
 +    if (prefixMatches(prims.size()))
@@ -1584,6 +1586,85 @@ index 9c39ae2..7656bc5 100644
 +                 q.tpsm, q.tbp, q.tbw, q.texW, q.texH, q.linear, q.tfx, q.tcc,
 +                 q.cbp, q.cpsm, q.csa, q.wms, q.wmt, q.ta0, q.ta1, q.aem,
 +                 q.iip, q.fge, q.fst);
++
++    // ★ WHERE does the prefix actually diverge? cont.172 assumed it was inside the
++    // culprit's rect and hit a contradiction (culprit-alone from a matching state showed no
++    // difference). Print the failing word and decide the question instead of assuming it.
++    {
++        (void)prefixMatches(bad + 1u);
++        const uint32_t w = s_lastFirstWord, stale = s_lastStaleWords;
++        const uint32_t byteOff = w * 4u;
++        // Is that word inside the culprit's frame rect, or its Z rect, or neither?
++        uint32_t fOff = 0, fLen = 0, zOff = 0, zLen = 0;
++        const bool haveF = gs2PageRange(q.fpsm, q.fbp, q.fbw, g.minX, g.minY, g.maxX, g.maxY,
++                                        m_vramSize, fOff, fLen);
++        const bool haveZ = gs2PageRange(q.zpsm, q.zbp, q.fbw, g.minX, g.minY, g.maxX, g.maxY,
++                                        m_vramSize, zOff, zLen);
++        const bool inF = haveF && byteOff >= fOff && byteOff < fOff + fLen;
++        const bool inZ = haveZ && byteOff >= zOff && byteOff < zOff + zLen;
++        // How many of the stale words are accounted for by the culprit's own rect? Compare
++        // the two buffers over the rect directly -- if the whole-4MB stale count is much
++        // larger than what the rect explains, the bisect's k is naming the primitive that
++        // TRIGGERS the divergence, not the one that contains it.
++        // Capture the BEFORE state too (prefix [0..bad), which matched exactly), so each
++        // failing pixel can be read three ways. If gpu-after == before, the GPU REJECTED
++        // the pixel (alpha or Z test) where the CPU accepted it; if it differs from both,
++        // the GPU accepted it and shaded it differently. That single distinction picks the
++        // next move, and nothing so far has actually established which it is.
++        (void)prefixMatches(bad);
++        const std::vector<uint8_t> beforeCpu = m_bisectScratch;
++        std::vector<uint8_t> beforeGpu;
++        dev->MirrorReadback(0u, m_vramSize, beforeGpu);
++        (void)prefixMatches(bad + 1u);
++        std::vector<uint8_t> gpuNow;
++        dev->MirrorReadback(0u, m_vramSize, gpuNow);
++        if (beforeCpu.size() == m_vramSize && beforeGpu.size() == m_vramSize &&
++            gpuNow.size() == m_vramSize)
++        {
++            unsigned shown3 = 0;
++            for (uint32_t y = g.minY; y <= g.maxY && shown3 < 4u; ++y)
++                for (uint32_t x = g.minX; x <= g.maxX && shown3 < 4u; ++x)
++                {
++                    const uint32_t cB = GSMem::ReadCT32(const_cast<uint8_t *>(beforeCpu.data()), q.fbp, q.fbw, x, y);
++                    const uint32_t gB = GSMem::ReadCT32(beforeGpu.data(), q.fbp, q.fbw, x, y);
++                    const uint32_t cA = GSMem::ReadCT32(m_bisectScratch.data(), q.fbp, q.fbw, x, y);
++                    const uint32_t gA = GSMem::ReadCT32(gpuNow.data(), q.fbp, q.fbw, x, y);
++                    const uint32_t czB = GSMem::ReadZ24(const_cast<uint8_t *>(beforeCpu.data()), q.zbp, q.fbw, x, y);
++                    const uint32_t gzB = GSMem::ReadZ24(beforeGpu.data(), q.zbp, q.fbw, x, y);
++                    const uint32_t czA = GSMem::ReadZ24(m_bisectScratch.data(), q.zbp, q.fbw, x, y);
++                    const uint32_t gzA = GSMem::ReadZ24(gpuNow.data(), q.zbp, q.fbw, x, y);
++                    if (cA == gA && czA == gzA)
++                        continue;
++                    ++shown3;
++                    std::fprintf(stderr,
++                                 "[gsgpu:bisect]   (%u,%u) rgb before c=%08x g=%08x -> after c=%08x g=%08x "
++                                 "%s | z before c=%06x g=%06x -> after c=%06x g=%06x %s\n",
++                                 x, y, cB, gB, cA, gA,
++                                 (gA == gB) ? "[GPU REJECTED]" : "[gpu wrote]",
++                                 czB, gzB, czA, gzA,
++                                 (gzA == gzB) ? "[GPU REJECTED]" : "[gpu wrote]");
++                }
++        }
++        unsigned rectDiff = 0;
++        if (gpuNow.size() == m_vramSize)
++            for (uint32_t y = g.minY; y <= g.maxY; ++y)
++                for (uint32_t x = g.minX; x <= g.maxX; ++x)
++                {
++                    if (GSMem::ReadCT32(m_bisectScratch.data(), q.fbp, q.fbw, x, y) !=
++                        GSMem::ReadCT32(gpuNow.data(), q.fbp, q.fbw, x, y))
++                        ++rectDiff;
++                    if (GSMem::ReadZ24(m_bisectScratch.data(), q.zbp, q.fbw, x, y) !=
++                        GSMem::ReadZ24(gpuNow.data(), q.zbp, q.fbw, x, y))
++                        ++rectDiff;
++                }
++        std::fprintf(stderr,
++                     "[gsgpu:bisect]   WHERE: first stale word=%u (byte 0x%06x, page %u), "
++                     "stale-words=%u | culprit frame[0x%06x+0x%x] %s, z[0x%06x+0x%x] %s | "
++                     "culprit rect explains %u word(s)\n",
++                     w, byteOff, byteOff / 8192u, stale,
++                     fOff, fLen, inF ? "INSIDE" : "outside",
++                     zOff, zLen, inZ ? "INSIDE" : "outside", rectDiff);
++    }
 +
 +    // DETERMINISM FIRST. The coverage probe below re-runs the same prefix; if the GPU
 +    // answer is not stable run-to-run, every "which primitive" conclusion is meaningless
@@ -2564,7 +2645,7 @@ index 9c39ae2..7656bc5 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,6 +3135,119 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,6 +3216,119 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -2684,7 +2765,7 @@ index 9c39ae2..7656bc5 100644
      switch (state.prim.type)
      {
      case GS_PRIM_SPRITE:
-@@ -762,15 +3265,29 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -762,15 +3346,29 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
      case GS_PRIM_POINT:
      {
          const GSVertex &v = batch.vertices[0];
@@ -2717,7 +2798,7 @@ index 9c39ae2..7656bc5 100644
  }
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
-@@ -792,11 +3309,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +3390,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -2732,7 +2813,7 @@ index 9c39ae2..7656bc5 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -817,7 +3333,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -817,7 +3414,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      u32 fbrgba = 0;
      if (frmw)
      {
@@ -2741,7 +2822,7 @@ index 9c39ae2..7656bc5 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +3363,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +3444,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -2755,7 +2836,7 @@ index 9c39ae2..7656bc5 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +3446,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +3527,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -2789,7 +2870,7 @@ index 9c39ae2..7656bc5 100644
      }
  }
  
-@@ -947,15 +3482,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +3563,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -2838,7 +2919,7 @@ index 9c39ae2..7656bc5 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,26 +3533,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,26 +3614,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -2892,7 +2973,7 @@ index 9c39ae2..7656bc5 100644
      }
      else
      {
-@@ -1002,7 +3584,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +3665,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -2901,7 +2982,7 @@ index 9c39ae2..7656bc5 100644
  
          switch (tex.psm)
          {
-@@ -1024,7 +3606,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +3687,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -2916,7 +2997,7 @@ index 9c39ae2..7656bc5 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +3813,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,6 +3894,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -2925,7 +3006,7 @@ index 9c39ae2..7656bc5 100644
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +3871,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +3952,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -2934,7 +3015,7 @@ index 9c39ae2..7656bc5 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +3889,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +3970,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -2967,7 +3048,7 @@ index 9c39ae2..7656bc5 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1376,7 +3992,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +4073,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -2988,7 +3069,7 @@ index 9c39ae2..7656bc5 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +4014,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +4095,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -3010,7 +3091,7 @@ index 9c39ae2..7656bc5 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,9 +4037,30 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,9 +4118,30 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -3041,7 +3122,7 @@ index 9c39ae2..7656bc5 100644
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
          return;
  
-@@ -1406,6 +4071,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +4152,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -3193,7 +3274,7 @@ index 9c39ae2..7656bc5 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1496,12 +4306,48 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1496,12 +4387,48 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
              return;
          }
      }
@@ -3242,7 +3323,7 @@ index 9c39ae2..7656bc5 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1536,6 +4382,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1536,6 +4463,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  
      m_transferState.copiedPixels = total;
      m_transferState.direction = 3u;
@@ -3265,7 +3346,7 @@ index 9c39ae2..7656bc5 100644
  }
  
  void GSCpuBackend::PerformLocalToHostTransfer()
-@@ -1610,6 +4472,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +4553,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -3273,7 +3354,7 @@ index 9c39ae2..7656bc5 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,9 +4485,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,9 +4566,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -3289,7 +3370,7 @@ index 9c39ae2..7656bc5 100644
  
      const uint32_t x0 = context.scissor.x0;
      const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
-@@ -1656,6 +4525,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1656,6 +4606,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -3300,7 +3381,7 @@ index 9c39ae2..7656bc5 100644
          return true;
      }
  
-@@ -1674,11 +4547,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1674,11 +4628,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -3382,7 +3463,7 @@ index 9c39ae2..7656bc5 100644
  bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         uint32_t width,
                                         uint32_t height,
-@@ -1688,6 +4631,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1688,6 +4712,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         bool frameBaseIsPages,
                                         uint32_t sourceOriginX,
                                         uint32_t sourceOriginY) const
@@ -3429,7 +3510,7 @@ index 9c39ae2..7656bc5 100644
  {
      if (!m_vram || m_vramSize == 0u)
          return false;
-@@ -1759,16 +4742,62 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +4823,62 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -3496,7 +3577,7 @@ index 9c39ae2..7656bc5 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +4841,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +4922,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;
