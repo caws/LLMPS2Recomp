@@ -1,0 +1,16 @@
+# PS2Recomp engine — stateless. Games live in separate per-game repos that this
+# engine is pointed at; nothing game-specific is tracked here.
+
+# Toolchain (cloned + built by scripts/01_setup.sh)
+/tools/PS2Recomp
+/tools/ghidra*
+
+# Scratch (build logs, run logs)
+/tmp
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
