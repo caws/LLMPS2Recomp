@@ -102,6 +102,16 @@ memory, prior findings, a subagent/workflow synthesis, even a runtime probe's pr
   (two from workflow syntheses, one from prior notes) were wrong and were caught only by checking the
   disasm / generated code / an empirical run. *Always re-derive a load-bearing claim from ground
   truth before building on it* — especially one that came from a subagent.
+- **A static caller-grep is NOT a verified call chain — use all three (disasm + generated + gdb).**
+  Grepping the generated `.cpp` for who calls a function gives *candidate* callers, not the path
+  actually taken: it is blind to fn-ptr/vtable/table dispatch (target has *no* static caller) and
+  ambiguous under recursion or many callers. This bit us: a caller-grep fingered
+  `0x17a570` as the registry-build selector — but a hook proved it never runs, and a gdb `bt` at the
+  target gave the true path (`…←0x1387a0←0x139A80←dispatchLoop`). **For any dispatch/caller chain:
+  read the disasm of the actual dispatch site, cross-check the generated code, and confirm with gdb.**
+  The cheap, decisive tool is **`bt` at the target function** — the runtime calls recompiled functions
+  as nested host calls, so the host stack *is* the guest call chain (`break FUN_<addr>` + `bt`; see
+  [debugging.md](debugging.md) / the gdb recipe). Prefer it over static xref for caller questions.
 - **Probe reads can lie too.** A value printed from a runtime probe can be a tail-call/`jr` artifact.
   When a probe disagrees with the disasm, suspect the probe.
 - **Empirical test beats argument.** When two analyses disagree, the run decides. Prefer a quick

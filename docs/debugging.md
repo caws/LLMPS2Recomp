@@ -75,6 +75,32 @@ A frame dispatched **directly by `dispatchLoop`** (no recompiled caller above it
 function the boot jumped to via the engine's dispatch — useful for spotting where an
 indirect (`jalr`) call landed.
 
+### `bt` at a target function = the guest call chain (use this for caller/dispatch questions)
+
+The runtime calls recompiled functions as **nested host C++ calls** (`FUN_B(rdram,ctx,runtime)`
+from inside `FUN_A`), so the **host stack mirrors the guest call chain.** When you need the
+*actual* path that reaches a function — and a static caller-grep of the generated `.cpp` is
+ambiguous (many callers, recursion) or empty (the target is reached only via fn-ptr / vtable /
+table dispatch, so it has **no** static caller) — break at the function and backtrace:
+
+```
+break FUN_<addr>_0x<addr>
+commands
+silent
+bt 40
+detach
+quit
+end
+run
+```
+
+The frames *are* the guest callers with exact `source:line` (e.g. `0x1d8900 ← 0x138170 ← … ←
+0x1387a0 ← 0x139A80:1689 ← dispatchLoop`). No rebuild, no instrumentation. **Prefer this over
+static caller-greps for any dispatch/caller chain** — a grep gave the wrong answer (`0x17a570`
+"selects" the registry build) that a hook proved never runs and this `bt` corrected. The frame
+directly above the target is its immediate guest caller; a `dispatchLoop` parent means the
+function was entered at top-level via the guest PC (its own caller already returned).
+
 ### Cross-referencing the generated C++
 
 When raw disasm is hard to follow, **read the generated recompiled C++** —
