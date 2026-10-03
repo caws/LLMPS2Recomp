@@ -1,0 +1,84 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 6974254..2aa88b7 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -1,6 +1,43 @@
+ #include "runtime/ps2_vu1.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <climits>
+ #include "ps2_vu1_detail.h"
+ 
++// FTOI saturation trap (PS2X_VU1_FTOITRAP, default OFF): the level-era garbage cascade carries
++// saturated-int fingerprints; name the FIRST saturating FTOIs (program pc + input bits).
++static void logFtoiSaturation(uint32_t pc, unsigned long long cycle, float input, int component, float scale,
++                              const uint8_t *code, uint32_t codeSize)
++{
++    static const bool s_on = []
++    { const char *e = std::getenv("PS2X_VU1_FTOITRAP"); return e && e[0] && e[0] != '0'; }();
++    if (!s_on)
++        return;
++    static unsigned long s_n = 0;
++    ++s_n;
++    if (s_n <= 24u || (s_n % 65536u) == 0u)
++    {
++        uint32_t bits;
++        std::memcpy(&bits, &input, 4);
++        std::fprintf(stderr, "[VU1 ftoi-sat] n=%lu pc=0x%x cycle=%llu in=0x%08x(%g) c=%d scale=%g\n",
++                     s_n, pc, cycle, bits, input, component, scale);
++        if (s_n == 1u && code)
++        {
++            const uint32_t base = (pc >= 24u) ? (pc - 24u) & ~7u : 0u;
++            for (uint32_t off = 0; off < 48u && base + off + 8u <= codeSize; off += 8u)
++            {
++                uint32_t lo = 0, hi = 0;
++                std::memcpy(&lo, code + base + off, 4u);
++                std::memcpy(&hi, code + base + off + 4u, 4u);
++                std::fprintf(stderr, "    code 0x%04x: upper=%08x lower=%08x%s\n",
++                             base + off, hi, lo, (base + off == pc) ? "  <= ftoi" : "");
++            }
++        }
++    }
++}
++
++
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+@@ -328,6 +365,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             for (int c = 0; c < 4; c++)
+             {
+                 int32_t iv = vuFloatToInt(vs[c], 1.0f);
++                if (iv == INT32_MAX || iv == INT32_MIN)
++                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 1.0f, m_cachedVuCode, m_cachedCodeSize);
+                 std::memcpy(&result[c], &iv, 4);
+             }
+             applyDest(vtDest, result, dest);
+@@ -336,6 +375,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             for (int c = 0; c < 4; c++)
+             {
+                 int32_t iv = vuFloatToInt(vs[c], 16.0f);
++                if (iv == INT32_MAX || iv == INT32_MIN)
++                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 16.0f, m_cachedVuCode, m_cachedCodeSize);
+                 std::memcpy(&result[c], &iv, 4);
+             }
+             applyDest(vtDest, result, dest);
+@@ -344,6 +385,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             for (int c = 0; c < 4; c++)
+             {
+                 int32_t iv = vuFloatToInt(vs[c], 4096.0f);
++                if (iv == INT32_MAX || iv == INT32_MIN)
++                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 4096.0f, m_cachedVuCode, m_cachedCodeSize);
+                 std::memcpy(&result[c], &iv, 4);
+             }
+             applyDest(vtDest, result, dest);
+@@ -352,6 +395,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+             for (int c = 0; c < 4; c++)
+             {
+                 int32_t iv = vuFloatToInt(vs[c], 32768.0f);
++                if (iv == INT32_MAX || iv == INT32_MIN)
++                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 32768.0f, m_cachedVuCode, m_cachedCodeSize);
+                 std::memcpy(&result[c], &iv, 4);
+             }
+             applyDest(vtDest, result, dest);

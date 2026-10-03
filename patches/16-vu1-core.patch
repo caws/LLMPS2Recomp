@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..f56fa43 100644
+index bd75bba..1dff369 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -840,6 +840,51 @@ void VU1Interpreter::commitReadyPipelines()
@@ -160,3 +160,64 @@ index bd75bba..f56fa43 100644
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
      m_xgkick = {};
      m_xgkick.active = true;
+@@ -1590,6 +1702,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                              uint32_t startPC, uint32_t top, uint32_t itop,
+                              uint32_t maxCycles)
+ {
++    // Level-era MSCAL peek (part of PS2X_VIF_CENSUS via env; cont.155): dump what the program
++    // RECEIVES — the first qwords at TOP (the VIF-built input buffer) — for the first few
++    // level-era executions per distinct startPC.
++    {
++        static const bool s_peek = []
++        { const char *e = std::getenv("PS2X_VU1_MSCALPEEK"); return e && e[0] && e[0] != '0'; }();
++        if (s_peek && m_cycle > 450000000ull && vuData)
++        {
++            static uint32_t s_pcs[8] = {0};
++            static int s_n = 0;
++            bool seen = false;
++            for (int i = 0; i < s_n; ++i)
++                if (s_pcs[i] == startPC)
++                    seen = true;
++            if (!seen && s_n < 8)
++            {
++                s_pcs[s_n++] = startPC;
++                std::fprintf(stderr, "[VU1 mscal-peek] startPC=0x%x top=0x%x itop=0x%x cycle=%llu\n",
++                             startPC, top, itop, static_cast<unsigned long long>(m_cycle));
++            }
++            // Full snapshot for offline RE (PS2X_VU1_SNAPSHOT=<dir>): rolling — rewritten every
++            // 25000 executions, so the last capture before the run ends is the current era's.
++            {
++                static unsigned long s_exec = 0;
++                ++s_exec;
++                const char *snapDir = std::getenv("PS2X_VU1_SNAPSHOT");
++                if (snapDir && vuCode && (s_exec % 2000u) == 1u)
++                {
++                    char path[512];
++                    std::snprintf(path, sizeof(path), "%s/vu1_code.bin", snapDir);
++                    if (FILE *f = std::fopen(path, "wb"))
++                    {
++                        std::fwrite(vuCode, 1, codeSize, f);
++                        std::fclose(f);
++                    }
++                    std::snprintf(path, sizeof(path), "%s/vu1_data.bin", snapDir);
++                    if (FILE *f = std::fopen(path, "wb"))
++                    {
++                        std::fwrite(vuData, 1, dataSize, f);
++                        std::fclose(f);
++                    }
++                    std::fprintf(stderr, "[VU1 snapshot] wrote %s/vu1_{code,data}.bin (startPC=0x%x exec=%lu)\n",
++                                 snapDir, startPC, s_exec);
++                }
++                for (uint32_t q = 0; q < 4u; ++q)
++                {
++                    const uint32_t base = ((top & 0x3FFu) * 16u + q * 16u) % dataSize;
++                    uint32_t w[4];
++                    std::memcpy(w, vuData + base, 16u);
++                    std::fprintf(stderr, "    top+%u: %08x %08x %08x %08x\n", q, w[0], w[1], w[2], w[3]);
++                }
++            }
++        }
++    }
+     resetScheduler();
+     m_state.pc = startPC & microAddressMask();
+     m_state.ebit = false;

@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..03fe62f 100644
+index 9c39ae2..137e61f 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,6 +10,7 @@
@@ -27,7 +27,7 @@ index 9c39ae2..03fe62f 100644
              break;
          }
      }
-@@ -635,10 +642,106 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+@@ -635,10 +642,158 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
      return result;
  }
  
@@ -98,8 +98,60 @@ index 9c39ae2..03fe62f 100644
 +            g_gs2Draw.lastTfx = ctx.tex0.tfx;
 +            g_gs2Draw.lastFbp = ctx.frame.fbp;
 +        }
++        // Statistical draw sampler (1-in-4096, era-tagged by total): the first-N peeks below
++        // sample one instant and mislead (rule 8/16); this gives the population.
++        if ((g_gs2Draw.total % 4096u) == 7u && batch.vertexCount >= 2u)
++        {
++            const auto &v0 = batch.vertices[0];
++            const auto &v1 = batch.vertices[1];
++            const auto &v2 = batch.vertices[batch.vertexCount >= 3u ? 2u : 1u];
++            const float xmin = std::min({v0.x, v1.x, v2.x});
++            const float xmax = std::max({v0.x, v1.x, v2.x});
++            const float ymin = std::min({v0.y, v1.y, v2.y});
++            const float ymax = std::max({v0.y, v1.y, v2.y});
++            const uint8_t ztst = static_cast<uint8_t>((ctx.test >> 17) & 0x3u);
++            const uint8_t zmsk = ctx.zbuf.zmask ? 1u : 0u;
++            char uvinfo[96];
++            if (state.prim.tme && state.prim.fst)
++                std::snprintf(uvinfo, sizeof(uvinfo), "uv=(%u..%u,%u..%u)",
++                              std::min({v0.u, v1.u, v2.u}) >> 4, std::max({v0.u, v1.u, v2.u}) >> 4,
++                              std::min({v0.v, v1.v, v2.v}) >> 4, std::max({v0.v, v1.v, v2.v}) >> 4);
++            else if (state.prim.tme)
++                std::snprintf(uvinfo, sizeof(uvinfo), "stq0=(%g,%g,%g)", v0.s, v0.t, v0.q);
++            else
++                std::snprintf(uvinfo, sizeof(uvinfo), "flat rgba=(%u,%u,%u,%u) alpha=0x%llx pabe=%u",
++                              static_cast<unsigned>(v2.r), static_cast<unsigned>(v2.g),
++                              static_cast<unsigned>(v2.b), static_cast<unsigned>(v2.a),
++                              static_cast<unsigned long long>(ctx.alpha), state.pabe ? 1u : 0u);
++            std::fprintf(stderr,
++                         "[gs2:samp] n=%lu type=%u tme=%u fst=%u abe=%u iip=%u bbox=(%.0f..%.0f,%.0f..%.0f) "
++                         "z0=%.0f ztst=%u zmsk=%u texpsm=0x%x tbp0=%u %s\n",
++                         g_gs2Draw.total, static_cast<unsigned>(state.prim.type),
++                         state.prim.tme ? 1u : 0u, state.prim.fst ? 1u : 0u,
++                         state.prim.abe ? 1u : 0u, state.prim.iip ? 1u : 0u,
++                         xmin, xmax, ymin, ymax, static_cast<double>(v0.z), ztst, zmsk,
++                         state.prim.tme ? ctx.tex0.psm : 0u, state.prim.tme ? ctx.tex0.tbp0 : 0u,
++                         uvinfo);
++        }
 +        // Level-era vertex peek: dump the first perspective-textured triangles' full vertex
 +        // data once the draw count is past the boot/movie (are S/T/Q sane or exploded?).
++        if (g_gs2Draw.total > 200000u && state.prim.tme && state.prim.fst &&
++            batch.vertexCount >= 3u)
++        {
++            static unsigned long s_fpeek = 0;
++            if (++s_fpeek <= 8u)
++                std::fprintf(stderr,
++                             "[gs2:fvtx] #%lu type=%u tex(psm=0x%x tw=%u th=%u tbw=%u) "
++                             "v0{xy=%.1f,%.1f uv=%u,%u} v1{xy=%.1f,%.1f uv=%u,%u} v2{xy=%.1f,%.1f uv=%u,%u}\n",
++                             s_fpeek, static_cast<unsigned>(state.prim.type),
++                             ctx.tex0.psm, ctx.tex0.tw, ctx.tex0.th, ctx.tex0.tbw,
++                             batch.vertices[0].x, batch.vertices[0].y,
++                             batch.vertices[0].u >> 4, batch.vertices[0].v >> 4,
++                             batch.vertices[1].x, batch.vertices[1].y,
++                             batch.vertices[1].u >> 4, batch.vertices[1].v >> 4,
++                             batch.vertices[2].x, batch.vertices[2].y,
++                             batch.vertices[2].u >> 4, batch.vertices[2].v >> 4);
++        }
 +        if (g_gs2Draw.total > 200000u && state.prim.tme && !state.prim.fst &&
 +            batch.vertexCount >= 3u)
 +        {
@@ -134,7 +186,7 @@ index 9c39ae2..03fe62f 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -947,6 +1050,12 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,6 +1102,12 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -147,7 +199,7 @@ index 9c39ae2..03fe62f 100644
      const uint32_t clutIndex = resolveClutIndex(index, cpsm, csm, csa, sourcePsm);
      const uint32_t clutWidth = (state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
      const uint32_t clutX = static_cast<uint32_t>(state.texclut.cou) + (clutIndex & 0x0Fu);
-@@ -1024,7 +1133,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +1185,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -162,7 +214,7 @@ index 9c39ae2..03fe62f 100644
      };
  
      if (!state.linearFilter)
-@@ -1299,6 +1414,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +1466,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -195,7 +247,7 @@ index 9c39ae2..03fe62f 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1406,6 +1547,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +1599,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
