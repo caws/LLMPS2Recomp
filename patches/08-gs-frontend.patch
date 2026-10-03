@@ -1,17 +1,318 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index fd5a90d..7a3d73a 100644
+index fd5a90d..cdd1a4e 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -725,8 +725,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
-             if ((nloop * nreg) & 1)
+@@ -638,6 +638,40 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+     return true;
+ }
+ 
++namespace
++{
++struct GifParseState
++{
++    uint32_t active = 0u;   // 0 = idle; 1 = mid-tag, resume on this path's next packet
++    uint8_t flg = 0u;
++    uint32_t nreg = 0u;
++    uint8_t regs[16] = {};
++    uint32_t regIndex = 0u;   // PACKED/REGLIST: next reg slot
++    uint32_t loopsLeft = 0u;  // PACKED: loops remaining (current partial loop included)
++    uint32_t regsLeft = 0u;   // REGLIST: registers remaining
++    bool padPending = false;  // REGLIST: odd reg total -> trailing 8-byte alignment slot
++    uint32_t imageQwLeft = 0u; // IMAGE/IMAGE2: data qwords remaining
++    float q = 1.0f;           // saved m_curQ across the boundary
++    // Seed diagnostics (cont.156): what preceded the current tag read, to attribute desyncs.
++    uint8_t lastEvent = 0u;    // 0 none, 1 image-completed, 2 packed-completed, 3 reglist-completed
++    uint32_t lastEventOff = 0u; // offset just after that completion (same packet)
++    uint8_t lastEventResumed = 0u; // the completed tag had crossed a packet boundary
++    uint32_t lastImgNloop = 0u; // the completed image's declared nloop
++};
++GifParseState g_gifParseState[4];
++uint32_t g_gifActivePath = 3u;
++const bool s_gifResume = []
++{ const char *e = std::getenv("PS2X_GIF_RESUME"); return !(e && e[0] == '0'); }();
++} // namespace
++
++// Called by the GIF arbiter (and the XGKICK fallback) right before each packet is handed to
++// processGIFPacket, so the parser resumes the correct path's suspended tag. Extern "C" free
++// function on purpose: no header change (headers reach the generated code -> full rebuild).
++extern "C" void ps2xGsSetGifPath(uint32_t path)
++{
++    g_gifActivePath = path < 4u ? path : 3u;
++}
++
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+@@ -668,72 +702,185 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+         }
+     });
+ 
++    // One-shot tag-walk dump (PS2X_GIF_WALKDUMP=<pktsize>): print every tag of the FIRST
++    // packet whose sizeBytes matches, to find where the walk desyncs into image data.
++    static const long s_walkDumpSize = []
++    { const char *e = std::getenv("PS2X_GIF_WALKDUMP"); return e ? std::atol(e) : -1; }();
++    static bool s_walkDumpDone = false;
++    const bool walkDump = !s_walkDumpDone && s_walkDumpSize >= 0 &&
++                          sizeBytes == static_cast<uint32_t>(s_walkDumpSize);
++    if (walkDump)
++        s_walkDumpDone = true;
++    uint32_t walkLines = 0;
++
++    // Per-path resumable parse (PS2X_GIF_RESUME, default ON; PCSX2 Gif_Path parity): a GIF
++    // tag's payload legally spans DMA/DIRECT submission boundaries, so the parser keeps the
++    // active tag (format, loops left, reg cursor, image remainder) PER PATH and resumes it on
++    // the path's next packet. The old stateless per-packet parse dropped a split tag's tail
++    // and re-read the next packet's mid-payload bytes as tags -> garbage register writes
++    // (the movie-era 200944-byte packets misparsed from byte 0, cont.156).
++    GifParseState &ps = g_gifParseState[g_gifActivePath & 3u];
++    if (!s_gifResume)
++        ps.active = 0u;
++    ps.lastEventResumed = ps.active ? 1u : 0u;
++    ps.lastEvent = 0u;
++    if (ps.active)
++        m_curQ = ps.q;
++
+     uint32_t offset = 0;
+-    while (offset + 16 <= sizeBytes)
++    for (;;)
+     {
+-        uint64_t tagLo = loadLE64(data + offset);
+-        uint64_t tagHi = loadLE64(data + offset + 8);
+-        offset += 16;
++        if (!ps.active)
++        {
++            if (offset + 16 > sizeBytes)
++                break;
++            const uint64_t tagLo = loadLE64(data + offset);
++            const uint64_t tagHi = loadLE64(data + offset + 8);
++            if (walkDump && walkLines < 220u)
++            {
++                ++walkLines;
++                std::fprintf(stderr, "[gif:walk] off=%u lo=%016llx hi=%016llx nloop=%u flg=%u nreg=%u\n",
++                             offset,
++                             static_cast<unsigned long long>(tagLo),
++                             static_cast<unsigned long long>(tagHi),
++                             static_cast<uint32_t>(tagLo & 0x7FFF),
++                             static_cast<uint32_t>((tagLo >> 58) & 0x3),
++                             static_cast<uint32_t>((tagLo >> 60) & 0xF) ? static_cast<uint32_t>((tagLo >> 60) & 0xF) : 16u);
++            }
++            offset += 16;
+ 
+-        m_curQ = 1.0f;
++            m_curQ = 1.0f;
+ 
+-        uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
+-        uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
+-        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
+-        if (nreg == 0)
+-            nreg = 16;
++            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
++            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
++            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
++            if (nreg == 0)
++                nreg = 16;
+ 
+-        recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
++            recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+ 
+-        bool pre = ((tagLo >> 46) & 1) != 0;
+-        if (pre)
+-        {
+-            writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+-        }
++            const bool pre = ((tagLo >> 46) & 1) != 0;
++            if (pre)
++                writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+ 
+-        uint8_t regs[16];
+-        for (uint32_t i = 0; i < nreg; ++i)
+-            regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
++            if (nloop == 0u)
++                continue; // tag with no payload (NOP / PRIM-only)
+ 
+-        if (flg == GIF_FMT_PACKED)
+-        {
+-            for (uint32_t loop = 0; loop < nloop; ++loop)
++            ps.flg = flg;
++            ps.nreg = nreg;
++            for (uint32_t i = 0; i < 16u; ++i)
++                ps.regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
++            ps.regIndex = 0u;
++            if (flg == GIF_FMT_PACKED)
++            {
++                ps.loopsLeft = nloop;
++            }
++            else if (flg == GIF_FMT_REGLIST)
+             {
+-                for (uint32_t r = 0; r < nreg; ++r)
++                ps.regsLeft = nloop * nreg;
++                ps.padPending = (ps.regsLeft & 1u) != 0u;
++            }
++            else // IMAGE (flg=2) or flg=3 "Disable" == IMAGE2: both carry nloop data qwords
++            {    // (ps2tek; PCSX2 GIFPath shares one case for GIF_FLG_IMAGE/IMAGE2)
++                ps.imageQwLeft = nloop;
++                ps.lastImgNloop = nloop;
++            }
++            // Seed probe: an implausible tag right after a completion attributes the desync.
++            {
++                static const bool s_seedLog = []
++                { const char *e = std::getenv("PS2X_GIF_SEEDLOG"); return e && e[0] && e[0] != '0'; }();
++                const bool implausible =
++                    (flg == GIF_FMT_PACKED && nloop > 0x4000u && nreg > 8u) ||
++                    (flg == GIF_FMT_REGLIST && nloop > 0x4000u && nreg > 8u);
++                if (s_seedLog && implausible)
+                 {
+-                    if (offset + 16 > sizeBytes)
+-                        return;
+-                    uint64_t lo = loadLE64(data + offset);
+-                    uint64_t hi = loadLE64(data + offset + 8);
+-                    offset += 16;
+-                    writeRegisterPacked(regs[r], lo, hi);
++                    static unsigned long s_n = 0;
++                    ++s_n;
++                    if (s_n <= 40u || (s_n % 1024u) == 0u)
++                        std::fprintf(stderr,
++                                     "[gif:seed] #%lu path=%u off=%u pkt=%u tag{flg=%u nloop=%u nreg=%u} "
++                                     "prev{ev=%u off=%u resumed=%u imgNloop=%u} lo=%016llx\n",
++                                     s_n, g_gifActivePath, offset - 16u, sizeBytes, flg, nloop, nreg,
++                                     ps.lastEvent, ps.lastEventOff, ps.lastEventResumed, ps.lastImgNloop,
++                                     static_cast<unsigned long long>(tagLo));
+                 }
+             }
++            ps.active = 1u;
+         }
+-        else if (flg == GIF_FMT_REGLIST)
++
++        if (ps.flg == GIF_FMT_PACKED)
+         {
+-            for (uint32_t loop = 0; loop < nloop; ++loop)
++            while (ps.loopsLeft != 0u)
+             {
+-                for (uint32_t r = 0; r < nreg; ++r)
++                while (ps.regIndex < ps.nreg)
+                 {
+-                    if (offset + 8 > sizeBytes)
+-                        return;
+-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
+-                    offset += 8;
++                    if (offset + 16 > sizeBytes)
++                        goto suspend; // the level's big draw lists really do span DIRECTs
++                    const uint64_t lo = loadLE64(data + offset);
++                    const uint64_t hi = loadLE64(data + offset + 8);
++                    offset += 16;
++                    writeRegisterPacked(ps.regs[ps.regIndex], lo, hi);
++                    ++ps.regIndex;
+                 }
++                ps.regIndex = 0u;
++                --ps.loopsLeft;
+             }
+-            if ((nloop * nreg) & 1)
++            ps.lastEvent = 2u;
++            ps.lastEventOff = offset;
++            ps.active = 0u;
++        }
++        else if (ps.flg == GIF_FMT_REGLIST)
++        {
++            while (ps.regsLeft != 0u)
++            {
++                if (offset + 8 > sizeBytes)
++                    goto suspend;
++                writeRegisterUnlocked(ps.regs[ps.regIndex], loadLE64(data + offset));
                  offset += 8;
++                --ps.regsLeft;
++                if (++ps.regIndex == ps.nreg)
++                    ps.regIndex = 0u;
++            }
++            if (ps.padPending)
++            {
++                if (offset + 8 > sizeBytes)
++                    goto suspend;
++                offset += 8; // odd reg total: qword-align past the unused half
++                ps.padPending = false;
++            }
++            ps.active = 0u;
          }
 -        else if (flg == GIF_FMT_IMAGE)
--        {
-+        else // IMAGE (flg=2) or flg=3 "Disable" == IMAGE2: BOTH consume nloop qwords
-+        {    // (ps2tek; PCSX2 GIFPath shares one case for GIF_FLG_IMAGE/IMAGE2). Treating
-+             // flg=3 as payload-less desyncs the parser: the data qwords get re-read as
-+             // GIF tags -> garbage FRAME/scissor writes (the cont.156 level corruption).
-             uint32_t imageBytes = nloop * 16;
-             if (offset + imageBytes > sizeBytes)
-                 imageBytes = sizeBytes - offset;
++        else // IMAGE / IMAGE2
+         {
+-            uint32_t imageBytes = nloop * 16;
+-            if (offset + imageBytes > sizeBytes)
+-                imageBytes = sizeBytes - offset;
+-            processImageData(data + offset, imageBytes);
+-            offset += imageBytes;
++            const uint32_t availQw = (sizeBytes - offset) / 16u;
++            const uint32_t chunkQw = std::min(ps.imageQwLeft, availQw);
++            if (chunkQw != 0u)
++            {
++                processImageData(data + offset, chunkQw * 16u);
++                offset += chunkQw * 16u;
++                ps.imageQwLeft -= chunkQw;
++            }
++            if (ps.imageQwLeft != 0u)
++                goto suspend;
++            ps.lastEvent = 1u;
++            ps.lastEventOff = offset;
++            ps.active = 0u;
+         }
+     }
++    return;
++
++suspend:
++    ps.q = m_curQ; // mid-tag packet boundary: resume on this path's next packet
++    {
++        static unsigned long s_suspN = 0;
++        ++s_suspN;
++        if (s_suspN <= 48u || (s_suspN % 2048u) == 0u)
++            std::fprintf(stderr,
++                         "[gif:susp] #%lu path=%u flg=%u loopsLeft=%u regsLeft=%u imgQwLeft=%u "
++                         "regIdx=%u nreg=%u pkt=%u off=%u\n",
++                         s_suspN, g_gifActivePath, ps.flg, ps.loopsLeft, ps.regsLeft,
++                         ps.imageQwLeft, ps.regIndex, ps.nreg, sizeBytes, offset);
++    }
+ }
+ 
+ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -741,6 +888,10 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16u || !m_backend)
+         return false;
++    // PATH3 has a suspended tag mid-payload: this bypass would parse out of stream order and
++    // leave the pending state to poison the next PATH3 packet. Fall back to the normal route.
++    if (s_gifResume && g_gifParseState[3].active)
++        return false;
+ 
+     if (!validatePackedGifPacket(data, sizeBytes))
+         return false;
+@@ -1067,6 +1218,32 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ 
+ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+ {
++    // PS2X_GS_FRAMETRAP: log implausible FRAME writes with the submitting path + parse phase,
++    // to locate the residual desync source (cont.156). Level-legit fbp: 0/128/256/384, fbw=8.
++    {
++        static const bool s_frameTrap = []
++        { const char *e = std::getenv("PS2X_GS_FRAMETRAP"); return e && e[0] && e[0] != '0'; }();
++        if (s_frameTrap && (regAddr == 0x4Cu || regAddr == 0x4Du))
++        {
++            const uint32_t fbp = static_cast<uint32_t>(value & 0x1FFu);
++            const uint32_t fbw = static_cast<uint32_t>((value >> 16) & 0x3Fu);
++            if (fbw != 8u || (fbp & 127u) != 0u)
++            {
++                static unsigned long s_n = 0;
++                ++s_n;
++                if (s_n <= 40u || (s_n % 1024u) == 0u)
++                {
++                    const GifParseState &tps = g_gifParseState[g_gifActivePath & 3u];
++                    std::fprintf(stderr,
++                                 "[gs:frametrap] #%lu reg=%02x val=%016llx fbp=%u fbw=%u path=%u "
++                                 "psActive=%u psFlg=%u loopsLeft=%u imgLeft=%u\n",
++                                 s_n, regAddr, static_cast<unsigned long long>(value), fbp, fbw,
++                                 g_gifActivePath, tps.active, tps.flg, tps.loopsLeft, tps.imageQwLeft);
++                }
++            }
++        }
++    }
++
+     const bool interestingReg =
+         regAddr == GS_REG_PRIM ||
+         regAddr == GS_REG_RGBAQ ||

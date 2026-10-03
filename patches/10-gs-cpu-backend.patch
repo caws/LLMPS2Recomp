@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..b7f0594 100644
+index 9c39ae2..17506d5 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,6 +10,7 @@
@@ -503,7 +503,7 @@ index 9c39ae2..b7f0594 100644
 +            static unsigned long s_presN = 0;
 +            ++s_presN;
 +            const char *pd = std::getenv("PS2X_GS_PRESENT_SAVE");
-+            if (pd && g_gs2EraOpen && (s_presN % 512u) == 0u && !pixels.empty())
++            if (pd && g_gs2EraOpen && (s_presN % 32u) == 0u && !pixels.empty())
 +            {
 +                char path[512];
 +                std::snprintf(path, sizeof(path), "%s/present_%lu.ppm", pd, (s_presN / 512u) % 4u);

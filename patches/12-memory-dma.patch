@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 7cb2ba4..fa6ff8f 100644
+index 7cb2ba4..ed6fde9 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -3,6 +3,7 @@
@@ -21,7 +21,28 @@ index 7cb2ba4..fa6ff8f 100644
      resetEeTimers();
  
      try
-@@ -1209,6 +1214,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1201,6 +1206,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+     {
+         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+ 
++        // PS2X_VIF_CTLLOG: log VIF1 control-register writes (FBRST/STAT/ERR/MARK) -- which
++        // reset mechanism does the game use between frame chains? (cont.156 span-carry hunt)
++        {
++            static const bool s_ctlLog = []
++            { const char *e = std::getenv("PS2X_VIF_CTLLOG"); return e && e[0] && e[0] != '0'; }();
++            if (s_ctlLog && address != 0x10003C00u + 0x100u)
++            {
++                static unsigned long s_n = 0;
++                ++s_n;
++                if (s_n <= 60u || (s_n % 512u) == 0u)
++                    std::fprintf(stderr, "[vif1:ctl] #%lu addr=%08X val=%08X\n",
++                                 s_n, address, value);
++            }
++        }
+         switch (address)
+         {
+         case 0x10003C10u:     // VIF1_FBRST
+@@ -1209,6 +1228,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                  std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                  m_vif1PendingPath2ImageQwc = 0u;
                  m_vif1PendingPath2DirectHl = false;
@@ -32,7 +53,7 @@ index 7cb2ba4..fa6ff8f 100644
              }
              if (value & 0x8u) // STC
              {
-@@ -1315,7 +1324,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1315,7 +1338,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                      uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                      uint32_t asp = (chcr >> 4) & 0x3u;
                      const bool tieEnabled = (chcr & (1u << 7)) != 0u;
@@ -58,7 +79,7 @@ index 7cb2ba4..fa6ff8f 100644
                      std::vector<uint8_t> chainBuf;
  
                      auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
-@@ -1353,6 +1379,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1353,6 +1393,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                          }
                      };
  
@@ -81,7 +102,7 @@ index 7cb2ba4..fa6ff8f 100644
                      auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
                      {
                          uint32_t tagPhys = 0u;
-@@ -1365,6 +1407,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1365,6 +1421,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                              return;
  
                          // VIF packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
@@ -90,7 +111,7 @@ index 7cb2ba4..fa6ff8f 100644
                          chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
                          appendData(localTagAddr + 16u, qwCount);
                      };
-@@ -1483,6 +1527,28 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1483,6 +1541,28 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                          if (compactVifLocalTag)
                              appendCompactVif1TagData(currentTagAddr, 0u);
  
@@ -119,7 +140,26 @@ index 7cb2ba4..fa6ff8f 100644
                          if (hasPayload)
                          {
                              if (compactVifLocalTag)
-@@ -1540,6 +1606,58 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1492,6 +1572,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         }
+                         if (irq && tieEnabled)
+                             endChain = true;
++                        // PS2X_VIF_SEQLOG: end-of-chain forensics for big VIF1 chains -- which
++                        // tag ended the walk (id/qwc/irq) and how many tags were processed.
++                        if (endChain || tagsProcessed >= kMaxChainTags)
++                        {
++                            static const bool s_endLog = []
++                            { const char *e = std::getenv("PS2X_VIF_SEQLOG"); return e && e[0] && e[0] != '0'; }();
++                            if (s_endLog && chainBuf.size() > 3000000u)
++                                std::fprintf(stderr,
++                                             "[vif1:chainend] bytes=%zu tags=%d lastTag{id=%u qwc=%u irq=%d addr=%08X} tie=%d\n",
++                                             chainBuf.size(), tagsProcessed, id, (unsigned)tagQwc,
++                                             irq ? 1 : 0, addr, tieEnabled ? 1 : 0);
++                        }
+                         if (endChain)
+                             break;
+                     }
+@@ -1540,6 +1632,58 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                      processPendingTransfers();
                  }
              }

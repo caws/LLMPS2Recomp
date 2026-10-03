@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..1dff369 100644
+index bd75bba..2f6d6d0 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-@@ -840,6 +840,51 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -840,6 +840,53 @@ void VU1Interpreter::commitReadyPipelines()
      }
  }
  
@@ -15,6 +15,8 @@ index bd75bba..1dff369 100644
 +//   real hardware never stops the VU over GIF data content, and the old interpreter dropped the
 +//   kick and continued. Upstream's m_stopRequested abort turned every garbage-tag kick into a
 +//   whole dead geometry batch (~140 killed programs / 10 min in the LOTR level era).
++extern "C" void ps2xGsSetGifPath(uint32_t); // gs_frontend.cpp per-path GIF resume selector
++
 +static const bool s_vu1KickFlg3Image = []
 +{ const char *e = std::getenv("PS2X_VU1_KICKFLG3"); return !(e && e[0] == '0'); }();
 +static const bool s_vu1KickDropSoft = []
@@ -54,7 +56,7 @@ index bd75bba..1dff369 100644
  void VU1Interpreter::progressXgkick()
  {
      if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
-@@ -851,6 +896,44 @@ void VU1Interpreter::progressXgkick()
+@@ -851,6 +898,44 @@ void VU1Interpreter::progressXgkick()
          m_xgkick.cycleCredit -= 2u;
          if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
          {
@@ -99,7 +101,7 @@ index bd75bba..1dff369 100644
              reportReservedInstruction(false, 0xFFFFFFFBu);
              m_xgkick.active = false;
              return;
-@@ -879,10 +962,16 @@ void VU1Interpreter::progressXgkick()
+@@ -879,10 +964,16 @@ void VU1Interpreter::progressXgkick()
                  tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
              else if (format == 1u)
                  tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
@@ -118,7 +120,7 @@ index bd75bba..1dff369 100644
                  reportReservedInstruction(false, 0xFFFFFFF8u);
                  m_xgkick.active = false;
                  return;
-@@ -890,6 +979,12 @@ void VU1Interpreter::progressXgkick()
+@@ -890,6 +981,12 @@ void VU1Interpreter::progressXgkick()
  
              if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
              {
@@ -131,7 +133,12 @@ index bd75bba..1dff369 100644
                  reportReservedInstruction(false, 0xFFFFFFFBu);
                  m_xgkick.active = false;
                  return;
-@@ -926,11 +1021,28 @@ void VU1Interpreter::finishXgkick()
+@@ -922,15 +1019,33 @@ void VU1Interpreter::finishXgkick()
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
++        ps2xGsSetGifPath(1u);
+         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
      m_xgkick.active = false;
  }
  
@@ -160,7 +167,7 @@ index bd75bba..1dff369 100644
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
      m_xgkick = {};
      m_xgkick.active = true;
-@@ -1590,6 +1702,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -1590,6 +1705,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t startPC, uint32_t top, uint32_t itop,
                               uint32_t maxCycles)
  {

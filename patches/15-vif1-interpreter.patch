@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index 05fc764..67749c9 100644
+index 05fc764..9d7d25a 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 05fc764..67749c9 100644
  #include <cstring>
  
  enum VIFCmd : uint8_t
-@@ -28,8 +30,108 @@ enum VIFCmd : uint8_t
+@@ -28,8 +30,121 @@ enum VIFCmd : uint8_t
  
  namespace
  {
@@ -113,13 +113,26 @@ index 05fc764..67749c9 100644
 +        const char *e = std::getenv("PS2X_VIF_DIRECTSPAN");
 +        return !(e != nullptr && e[0] == '0'); // default ON (correctness fix)
 +    }();
++
++    // PS2X_GIF_RESUME (default ON) moves split-tag handling into the GS frontend's per-path
++    // resumable parser: it consumes a spilled tag's tail from the path's NEXT packet directly,
++    // so the VIF-side image-continuation carry (which prepends a synthesized IMAGE tag) must
++    // stand down or the resuming parser reads the synthetic tag as payload.
++    const bool s_gifResumeOwnsSplits = [] {
++        const char *e = std::getenv("PS2X_GIF_RESUME");
++        return !(e && e[0] == '0');
++    }();
 +    uint32_t g_vif1DirectSpanRemainQw = 0u;
++    struct VifCmdRingEnt { uint32_t pos; uint32_t bufSize; uint32_t cmd; };
++    VifCmdRingEnt g_vifCmdRing[32] = {};
++    uint32_t g_vifCmdRingIdx = 0u;
++    uint32_t g_vifEntrySpanQw = 0u;
 +    bool g_vif1DirectSpanHl = false;
 +
      uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
      {
          if (!data || sizeBytes < 16u)
-@@ -38,11 +140,55 @@ namespace
+@@ -38,11 +153,66 @@ namespace
          uint64_t tagLo = 0u;
          std::memcpy(&tagLo, data, sizeof(tagLo));
          const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
@@ -165,7 +178,18 @@ index 05fc764..67749c9 100644
 +            {
 +                const uint32_t need = nloop * 16u;
 +                if (off + need > sizeBytes)
-+                    return nloop - (sizeBytes - off) / 16u; // image spills past this payload
++                {
++                    const uint32_t spill = nloop - (sizeBytes - off) / 16u;
++                    if (flg == 3u)
++                    {
++                        static unsigned long s_flg3SpillN = 0;
++                        ++s_flg3SpillN;
++                        if (s_flg3SpillN <= 32u || (s_flg3SpillN % 1024u) == 0u)
++                            std::fprintf(stderr, "[vif:flg3spill] #%lu nloop=%u spill=%u pkt=%u off=%u\n",
++                                         s_flg3SpillN, nloop, spill, sizeBytes, off);
++                    }
++                    return spill; // image spills past this payload
++                }
 +                off += need;
 +            }
 +            if (off > sizeBytes) // a PACKED/REGLIST tag overran -> malformed payload, stop
@@ -176,7 +200,7 @@ index 05fc764..67749c9 100644
  }
  
  void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
-@@ -247,6 +393,14 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -247,6 +417,14 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
      }
  }
  
@@ -191,7 +215,7 @@ index 05fc764..67749c9 100644
  void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
  {
      if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
-@@ -261,14 +415,90 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+@@ -261,14 +439,109 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
  
  void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -209,6 +233,24 @@ index 05fc764..67749c9 100644
 +    // FIRST -- this data is mid-span Path2 GIF payload, never VIF commands. Delivery mirrors the
 +    // DIRECT handler: pending-image continuation (payload-aligned, cycle 85) first, then the
 +    // remainder submitted for tag parse with carry detection.
++    g_vifEntrySpanQw = g_vif1DirectSpanRemainQw;
++    // PS2X_VIF_SEQLOG: one line per VIF1 delivery -- size, entry span, first 16 bytes.
++    // Ordering forensics (cont.156): does the ~900KB GIF continuation of the trailing
++    // DIRECT imm=0 arrive as the NEXT delivery (hardware order) or displaced?
++    {
++        static const bool s_seqLog = []
++        { const char *e = std::getenv("PS2X_VIF_SEQLOG"); return e && e[0] && e[0] != '0'; }();
++        if (s_seqLog)
++        {
++            static unsigned long s_n = 0;
++            ++s_n;
++            char hb[40];
++            for (int k = 0; k < 12 && k < (int)sizeBytes; ++k)
++                std::snprintf(hb + k * 2, 3, "%02X", data[k]);
++            std::fprintf(stderr, "[vif1:seq] #%lu size=%u entrySpan=%u head=%s\n",
++                         s_n, sizeBytes, g_vifEntrySpanQw, hb);
++        }
++    }
 +    if (s_vifDirectSpan && g_vif1DirectSpanRemainQw != 0u)
 +    {
 +        const uint32_t spanQw = std::min<uint32_t>(g_vif1DirectSpanRemainQw, sizeBytes / 16u);
@@ -261,7 +303,8 @@ index 05fc764..67749c9 100644
 +                const uint8_t *restData = data + static_cast<size_t>(imgQw) * 16u;
 +                submitGifPacket(GifPathId::Path2, restData, restQw * 16u, true,
 +                                g_vif1DirectSpanHl);
-+                const uint32_t carry = directTrailingImageQwc(restData, restQw * 16u);
++                const uint32_t carry =
++                    s_gifResumeOwnsSplits ? 0u : directTrailingImageQwc(restData, restQw * 16u);
 +                if (carry != 0u)
 +                {
 +                    m_vif1PendingPath2ImageQwc = carry;
@@ -283,7 +326,7 @@ index 05fc764..67749c9 100644
          {
              const uint32_t availableQw = (sizeBytes - pos) / 16u;
              if (availableQw == 0u)
-@@ -277,6 +507,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -277,6 +550,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              }
  
              const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
@@ -318,7 +361,48 @@ index 05fc764..67749c9 100644
              std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
              const uint64_t imageTag =
                  static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-@@ -452,6 +710,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -307,6 +608,40 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         uint16_t imm = cmd & 0xFFFF;
+         uint8_t num = (cmd >> 16) & 0xFF;
+         const bool irq = (cmd & 0x80000000u) != 0u;
++        // Command ring (cont.156): last 32 VIF1 commands, dumped by the directbig probe to find
++        // where the command-stream walk desyncs into data (phantom DIRECTHL family).
++        g_vifCmdRing[g_vifCmdRingIdx & 31u] = {pos - 4u, sizeBytes, cmd};
++        ++g_vifCmdRingIdx;
++        // One-shot big-buffer capture (PS2X_VIF_BUFDUMP=<minBytes>): raw buffer + every decoded
++        // command, for offline re-walks (test size formulas without rebuilds).
++        {
++            static const uint32_t s_bufDumpMin = [] {
++                const char *e = std::getenv("PS2X_VIF_BUFDUMP");
++                return (e && e[0]) ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
++            }();
++            static FILE *s_bufTrace = nullptr;
++            static const uint8_t *s_bufTarget = nullptr;
++            if (s_bufDumpMin != 0u && sizeBytes >= s_bufDumpMin && !s_bufTarget)
++            {
++                if (FILE *bf = std::fopen("tmp/vifbuf.bin", "wb"))
++                {
++                    std::fwrite(data, 1, sizeBytes, bf);
++                    std::fclose(bf);
++                }
++                s_bufTrace = std::fopen("tmp/viftrace.txt", "w");
++                s_bufTarget = data;
++                std::fprintf(stderr, "[VIF:bufdump] captured %u bytes -> tmp/vifbuf.bin\n", sizeBytes);
++            }
++            if (s_bufTrace && s_bufTarget == data)
++            {
++                std::fprintf(s_bufTrace, "%u %08X\n", pos - 4u, cmd);
++                if (pos + 4u > sizeBytes)
++                {
++                    std::fclose(s_bufTrace);
++                    s_bufTrace = nullptr;
++                }
++            }
++        }
+ 
+         // Track most-recent command for VIFn_CODE emulation.
+         vif1_regs.code = cmd;
+@@ -452,6 +787,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                      std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                      markVU1CodeModified();
                  }
@@ -334,7 +418,7 @@ index 05fc764..67749c9 100644
              }
              pos += mpgBytes;
              if (pos > sizeBytes)
-@@ -463,31 +730,204 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -463,31 +807,263 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              uint32_t qwCount = imm;
              if (qwCount == 0)
                  qwCount = 65536;
@@ -375,6 +459,33 @@ index 05fc764..67749c9 100644
 +                        for (uint32_t b = 0; b < 16u && (o + b) < sizeBytes; ++b)
 +                            std::fprintf(stderr, "%02X", data[o + b]);
 +                        std::fprintf(stderr, "\n");
++                    }
++                    // Retroactive bad-buffer dump: the EXACT instance that produced this
++                    // phantom, for offline ground-truth walks. One-shot.
++                    {
++                        static bool s_badDumped = false;
++                        if (!s_badDumped && std::getenv("PS2X_VIF_BUFDUMP"))
++                        {
++                            s_badDumped = true;
++                            if (FILE *bf = std::fopen("tmp/vifbuf_bad.bin", "wb"))
++                            {
++                                std::fwrite(data, 1, sizeBytes, bf);
++                                std::fclose(bf);
++                            }
++                            std::fprintf(stderr,
++                                         "[VIF:baddump] wrote %u bytes, phantom at pos=%u entrySpanQw=%u\n",
++                                         sizeBytes, pos, g_vifEntrySpanQw);
++                        }
++                    }
++                    std::fprintf(stderr, "    ring (oldest->newest):\n");
++                    for (uint32_t k = 0; k < 32u; ++k)
++                    {
++                        const VifCmdRingEnt &e = g_vifCmdRing[(g_vifCmdRingIdx + k) & 31u];
++                        if (e.bufSize == 0u)
++                            continue;
++                        std::fprintf(stderr, "      pos=%u/%u cmd=%08X op=%02X num=%u imm=%u\n",
++                                     e.pos, e.bufSize, e.cmd,
++                                     (e.cmd >> 24) & 0x7Fu, (e.cmd >> 16) & 0xFFu, e.cmd & 0xFFFFu);
 +                    }
 +                }
 +            }
@@ -441,7 +552,9 @@ index 05fc764..67749c9 100644
 +                const uint8_t *restData = data + pos + static_cast<size_t>(imgQw) * 16u;
 +
 +                if (restQw > 0u)
-+                {
+                 {
+-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
+-                    if (imageQw > inlineImageQw)
 +                // PS2X_GS_IMGCONT (cycle 83): sample the GS pending-image BEFORE this DIRECT so we
 +                // can tell whether THIS DIRECT opened a fresh image that overran (before==0,
 +                // after>0) vs a stale/pre-existing incomplete transfer (before>0) -- the latter must
@@ -466,7 +579,8 @@ index 05fc764..67749c9 100644
 +                const uint32_t oldImageQw = gifImageQwcFromTag(restData, restQw * 16u);
 +                const uint32_t oldCarry =
 +                    (oldImageQw > (restQw - 1u)) ? (oldImageQw - (restQw - 1u)) : 0u;
-+                const uint32_t newCarry = directTrailingImageQwc(restData, restQw * 16u);
++                const uint32_t newCarry =
++                    s_gifResumeOwnsSplits ? 0u : directTrailingImageQwc(restData, restQw * 16u);
 +
 +                // PS2X_GS_DIRECTIMGLOG=1 (probe, no behaviour change). Where NEW disagrees with OLD,
 +                // dump qwCount, first-tag flg, both carries, AND the 16 bytes FOLLOWING this DIRECT
@@ -478,9 +592,7 @@ index 05fc764..67749c9 100644
 +                    return e && e[0] && e[0] != '0';
 +                }();
 +                if (s_dirImgLog && newCarry != oldCarry)
-                 {
--                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
--                    if (imageQw > inlineImageQw)
++                {
 +                    static uint64_t s_n = 0ull;
 +                    if (++s_n <= 60ull || (s_n % 500ull) == 0ull)
                      {
@@ -511,7 +623,11 @@ index 05fc764..67749c9 100644
 +                // new carry on it. Reliable and false-positive-free at the SOURCE, unlike cycle 82's
 +                // re-walk and cycle 89's stale-transfer over-fire. Default OFF pending validation.
 +                uint32_t carry;
-+                if (s_imgCont)
++                if (s_gifResumeOwnsSplits)
++                {
++                    carry = 0u; // the frontend's resumable parser owns split tags
++                }
++                else if (s_imgCont)
 +                {
 +                    const uint32_t pendAfter =
 +                        m_gsPendingImageFn ? m_gsPendingImageFn() : 0u;
@@ -538,15 +654,42 @@ index 05fc764..67749c9 100644
              {
 +                // Cycle 86 (PS2X_VIF_DIRECTSPAN): the un-delivered remainder of this DIRECT
 +                // continues at the next processVIF1Data entry instead of being forgotten.
-+                if (s_vifDirectSpan)
++                // ★ cont.156 refinement: ONLY for imm != 0. The game ends EVERY frame chain
++                // with a terminal [NOP][DIRECT imm=0] tag embed followed by nothing -- on
++                // hardware that construct is benign, and arming a 65536-qw span from it made
++                // the carry eat the first ~900 KB of every subsequent frame chain (the
++                // phantom-DIRECTHL corruption cascade). The original imm=0-span evidence
++                // (run_c86A) was itself the half-phase misparse artifact that PS2X_DMA_TTEQW
++                // later fixed. Sized DIRECTs (imm != 0) still span (the FMV's 32767-qw
++                // uploads legitimately split across chain buffers). PS2X_VIF_IMM0SPAN=1
++                // restores the old behavior.
++                static const bool s_imm0Span = [] {
++                    const char *e = std::getenv("PS2X_VIF_IMM0SPAN");
++                    return e && e[0] && e[0] != '0';
++                }();
++                if (s_vifDirectSpan && (imm != 0u || s_imm0Span))
 +                {
 +                    g_vif1DirectSpanRemainQw = declaredQw - qwCount;
 +                    g_vif1DirectSpanHl = (opcode == VIF_DIRECTHL);
++                    {
++                        static const bool s_spanSetLog = []
++                        { const char *e = std::getenv("PS2X_VIF_CTLLOG"); return e && e[0] && e[0] != '0'; }();
++                        if (s_spanSetLog)
++                        {
++                            static unsigned long s_n = 0;
++                            ++s_n;
++                            if (s_n <= 60u || (s_n % 256u) == 0u)
++                                std::fprintf(stderr,
++                                             "[vif1:spanset] #%lu remain=%u declared=%u fed=%u pos=%u/%u imm=%u\n",
++                                             s_n, g_vif1DirectSpanRemainQw, declaredQw, qwCount,
++                                             pos, sizeBytes, (unsigned)imm);
++                        }
++                    }
 +                }
                  pos = sizeBytes;
                  break;
              }
-@@ -530,6 +970,62 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -530,6 +1106,62 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              if (wl == 0u)
                  wl = 1u;
  
@@ -609,7 +752,7 @@ index 05fc764..67749c9 100644
              uint32_t sourceVectorCount = writeVectorCount;
              if (cl < wl)
              {
-@@ -549,6 +1045,43 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -549,6 +1181,43 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
  
              const bool zeroExtend = (imm & 0x4000u) != 0u;
  
@@ -653,7 +796,7 @@ index 05fc764..67749c9 100644
              if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
              {
                  const uint8_t *srcBase = data + pos;
-@@ -758,3 +1291,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -758,3 +1427,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          }
      }
  }
