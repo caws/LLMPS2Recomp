@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..6a44438 100644
+index 9c39ae2..c7969c8 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -10,6 +10,7 @@
@@ -10,7 +10,7 @@ index 9c39ae2..6a44438 100644
  #include <cstring>
  #include <fstream>
  #include <iostream>
-@@ -468,12 +469,112 @@ namespace
+@@ -468,12 +469,147 @@ namespace
      }
  }
  
@@ -32,6 +32,38 @@ index 9c39ae2..6a44438 100644
 +{ const char *e = std::getenv("PS2X_GS_THREAD"); return !(e && e[0] == '0'); }();
 +static constexpr size_t kGsQueueMaxItems = 65536;
 +static constexpr size_t kGsQueueMaxUploadBytes = 96u * 1024u * 1024u;
++
++// ---- Display-flip presentation snapshot (PS2X_GS_FLIPSNAP, default ON; =0 reverts to the pure
++// per-Sync capture). Root cause (cont.165, menu-text RE): the menu redraws its DISPLAY buffer
++// every frame -- clear -> scene composite -> cover into the BACK buffer, then flips, then draws
++// the UI TEXT directly onto the new FRONT buffer (real scanout picks that up mid-frame). So the
++// frame-complete state exists only shortly AFTER each DISPFB flip, and mid-frame captures (the
++// old per-Sync snapshot, or the live no-drain present) showed post-clear black or the pre-cover
++// scene, never the text. Mechanism: the DISPFB1/2 write ARMS a capture; the worker consumes it
++// at its first idle moment after at least one post-flip draw executed (the front-buffer text
++// batch). The per-Sync capture remains as a fallback for eras with no flips for >400ms.
++static const bool s_gsFlipSnap = []
++{ const char *e = std::getenv("PS2X_GS_FLIPSNAP"); return !(e && e[0] == '0'); }();
++// CLUT shadow (default ON; =0 disables) -- see the m_clutShadow member comment (cont.165).
++static const bool s_gsClutShadow = []
++{ const char *e = std::getenv("PS2X_GS_CLUTSHADOW"); return !(e && e[0] == '0'); }();
++// PS2X_GS_FONTTRACE (env, default OFF): LOTR menu-text RE (cont.165). Traces (a) every transfer
++// whose destination is the font-CLUT blocks 12288-12290 with its first payload words, and (b)
++// every draw that samples a T4HL/T4HH texture with its CLUT at those blocks. Diagnostic for the
++// CLUT-RGB-zeroed-in-VRAM corruption (source payloads are white+alpha, VRAM ends up alpha-only).
++static const bool g_gs2FontTrace = []
++{ const char *e = std::getenv("PS2X_GS_FONTTRACE"); return e && e[0] && e[0] != '0'; }();
++static unsigned long g_gs2FontPixWrites = 0; // frameWrite count, read per-draw by [gs2:fontwrites]
++static unsigned long g_gs2FontDraws = 0;     // total T4HL/HH cbp-12288 glyph draws (uncapped)
++static std::atomic<uint32_t> g_gs2LastFontFbp{0xFFFFu}; // FRAME.fbp of the most recent glyph draw
++static std::atomic<GSCpuBackend *> g_gs2ActiveBackend{nullptr};
++static std::atomic<uint64_t> g_gs2LastFlipSnapMs{0};
++static uint64_t gs2NowMs()
++{
++    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                     std::chrono::steady_clock::now().time_since_epoch())
++                                     .count());
++}
 +
 +void GSCpuBackend::workerLoop()
 +{
@@ -101,6 +133,9 @@ index 9c39ae2..6a44438 100644
 +
 +GSCpuBackend::~GSCpuBackend()
 +{
++    GSCpuBackend *self = this;
++    g_gs2ActiveBackend.compare_exchange_strong(self, nullptr, std::memory_order_release,
++                                               std::memory_order_relaxed);
 +    if (m_worker.joinable())
 +    {
 +        {
@@ -123,7 +158,7 @@ index 9c39ae2..6a44438 100644
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +632,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +667,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -140,7 +175,7 @@ index 9c39ae2..6a44438 100644
              break;
          }
      }
-@@ -541,6 +648,7 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,14 +683,22 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -148,7 +183,14 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      m_vram = vram;
      m_vramSize = vramSize;
-@@ -549,6 +657,7 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+     ResetUnlocked();
++    // Display-flip snapshot routing: FIRST-initialized backend wins. The presentation path
++    // Initializes a thread_local scratch backend over the VRAM snapshot on every present --
++    // that one must never capture flips (its "VRAM" is the copy itself).
++    GSCpuBackend *expected = nullptr;
++    g_gs2ActiveBackend.compare_exchange_strong(expected, this, std::memory_order_release,
++                                               std::memory_order_relaxed);
+ }
  
  void GSCpuBackend::Reset()
  {
@@ -156,7 +198,12 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      ResetUnlocked();
  }
-@@ -565,6 +674,16 @@ void GSCpuBackend::ResetUnlocked()
+@@ -561,10 +711,21 @@ void GSCpuBackend::ResetUnlocked()
+     m_transferState.direction = 3u;
+     m_localToHostBuffer.clear();
+     m_localToHostReadPos = 0u;
++    m_clutShadow.clear();
+ }
  
  void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  {
@@ -173,7 +220,7 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +692,58 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,22 +734,109 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -218,16 +265,67 @@ index 9c39ae2..6a44438 100644
 +    // everything the guest submitted before this Sync (FINISH fires per frame chain).
 +    // Copy VRAM here; Present() prefers this frame-complete copy while fresh and falls
 +    // back to live VRAM when an era doesn't Sync.
++    // cont.165: while display-flip snapshots are live (a flip in the last 400ms), ordinary
++    // Syncs must NOT capture -- a mid-frame capture would overwrite the frame-complete flip
++    // snapshot with a post-clear/mid-scene state (that was the menu-text eraser). When an era
++    // stops flipping for >400ms, this per-Sync capture resumes as the fallback.
++    if (s_gsFlipSnap && gs2NowMs() - g_gs2LastFlipSnapMs.load(std::memory_order_acquire) < 400u)
++        return;
 +    if (s_gsThread && m_vram && m_vramSize != 0u)
 +    {
 +        std::lock_guard<std::mutex> lock(m_mutex);
 +        std::lock_guard<std::mutex> plock(m_presentCopyMutex);
 +        m_presentCopy.assign(m_vram, m_vram + m_vramSize);
++        m_presentCopyHasRegs = false; // a Sync capture pairs with the LIVE display registers
 +        m_presentCopyTickMs.store(
 +            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 +                                      std::chrono::steady_clock::now().time_since_epoch())
 +                                      .count()),
 +            std::memory_order_release);
++    }
++}
++
++void GSCpuBackend::OnDisplayFlip(uint64_t preFlipDispfb1, uint64_t preFlipDispfb2)
++{
++    // The guest just flipped the display. The buffer the PRE-flip registers point to holds the
++    // last fully completed frame (its UI text was drawn onto it right after ITS flip -- proven
++    // cont.165: 128 glyph draws land in every inter-flip window, always AFTER the flip). Capture
++    // VRAM together with those pre-flip registers; Present() renders the pair. No drain: the
++    // pre-flip buffer's work executed a whole frame ago, and any concurrently-executing worker
++    // items only target the new back buffer.
++    if (!m_vram || m_vramSize == 0u)
++        return;
++    // The frame's tail (the UI text) is enqueued microseconds before the flip -- without a
++    // drain the snapshot races the worker and captures the frame WITHOUT its text (proven
++    // cont.165). This drain is bounded by one frame's tail at flip cadence (a few per second),
++    // unlike the per-present drain that starved the main thread (cont.163).
++    drainQueue();
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        std::lock_guard<std::mutex> plock(m_presentCopyMutex);
++        m_presentCopy.assign(m_vram, m_vram + m_vramSize);
++        m_presentCopyHasRegs = true;
++        m_presentCopyDispfb1 = preFlipDispfb1;
++        m_presentCopyDispfb2 = preFlipDispfb2;
++        const uint64_t now = gs2NowMs();
++        m_presentCopyTickMs.store(now, std::memory_order_release);
++        g_gs2LastFlipSnapMs.store(now, std::memory_order_release);
++    }
++    if (g_gs2FontTrace)
++    {
++        static unsigned long s_nf = 0;
++        static unsigned long s_lastFontDraws = 0;
++        const unsigned long fontDrawsNow = g_gs2FontDraws;
++        ++s_nf;
++        if (s_nf <= 32u || (s_nf % 256u) == 0u)
++            std::fprintf(stderr,
++                         "[gs2:flipsnap] #%lu captured pre-flip frame (glyphDraws+%lu since prev flip, "
++                         "last glyph fbp=%u, preFb1.fbp=%u preFb2.fbp=%u)\n",
++                         s_nf, fontDrawsNow - s_lastFontDraws,
++                         g_gs2LastFontFbp.load(std::memory_order_relaxed),
++                         static_cast<uint32_t>(preFlipDispfb1 & 0x1FFu),
++                         static_cast<uint32_t>(preFlipDispfb2 & 0x1FFu));
++        s_lastFontDraws = fontDrawsNow;
 +    }
  }
  
@@ -237,7 +335,7 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -602,6 +757,9 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+@@ -602,6 +850,9 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
  
  void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
  {
@@ -247,7 +345,7 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      WriteVramUnlocked(psm, base, bw, x, y, value);
  }
-@@ -613,8 +771,26 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+@@ -613,8 +864,26 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
      m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
  }
  
@@ -274,7 +372,7 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || m_vramSize == 0u)
      {
-@@ -627,6 +803,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+@@ -627,6 +896,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
  
  GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
  {
@@ -282,7 +380,7 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      GSTransferSnapshot result = m_transferState;
      result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
-@@ -635,10 +812,238 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+@@ -635,10 +905,293 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
      return result;
  }
  
@@ -293,6 +391,13 @@ index 9c39ae2..6a44438 100644
 +// per-dpsm counts, dims-sanity (the cycle-73 malformed discriminator), last descriptor.
 +static const bool s_gsCensus2 = []
 +{ const char *e = std::getenv("PS2X_GS_CENSUS2"); return e && e[0] && e[0] != '0'; }();
++void ps2xGsNotifyDisplayFlip(uint64_t preFlipDispfb1, uint64_t preFlipDispfb2)
++{
++    if (!s_gsFlipSnap)
++        return;
++    if (GSCpuBackend *b = g_gs2ActiveBackend.load(std::memory_order_acquire))
++        b->OnDisplayFlip(preFlipDispfb1, preFlipDispfb2);
++}
 +namespace
 +{
 +    struct Gs2DrawStats
@@ -336,6 +441,54 @@ index 9c39ae2..6a44438 100644
  {
      const GSDrawState &state = batch.state;
      const auto &ctx = state.context;
++    // PS2X_GS_FONTTRACE: draw-ORDER stamps -- a glyph draw vs the full-screen cover quad. The
++    // menu text is drawn with white texels (proven by [gs2:fontsamp]) yet the completed frame
++    // holds none: if an untextured full-width sprite lands on fbp 0/128 AFTER the glyphs (seq
++    // stamp = g_gs2Draw.total), the cover is erasing the text -- a path-order divergence.
++    if (g_gs2FontTrace && !state.prim.tme && state.prim.type == GS_PRIM_SPRITE &&
++        batch.vertexCount >= 2u && ctx.frame.fbp <= 128u &&
++        std::fabs(batch.vertices[1].x - batch.vertices[0].x) > 400.0f)
++    {
++        static unsigned long s_nc = 0;
++        if (++s_nc <= 64u)
++            std::fprintf(stderr,
++                         "[gs2:coverdraw] seq=%lu #%lu fbp=%u w=%.0f rgba=(%u,%u,%u,%u) abe=%u v0{%.1f,%.1f} v1{%.1f,%.1f}\n",
++                         g_gs2Draw.total, s_nc, ctx.frame.fbp,
++                         std::fabs(batch.vertices[1].x - batch.vertices[0].x),
++                         batch.vertices[1].r, batch.vertices[1].g, batch.vertices[1].b, batch.vertices[1].a,
++                         state.prim.abe ? 1u : 0u,
++                         batch.vertices[0].x, batch.vertices[0].y, batch.vertices[1].x, batch.vertices[1].y);
++    }
++    // PS2X_GS_FONTTRACE: does a menu-font glyph draw (T4HL/T4HH texture, CLUT at 12288-12290)
++    // reach the rasterizer at all, and with what state?
++    if (g_gs2FontTrace && state.prim.tme &&
++        (ctx.tex0.psm == GS_PSM_T4HL || ctx.tex0.psm == GS_PSM_T4HH) &&
++        ctx.tex0.cbp >= 12288u && ctx.tex0.cbp <= 12290u)
++    {
++        static unsigned long s_n = 0;
++        if (++s_n <= 48u)
++            std::fprintf(stderr,
++                         "[gs2:fontdraw] seq=%lu #%lu prim=%u n=%u abe=%u aa1=%u fst=%u "
++                         "texclut{cbw=%u cou=%u cov=%u} "
++                         "tex0{tbp=%u bw=%u psm=0x%x cbp=%u csa=%u tfx=%u tcc=%u} test=%llx alpha=%llx "
++                         "frame{fbp=%u psm=0x%x msk=%x} scis{%u-%u,%u-%u} off{%u,%u} "
++                         "v0{%.1f,%.1f uv=%u,%u rgba=%u,%u,%u,%u} v1{%.1f,%.1f}\n",
++                         g_gs2Draw.total, s_n, static_cast<unsigned>(state.prim.type), batch.vertexCount,
++                         state.prim.abe ? 1u : 0u, state.prim.aa1 ? 1u : 0u, state.prim.fst ? 1u : 0u,
++                         static_cast<unsigned>(state.texclut.cbw), static_cast<unsigned>(state.texclut.cou),
++                         static_cast<unsigned>(state.texclut.cov),
++                         ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, ctx.tex0.cbp, ctx.tex0.csa,
++                         ctx.tex0.tfx, ctx.tex0.tcc,
++                         static_cast<unsigned long long>(ctx.test),
++                         static_cast<unsigned long long>(ctx.alpha),
++                         ctx.frame.fbp, ctx.frame.psm, ctx.frame.fbmsk,
++                         ctx.scissor.x0, ctx.scissor.x1, ctx.scissor.y0, ctx.scissor.y1,
++                         ctx.xyoffset.ofx, ctx.xyoffset.ofy,
++                         batch.vertices[0].x, batch.vertices[0].y,
++                         batch.vertices[0].u >> 4, batch.vertices[0].v >> 4,
++                         batch.vertices[0].r, batch.vertices[0].g, batch.vertices[0].b, batch.vertices[0].a,
++                         batch.vertices[1].x, batch.vertices[1].y);
++    }
 +    if (s_gsCensus2)
 +    {
 +        ++g_gs2Draw.total;
@@ -521,7 +674,7 @@ index 9c39ae2..6a44438 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,6 +1150,21 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,6 +1298,59 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -540,10 +693,76 @@ index 9c39ae2..6a44438 100644
 +    m_draw.fbw = std::max<u32>(ctx.frame.fbw, 1u);
 +    m_draw.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
 +
++    // PS2X_GS_FONTTRACE: evaluate the sampling chain in-situ for a font glyph draw -- the raw
++    // palette index read from the atlas at the glyph's UV midpoint, the final combined texel
++    // (CLUT + TEXA applied), and the global CLAMP/texture-size state the packet never sets.
++    if (g_gs2FontTrace && state.prim.tme &&
++        (ctx.tex0.psm == GS_PSM_T4HL || ctx.tex0.psm == GS_PSM_T4HH) &&
++        ctx.tex0.cbp >= 12288u && ctx.tex0.cbp <= 12290u && batch.vertexCount >= 2u)
++    {
++        static unsigned long s_n2 = 0;
++        if (++s_n2 <= 24u)
++        {
++            const auto &sv0 = batch.vertices[0];
++            const auto &sv1 = batch.vertices[1];
++            const uint16_t mu = static_cast<uint16_t>((static_cast<uint32_t>(sv0.u) + sv1.u) / 2u);
++            const uint16_t mv = static_cast<uint16_t>((static_cast<uint32_t>(sv0.v) + sv1.v) / 2u);
++            const uint32_t rawIdx = m_draw.texRead(m_vram, ctx.tex0.tbp0, ctx.tex0.tbw, mu >> 4, mv >> 4);
++            const uint32_t texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, mu, mv);
++            std::fprintf(stderr,
++                         "[gs2:fontsamp] #%lu uv=(%u,%u) rawIdx=%u texel=%08x clamp=%llx texWH=%ux%u linear=%d texa{ta0=%u aem=%d ta1=%u}\n",
++                         s_n2, mu >> 4, mv >> 4, rawIdx, texel,
++                         static_cast<unsigned long long>(ctx.clamp),
++                         state.textureWidth, state.textureHeight, state.linearFilter ? 1 : 0,
++                         static_cast<unsigned>(state.texa.ta0), state.texa.aem ? 1 : 0,
++                         static_cast<unsigned>(state.texa.ta1));
++        }
++    }
++
++    // PS2X_GS_FONTTRACE: count framebuffer writes issued by each menu-glyph draw (proves whether
++    // the raster loop writes ANY pixels for these sprites, independent of any single watch pixel).
++    const bool fontCountThis = g_gs2FontTrace && state.prim.tme &&
++                               (ctx.tex0.psm == GS_PSM_T4HL || ctx.tex0.psm == GS_PSM_T4HH) &&
++                               ctx.tex0.cbp >= 12288u && ctx.tex0.cbp <= 12290u;
++    if (fontCountThis)
++    {
++        ++g_gs2FontDraws;
++        g_gs2LastFontFbp.store(ctx.frame.fbp, std::memory_order_relaxed);
++    }
++    const unsigned long fontWritesBefore = g_gs2FontPixWrites;
++
      switch (state.prim.type)
      {
      case GS_PRIM_SPRITE:
-@@ -792,11 +1212,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -762,15 +1368,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+     case GS_PRIM_POINT:
+     {
+         const GSVertex &v = batch.vertices[0];
+-        const auto &ctx = state.context;
+-        int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
+-        int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
++        const auto &ctx2 = state.context;
++        int px = static_cast<int>(v.x) - (ctx2.xyoffset.ofx >> 4);
++        int py = static_cast<int>(v.y) - (ctx2.xyoffset.ofy >> 4);
+         WritePixel(state, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
+         break;
+     }
+     default:
+         break;
+     }
++
++    if (fontCountThis)
++    {
++        static unsigned long s_nfc = 0;
++        if (++s_nfc <= 48u)
++            std::fprintf(stderr, "[gs2:fontwrites] #%lu seq=%lu wrote %lu px (v0 rgba=%u,%u,%u,%u)\n",
++                         s_nfc, g_gs2Draw.total, g_gs2FontPixWrites - fontWritesBefore,
++                         batch.vertices[0].r, batch.vertices[0].g, batch.vertices[0].b, batch.vertices[0].a);
++    }
+ }
+ 
+ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+@@ -792,11 +1407,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -558,7 +777,7 @@ index 9c39ae2..6a44438 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -817,7 +1236,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -817,7 +1431,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      u32 fbrgba = 0;
      if (frmw)
      {
@@ -567,7 +786,7 @@ index 9c39ae2..6a44438 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +1266,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +1461,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -581,12 +800,31 @@ index 9c39ae2..6a44438 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +1349,12 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +1544,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
 -        WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
 +        m_draw.frameWrite(m_vram, fbp, fbw, x, y, pixel);
++        if (g_gs2FontTrace)
++            ++g_gs2FontPixWrites;
++
++        // PS2X_GS_FONTTRACE pixel watch: every write to one known glyph pixel (block 0, 128x428)
++        // during the menu era -- names the draw that erases the text if one exists, and proves
++        // the glyph write itself lands (immediate readback).
++        if (g_gs2FontTrace && fbp == 0u && x == 128 && y == 428)
++        {
++            static unsigned long s_nw = 0;
++            if (++s_nw <= 64u)
++            {
++                const uint32_t rb = m_draw.frameRead(m_vram, fbp, fbw, x, y);
++                std::fprintf(stderr,
++                             "[gs2:pixwatch] #%lu seq=%lu wrote=%08x readback=%08x tme=%u prim=%u tex0psm=0x%x abe=%u fbmsk=%x srcRGBA=(%u,%u,%u,%u)\n",
++                             s_nw, g_gs2Draw.total, pixel, rb, state.prim.tme ? 1u : 0u,
++                             static_cast<unsigned>(state.prim.type), ctx.tex0.psm,
++                             state.prim.abe ? 1u : 0u, ctx.frame.fbmsk, srcR, srcG, srcB, a);
++            }
++        }
      }
  
      if (writeMask.writeDepth && !ctx.zbuf.zmask)
@@ -596,7 +834,7 @@ index 9c39ae2..6a44438 100644
      }
  }
  
-@@ -947,6 +1366,12 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +1580,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -607,9 +845,45 @@ index 9c39ae2..6a44438 100644
 +    // rasterizer (ee14958 ps2_gs_rasterizer.cpp lookupCLUT), which rendered this game's
 +    // HUD/menu/terrain palettes correctly — do NOT "fix" this toward PCSX2's representation.
      const uint32_t clutIndex = resolveClutIndex(index, cpsm, csm, csa, sourcePsm);
-     const uint32_t clutWidth = (state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
-     const uint32_t clutX = static_cast<uint32_t>(state.texclut.cou) + (clutIndex & 0x0Fu);
-@@ -969,26 +1394,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+-    const uint32_t clutWidth = (state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
+-    const uint32_t clutX = static_cast<uint32_t>(state.texclut.cou) + (clutIndex & 0x0Fu);
+-    const uint32_t clutY = static_cast<uint32_t>(state.texclut.cov) + (clutIndex >> 4);
++    // TEXCLUT (cbw/cou/cov) applies to CSM2 ONLY -- for CSM1 the CLUT sits in its fixed layout at
++    // CBP and TEXCLUT must be ignored (PCSX2 GS/GSLocalMemory.cpp: TEXCLUT is only consulted in
++    // the *CSM2* ReadCLUT/WriteCLUT variants; GSTextureCacheSW ignores it for CSM1). Applying a
++    // stale TEXCLUT (e.g. left over from earlier CSM2 use) to a CSM1 lookup offsets every entry
++    // read off the palette -- LOTR EUR menu-font CLUTs sample as zeros -> ATST kills all glyphs.
++    const bool csm2 = (csm != 0u);
++    const uint32_t clutWidth = (csm2 && state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
++    const uint32_t clutX = (csm2 ? static_cast<uint32_t>(state.texclut.cou) : 0u) + (clutIndex & 0x0Fu);
++    const uint32_t clutY = (csm2 ? static_cast<uint32_t>(state.texclut.cov) : 0u) + (clutIndex >> 4);
+ 
+     switch (cpsm)
+     {
+     case GS_PSM_CT32:
+-        return applyTexa(state.texa, cpsm, GSMem::ReadCT32(m_vram, cbp, clutWidth, clutX, clutY));
++    {
++        uint32_t entry = GSMem::ReadCT32(m_vram, cbp, clutWidth, clutX, clutY);
++        // CLUT shadow (cont.165): a CSM1 entry whose RGB lanes were zeroed by a colliding
++        // render target (FBMSK=ff000000 scene draws over the CLUT blocks) while its alpha
++        // matches the uploaded payload is served from the upload -- the value real hardware
++        // would sample had the game's VRAM allocator not placed the CLUT inside the target.
++        if (s_gsClutShadow && csm == 0u && (entry & 0x00FFFFFFu) == 0u && !m_clutShadow.empty())
++        {
++            auto it = m_clutShadow.find(cbp);
++            if (it != m_clutShadow.end() && clutX < 8u && clutY < 2u)
++            {
++                const uint32_t up = it->second[clutY * 8u + clutX];
++                if ((up & 0xFF000000u) == (entry & 0xFF000000u) && (up & 0x00FFFFFFu) != 0u)
++                    entry = up;
++            }
++        }
++        return applyTexa(state.texa, cpsm, entry);
++    }
+     case GS_PSM_CT24:
+         return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
+     case GS_PSM_CT16:
+@@ -969,26 +1631,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -671,7 +945,7 @@ index 9c39ae2..6a44438 100644
      }
      else
      {
-@@ -1002,7 +1453,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +1690,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -680,7 +954,7 @@ index 9c39ae2..6a44438 100644
  
          switch (tex.psm)
          {
-@@ -1024,7 +1475,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +1712,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -695,7 +969,7 @@ index 9c39ae2..6a44438 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +1682,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,6 +1919,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -736,7 +1010,7 @@ index 9c39ae2..6a44438 100644
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +1772,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +2009,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -745,7 +1019,7 @@ index 9c39ae2..6a44438 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +1790,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +2027,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -778,7 +1052,7 @@ index 9c39ae2..6a44438 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1376,7 +1893,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +2130,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -799,7 +1073,29 @@ index 9c39ae2..6a44438 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1393,7 +1923,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +2152,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
+ 
++    // PS2X_GS_FONTTRACE (env, default OFF): trace every transfer targeting the font-CLUT blocks
++    // (LOTR menu text RE, cont.165 -- the CLUT RGB bytes arrive in VRAM zeroed, alpha intact).
++    if (g_gs2FontTrace && command.bitbltbuf.dbp >= 12288u && command.bitbltbuf.dbp <= 12290u)
++    {
++        static unsigned long s_n = 0;
++        if (++s_n <= 24u)
++            std::fprintf(stderr,
++                         "[gs2:fontxfer] #%lu dir=%u blt{sbp=%u sbw=%u spsm=0x%x dbp=%u dbw=%u dpsm=0x%x} "
++                         "pos{ssax=%u ssay=%u dsax=%u dsay=%u} reg{%ux%u}\n",
++                         s_n, command.direction, command.bitbltbuf.sbp, command.bitbltbuf.sbw,
++                         command.bitbltbuf.spsm, command.bitbltbuf.dbp, command.bitbltbuf.dbw,
++                         command.bitbltbuf.dpsm, command.trxpos.ssax, command.trxpos.ssay,
++                         command.trxpos.dsax, command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
++    }
++
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+     else if (command.direction == 1u)
+@@ -1393,7 +2175,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -822,10 +1118,36 @@ index 9c39ae2..6a44438 100644
      if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
          return;
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-@@ -1406,6 +1951,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +2203,69 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
++    // CLUT shadow capture (PS2X_GS_CLUTSHADOW, default ON): remember every 16-entry CT32 CLUT
++    // upload so sampling can survive the render-target stomp that zeroes its RGB lanes between
++    // upload and use (see the member comment in gs_cpu_backend.h; LOTR menu text, cont.165).
++    if (s_gsClutShadow && dpsm == GS_PSM_CT32 && m_transfer.trxreg.rrw == 8u &&
++        m_transfer.trxreg.rrh == 2u && sizeBytes >= 64u && m_clutShadow.size() < 64u)
++    {
++        std::array<uint32_t, 16> pay{};
++        std::memcpy(pay.data(), data, 64u);
++        m_clutShadow[dbp] = pay;
++    }
++
++    // PS2X_GS_FONTTRACE: payload arriving for the font-CLUT blocks -- is the RGB already gone here?
++    if (g_gs2FontTrace && dbp >= 12288u && dbp <= 12290u)
++    {
++        static unsigned long s_n = 0;
++        if (++s_n <= 24u)
++        {
++            uint32_t w[4] = {0, 0, 0, 0};
++            std::memcpy(w, data, std::min<uint32_t>(sizeBytes, 16u));
++            std::fprintf(stderr,
++                         "[gs2:fontup] #%lu dbp=%u dbw=%u dpsm=0x%x %ux%u bytes=%u data[0..3]=%08x %08x %08x %08x\n",
++                         s_n, dbp, dbw, dpsm, m_transfer.trxreg.rrw, m_transfer.trxreg.rrh,
++                         sizeBytes, w[0], w[1], w[2], w[3]);
++        }
++    }
++
 +    if (s_gsCensus2)
 +    {
 +        ++g_gs2Xfer.n;
@@ -866,7 +1188,7 @@ index 9c39ae2..6a44438 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1610,6 +2192,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +2470,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -874,7 +1196,7 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,6 +2205,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,6 +2483,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -884,7 +1206,7 @@ index 9c39ae2..6a44438 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || context.frame.fbw == 0u)
          return false;
-@@ -1759,10 +2345,26 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +2623,42 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -897,6 +1219,7 @@ index 9c39ae2..6a44438 100644
 +    // main thread must never starve on the worker queue (input pump).
      thread_local std::vector<uint8_t> snapshot;
 -    SnapshotVram(snapshot);
++    GSPresentationRequest effectiveRequest = request;
 +    const uint64_t copyTick = m_presentCopyTickMs.load(std::memory_order_acquire);
 +    const uint64_t nowMs = static_cast<uint64_t>(
 +        std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -906,6 +1229,15 @@ index 9c39ae2..6a44438 100644
 +    {
 +        std::lock_guard<std::mutex> plock(m_presentCopyMutex);
 +        snapshot = m_presentCopy;
++        // A display-flip snapshot pairs the VRAM copy with the DISPLAY REGISTERS from the
++        // same instant (the pre-flip front buffer, the one the frame was completed in --
++        // its UI text included). Rendering the copy with the LIVE registers would show the
++        // freshly flipped buffer, whose post-flip front-buffer text isn't drawn yet.
++        if (m_presentCopyHasRegs)
++        {
++            effectiveRequest.dispfb1 = m_presentCopyDispfb1;
++            effectiveRequest.dispfb2 = m_presentCopyDispfb2;
++        }
 +    }
 +    else
 +    {
@@ -914,7 +1246,14 @@ index 9c39ae2..6a44438 100644
      if (snapshot.empty())
          return {};
  
-@@ -1812,6 +2414,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     thread_local GSCpuBackend snapshotBackend;
+     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+-    return snapshotBackend.PresentFromLocalMemory(request);
++    return snapshotBackend.PresentFromLocalMemory(effectiveRequest);
+ }
+ 
+ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
+@@ -1812,6 +2702,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;

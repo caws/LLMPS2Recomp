@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index fd5a90d..cdd1a4e 100644
+index fd5a90d..4c71683 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -638,6 +638,40 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -139,12 +139,12 @@ index fd5a90d..cdd1a4e 100644
 +                ps.regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
 +            ps.regIndex = 0u;
 +            if (flg == GIF_FMT_PACKED)
-+            {
+             {
+-                for (uint32_t r = 0; r < nreg; ++r)
 +                ps.loopsLeft = nloop;
 +            }
 +            else if (flg == GIF_FMT_REGLIST)
-             {
--                for (uint32_t r = 0; r < nreg; ++r)
++            {
 +                ps.regsLeft = nloop * nreg;
 +                ps.padPending = (ps.regsLeft & 1u) != 0u;
 +            }
@@ -316,3 +316,33 @@ index fd5a90d..cdd1a4e 100644
      const bool interestingReg =
          regAddr == GS_REG_PRIM ||
          regAddr == GS_REG_RGBAQ ||
+@@ -1497,7 +1674,15 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     }
+     case 0x59:
+         if (m_privRegs)
++        {
++            const bool flipped = m_privRegs->dispfb1 != value;
++            const uint64_t preFb1 = m_privRegs->dispfb1, preFb2 = m_privRegs->dispfb2;
+             m_privRegs->dispfb1 = value;
++            // Display flip = a frame just completed in the PRE-write front buffer: snapshot
++            // it for presentation (cont.165 menu-text fix; see gs_cpu_backend.cpp).
++            if (flipped)
++                ps2xGsNotifyDisplayFlip(preFb1, preFb2);
++        }
+         break;
+     case 0x5a:
+         if (m_privRegs)
+@@ -1505,7 +1690,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+         break;
+     case 0x5b:
+         if (m_privRegs)
++        {
++            const bool flipped = m_privRegs->dispfb2 != value;
++            const uint64_t preFb1 = m_privRegs->dispfb1, preFb2 = m_privRegs->dispfb2;
+             m_privRegs->dispfb2 = value;
++            if (flipped)
++                ps2xGsNotifyDisplayFlip(preFb1, preFb2);
++        }
+         break;
+     case 0x5c:
+         if (m_privRegs)

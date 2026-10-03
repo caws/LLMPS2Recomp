@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..48b0d91 100644
+index 71e8032..897e760 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-@@ -3,14 +3,19 @@
+@@ -3,14 +3,20 @@
  #include "runtime/gs/gs_backend.h"
  
  #include <array>
@@ -10,6 +10,7 @@ index 71e8032..48b0d91 100644
 +#include <condition_variable>
 +#include <deque>
  #include <functional>
++#include <map>
  #include <mutex>
 +#include <thread>
  #include <vector>
@@ -22,7 +23,21 @@ index 71e8032..48b0d91 100644
  
      void Initialize(uint8_t *vram, uint32_t vramSize) override;
      void Reset() override;
-@@ -36,13 +41,30 @@ private:
+@@ -22,6 +28,13 @@ public:
+     void Flush() override;
+     void TextureFlush() override;
+     void Sync(GSSyncReason reason) override;
++    // Display-flip snapshot (cont.165): at the instant the guest flips DISPFB1/2, the OTHER
++    // (pre-flip) buffer holds the last fully completed frame -- including the UI text the game
++    // drew onto it right after ITS flip. Capture VRAM plus the PRE-flip display registers as one
++    // unit; Present() renders the copy with those registers. No drain (the pre-flip buffer's
++    // work was executed long ago; concurrent worker writes only touch the new back buffer).
++    // Called from the GS privileged-register write paths via ps2xGsNotifyDisplayFlip().
++    void OnDisplayFlip(uint64_t preFlipDispfb1, uint64_t preFlipDispfb2);
+     PresentationFrame Present(const GSPresentationRequest &request) override;
+ 
+     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
+@@ -36,13 +49,30 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -54,7 +69,7 @@ index 71e8032..48b0d91 100644
      uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
  
      void PerformLocalToLocalTransfer();
-@@ -58,8 +80,26 @@ private:
+@@ -58,8 +88,26 @@ private:
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
  
@@ -83,7 +98,7 @@ index 71e8032..48b0d91 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +107,23 @@ private:
+@@ -67,9 +115,41 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
@@ -98,12 +113,30 @@ index 71e8032..48b0d91 100644
 +    mutable std::condition_variable m_queueCv;     // wakes the worker
 +    mutable std::condition_variable m_queueIdleCv; // wakes drainers/backpressured producers
 +    mutable std::atomic<bool> m_presentPriority{false}; // presenter needs m_mutex next
++    // CLUT shadow (PS2X_GS_CLUTSHADOW, default ON; cont.165): the last-uploaded 16-entry CT32
++    // CLUT payload per destination block. The LOTR menu scene renders into a 512x512 target that
++    // covers the font-CLUT blocks with FBMSK=ff000000 (RGB written, alpha kept), zeroing the CLUT
++    // colors between their upload and the text draws (the text DMA stalls on FLUSHA behind the
++    // very VU1 batch that stomps). When a CSM1 CT32 CLUT entry reads back RGB-zeroed with the
++    // uploaded alpha intact, LookupCLUT serves the uploaded entry -- what real hardware would
++    // sample had the buffers not collided. Touched only under m_mutex.
++    std::map<uint32_t, std::array<uint32_t, 16>> m_clutShadow;
 +    mutable std::mutex m_presentCopyMutex;
-+    std::vector<uint8_t> m_presentCopy;                  // VRAM at the last drained Sync
++    std::vector<uint8_t> m_presentCopy;                  // VRAM at the last frame-complete moment
 +    mutable std::atomic<uint64_t> m_presentCopyTickMs{0};
++    // Display registers paired with m_presentCopy (a flip snapshot renders with the PRE-flip
++    // registers -- the buffer the completed frame lives in). Guarded by m_presentCopyMutex.
++    bool m_presentCopyHasRegs = false;
++    uint64_t m_presentCopyDispfb1 = 0;
++    uint64_t m_presentCopyDispfb2 = 0;
 +    std::deque<WorkItem> m_queue;
 +    size_t m_queueUploadBytes = 0;
 +    bool m_workerBusy = false;
 +    bool m_workerStop = false;
 +    std::thread m_worker;
  };
++
++// Route a guest DISPFB1/2 flip to the active CPU backend (see GSCpuBackend::OnDisplayFlip).
++// Pass the PRE-write dispfb1/2 values (the completed frame's registers). Defined in
++// gs_cpu_backend.cpp; safe to call from any thread; no-op when no backend is live.
++void ps2xGsNotifyDisplayFlip(uint64_t preFlipDispfb1, uint64_t preFlipDispfb2);
