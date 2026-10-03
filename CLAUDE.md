@@ -35,6 +35,14 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
 
 ## Hard constraints (do not violate)
 
+- **ALWAYS run `scripts/…` from THIS engine repo, pointed AT the game dir — never from the
+  game repo.** `scripts/` exists ONLY here (`LLMPS2Recomp/`); the game repo (`rotk_decomp/`,
+  etc.) has **no `scripts/`**. Invoke as `scripts/03_build_game.sh <ABSOLUTE-game-dir> …` from
+  the default cwd (this engine dir). **Never `cd <game_dir>` first** and never run the scripts
+  while cwd is the game repo — `cd <game_dir> && scripts/03_build_game.sh …` fails with
+  `No such file or directory`. The Bash tool cwd resets to this engine dir between calls, so a
+  plain `scripts/…` from a fresh call is correct; pass **absolute** `<game_dir>` + log paths.
+  (Full detail under "Build / run" below.)
 - **Never modify PS2Recomp's tracked source** under `tools/<game>/PS2Recomp/` — it's a
   separate git repo (cloned per game). In particular
   `tools/<game>/PS2Recomp/ps2xRuntime/src/runner/` is **wiped and regenerated on every
