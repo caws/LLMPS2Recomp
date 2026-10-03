@@ -51,7 +51,7 @@ Last verified: **21/21 patches apply, 21/21 files byte-identical.**
 | `15-vif1-interpreter.patch` | `ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp` | **`PS2X_VIF_DIRECTCARRY`** (payload-aligned Path2 image continuation) + **`PS2X_VIF_DIRECTSPAN`** (cross-transfer DIRECT span state; PCSX2 `vif1.tag.size` persists) |
 | `16-vu1-core.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp` | **`PS2X_VU_CLAMP`** — PS2 VU float semantics (no NaN/Inf/denormals; PCSX2 `vuDouble()`); `PS2X_VU1_MEMCENSUS` diagnostic |
 | `17-vu1-detail-header.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_detail.h` | VU1 clip/FTOI helpers |
-| `18-vu1-lower.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp` | XGKICK 0x4000 packet cap (PCSX2 `Gif_Unit.h`); FSEQ/FSAND/FSOR write It |
+| `18-vu1-lower.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp` | XGKICK 0x4000 packet cap (PCSX2 `Gif_Unit.h`); **`PS2X_VU_FLAGFIX`** — the flag-op decode table + FS\*/FM\*/FCGET bodies (PCSX2 `VUops.cpp`); `PS2X_VU1_KICKCENSUS` + `PS2X_VU1_FLAGCENSUS` instruments |
 | `19-vu1-upper.patch` | `ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp` | CLIP 24-bit mask; FTOI saturation |
 | `20-dbcman-hle-header.patch` | `ps2xRuntime/include/runtime/ps2_dbcman_hle.h` | DBCMAN.IRX HLE declarations (new file) |
 | `21-dbcman-hle.patch` | `ps2xRuntime/src/lib/ps2_dbcman_hle.cpp` | DBCMAN.IRX HLE implementation (new file) |
@@ -120,6 +120,65 @@ Controller input for pad2/libdbc games — **DBCMAN.IRX HLE (Sony DualShock2 man
 ### GS census / displog instruments (was `17-gs-debug…`)
 
 **Diagnostics (not a correctness fix), default-OFF.** Two GS instruments that cracked cycle 73. **(a) `PS2X_GS_CENSUS=<path>`** streams one line per GS debug event (`D`raw / `T`ransfer / `P`resent / `G`iftag / `R`egister) to a file, with `_AT`/`_FRAMES`/`_EVERY` frame windowing (periodic sampling — the interesting frames are ~10 min into the boot and the debug frame index is neither the game's `c` counter nor wall-clock, so a single absolute window is unusable), `_KINDS` bitmask and a `_MAX` line cap. It streams rather than reusing the ImGui panel's `writeGsDebugDump()`, because the 512-entry debug ring cannot hold a whole frame's draws. Hooked at the single point where an entry is stamped with seq/frameIndex, so it sees every kind exactly once; it also un-pauses `m_debugHistoryPaused` (capture is off by default and only the ImGui panel un-paused it). **(b) `PS2X_GS_DISPLOG=1`** prints PMODE/DISPLAY1/DISPLAY2/DISPFB1/DISPFB2 with their decoded WxH on every change — needed as a separate print because `applyGsDispEnv()` assigns `m_privRegs->display1` directly rather than through `writeRegister()`, so a DISPLAY change never appears as a Register debug event. Together these proved (i) the presentation is a genuine **512×512** letterboxed by the host viewer into the 640×448 window (retiring the "partial presentation" defect) and (ii) GS image transfers are **100.0% valid during the FMV and 76–100% malformed within 10 frames of its end**. Both wholly inert when the env vars are unset. **(c) `PS2X_GS_GIFLOG=1`** (added cont.130) counts/prints two GIF-parser pathologies: `IMAGE-CLAMPED` (a GIFtag declaring more IMAGE payload than its packet carries — the remainder is silently DROPPED) and `TAG-WHILE-INCOMPLETE` (a new tag parsed while the previous image transfer is still short of its pixel count). It measured **~1,744,000 clamps, essentially all with `avail=0`** — i.e. **the generic GIF image path delivers nothing at all**; textures only ever reach VRAM via the native fast paths. The `processGIFPacket()` header comment records the root cause and the FALSIFIED naive fix (see the cont.130 row in the game repo's progress.md). **(d) `PS2X_GS_QUADLOG=1`** (added cont.132) decodes the four vertex XYs of every 4-vertex PACKED primitive as `processGIFPacket` parses it, filtered to movie-strip geometry (~128 px wide, >400 px tall) and reported as a column index. It is the **sentinel for the "FMV right quarter is black" defect**: the FMV is drawn as four 128×512 column quads and this probe measured `col=0 ×16, col=1 ×15, col=2 ×15, col=3 ×0` — proving the 4th quad never reaches the parser at all (so it is not scissored, depth/alpha-killed, or rasterizer-rejected). Keep it until that column renders. All four wholly inert when unset. | cont.129 cycle 73 / cont.130 cycle 74 / cont.132 cycle 76
+
+### VU1 XGKICK per-kick census (`18-vu1-lower.patch`)
+
+**Diagnostic (not a correctness fix), default-OFF.** `PS2X_VU1_KICKCENSUS=<N>` censuses **every**
+XGKICK — outcome (`SUBMIT`/`DROP`/`ZERO`), decoded first tag, `iters`, `bytes` — and prints a running
+**aggregate over all kicks** next to each 1-in-N sample. Added because every XGKICK fact we had came
+from the `[VU1:xgkick] DROP` dump, which samples **conditioned on failure**; reading that as a rate
+produced a wrong model in cycle 90 ("73% of packets are empty" — it was 73% of *failures*). The
+unbiased numbers (800,000 level kicks) instead showed 78% submit / 21% drop, `nloop==0` at 67% of the
+level era vs 6% of boot, and localised the failure to a single VU1 address (`addr=8272`) whose tag is
+structurally perfect with a zero vertex count. Per-VU counters (VU0 and VU1 share the interpreter
+class; indexed by buffer size, 4KB = VU0). Wholly inert when the env var is unset. | cont.144 cycle 90
+
+### VU flag pipeline: decode table + FS\*/FM\*/FCGET bodies (`18-vu1-lower.patch`)
+
+**`PS2X_VU_FLAGFIX` (default ON; `=0` restores the previous behaviour).** The VU lower flag-op
+decode table was wrong in four slots and three `FS*` bodies were wrong outright. Verified against
+**PCSX2 `pcsx2/VUops.cpp`** — the authoritative `_LOWER_OPCODE[128]` table (in the `_vuTablesMess`
+macro) plus the `_vuFS*` / `_vuFM*` / `_vuFCGET` bodies:
+
+| opcode | PCSX2 | was | defect |
+|---|---|---|---|
+| `0x14` | FSEQ | FSEQ → VI01 | wrong dest (must be `It`) + wrong immediate assembly |
+| `0x15` | FSSET | FSSET | wrong immediate; clobbered the preserved `status[5:0]` |
+| `0x16` | FSAND | FSAND → VI01 | wrong dest + wrong immediate |
+| `0x17` | FSOR | *equality test* | wrong dest, wrong immediate, **wrong operation** |
+| `0x18` | FMEQ | FMAND | **swapped** with `0x1A` |
+| `0x1A` | FMAND | FMEQ | **swapped** with `0x18` |
+| `0x1B` | FMOR | *absent* | fell to `default:` → **silent no-op**, `It` left stale |
+| `0x1C` | FCGET | FMOR | wrong op — returned the **MAC** flags, not the **CLIP** flags |
+
+The `FS*` dest/immediate defect is a **regression**: this file's row previously advertised
+"FSEQ/FSAND/FSOR write It" (cont.44), but the fix is absent from both the pre-cycle-91 patch **and**
+upstream baseline `ee149581` — it was lost in the `ee14958` toolchain migration (which rewrote these
+files) and the README row was carried forward without re-verification. Cross-checked bodies:
+`_vuFSAND`/`_vuFSEQ`/`_vuFSOR` all write `VI[_It_].US[0]` from `status & 0xFFF` with
+`imm = ((code >> 21) & 1) << 11 | (code & 0x7FF)`; `_vuFSSET` does
+`statusflag = (imm & 0xFC0) | (statusflag & 0x3F)`; `_vuFCGET` does
+`VI[_It_].US[0] = VI[REG_CLIP_FLAG].UL & 0x0FFF`. All results masked to 16 bits (PCSX2 writes
+`US[0]`). `0x10`–`0x13` (FCEQ/FCSET/FCAND/FCOR) were already faithful and are unchanged.
+
+⚠ **Known remaining gap, deliberately NOT fixed here:** `m_state.mac` is never *computed* anywhere
+in this interpreter — no FMAC op updates it — so FMEQ/FMAND/FMOR read a permanently-zero MAC
+register even with this patch. PCSX2 computes it in `VUflags.cpp` (`VU_MAC_UPDATE`, per component,
+shifts x=3/y=2/z=1/w=0; Z bits [3:0], S [7:4], U [11:8], O [15:12]) and derives STATUS from it in
+`VU_STAT_UPDATE`. The `PS2X_VU1_FLAGCENSUS` `mac!=0` column measures whether the microprogram
+actually depends on it. | cont.145 cycle 91
+
+### VU1 flag-pipeline census (`18-vu1-lower.patch`)
+
+**Diagnostic (not a correctness fix), default-OFF.** `PS2X_VU1_FLAGCENSUS=<N>` counts every VU flag
+op **by raw opcode** (so the numbers do not depend on which architectural op we map that opcode to),
+plus every *unimplemented* opcode reached — the interpreter's three `default:` arms return silently,
+so a microprogram relying on a missing op gets a stale register and no diagnostic at all. At each
+XGKICK the ops executed since the previous kick are attributed to one of two buckets — first-tag
+`nloop == 0` (the cycle-91 failure) and `nloop > 0` (the known-good control in the same run) — and
+both buckets are printed together, so the failing population is always quoted beside its control
+(standing rule 25). `PS2X_VU1_FLAGCENSUS_ADDR=<n>` (default `8272`) additionally counts the kicks at
+the single VU1 address cont.144 pinned. Per-VU counters (rule 22). Inert when unset. | cont.145 cycle 91
 
 ## Maintenance
 
