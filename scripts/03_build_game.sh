@@ -158,8 +158,11 @@ if [ "$SKIP_BUILD" = false ]; then
     echo
     echo "[3/3] Building ps2EntryRunner..."
     echo "    build type: $BUILD_TYPE"
+    # Link with lld — the ~900MB runner relinks in seconds vs minutes on GNU ld.
+    # Fallback if lld misbehaves: -fuse-ld=gold, or drop the flag entirely.
     cmake -S "$PS2RECOMP_ROOT" -B "$PS2RECOMP_ROOT/out/build" \
-        -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+        -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+        -DCMAKE_EXE_LINKER_FLAGS="-pthread -fuse-ld=lld"
     cmake --build "$PS2RECOMP_ROOT/out/build" \
         --target ps2EntryRunner \
         --config "$BUILD_TYPE" \
