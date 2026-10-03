@@ -115,7 +115,9 @@ disasm + generated code are ground truth, notes are hypotheses; the dispatch mod
 incremental discipline). Then: [`debugging.md`](docs/debugging.md) (run-log triage, the
 **gdb-under-parent** recipe, **dispatch-logging loop maps**, profiling), [`functions-csv.md`](docs/functions-csv.md) (the
 three CSV bug classes — truncated / missing-gap **batchfix** / over-bound **boundfix** — and
-disasm-as-ground-truth validation), and [`overrides.md`](docs/overrides.md) (HLE patterns:
+disasm-as-ground-truth validation), [`overrides.md`](docs/overrides.md) (HLE patterns:
 wait-free replacement, clean skip, SIF/IOP handshake fakes, answering raw-transport RPCs via
-`runtime->iop().handleRPC`). Read those for the durable strategy; this file + the skill are
-the quick reference.
+`runtime->iop().handleRPC`), and [`workflows.md`](docs/workflows.md) (parallel **read-only**
+multi-agent RE fan-out for architecture-question frontiers; sub-agents never build — only the
+main agent does; template at `.claude/workflows/re-fanout.js`). Read those for the durable
+strategy; this file + the skill are the quick reference.

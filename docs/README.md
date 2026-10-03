@@ -44,6 +44,11 @@ mass-rewrite the inputs.**
 - **[overrides.md](overrides.md)** — HLE override patterns: wait-free replacement, clean
   skip, SIF/IOP handshake fakes, **answering raw-transport SIF RPCs via the runtime stub**,
   resumable mid-function entries, calling the original, and the `BUILD_TAG` discipline.
+- **[workflows.md](workflows.md)** — *parallel static investigation*: the read-only
+  multi-agent RE fan-out (N agents chase sub-questions → one synthesizes a buildable
+  override). Use when a frontier is an **architecture question**, not a CSV/override bug.
+  Sub-agents are READ-ONLY; **only the main agent builds**. Reusable template at
+  `.claude/workflows/re-fanout.js`.
 
 ## Hard constraints (apply everywhere)
 
