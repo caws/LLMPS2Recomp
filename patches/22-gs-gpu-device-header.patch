@@ -1,0 +1,64 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_device.h b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
+new file mode 100644
+index 0000000..72c2bc6
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_device.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include "runtime/gs/gs_types.h"
++
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++// GPU presentation-decode device (cont.166, phase 0 of the GPU-backend arc).
++//
++// Owns an EGL GL 4.3 core context (independent of raylib's GL 3.3 window context --
++// no sharing needed: results come back via buffer readback) and a compute kernel that
++// replicates GSCpuBackend::CopyFrameToHostRgbaCpu's local-memory display decode
++// bit-exactly: the same GSMem page-lookup tables (built from the identical
++// PixelStorageTraits templates), the same address masking, the same CT32/CT24/CT16/
++// CT16S unpack rules. Guest VRAM (the 4MB present snapshot) is uploaded once per
++// sourceId (the flip/Sync capture tick) and each display rect decodes on the GPU.
++//
++// Threading: ALL EGL/GL work runs on a dedicated device thread that exclusively owns
++// the context (a thread has ONE current GL context regardless of binding API, and the
++// present thread already holds raylib's GLX context -- eglMakeCurrent there fails with
++// EGL_BAD_ACCESS). DecodeFrameRect marshals one synchronous job at a time to it and is
++// callable from any thread. Any init failure disables the device for the run (logged).
++class GsGpuPresentDevice
++{
++public:
++    GsGpuPresentDevice();
++    ~GsGpuPresentDevice();
++
++    GsGpuPresentDevice(const GsGpuPresentDevice &) = delete;
++    GsGpuPresentDevice &operator=(const GsGpuPresentDevice &) = delete;
++
++    // True once the EGL context + kernel are live (attempts init on first call).
++    bool EnsureInitialized();
++
++    // GPU replica of the useLocalMemoryLayout=true path of CopyFrameToHostRgba:
++    // decode a width x height rect of the frame (origin applied in source space)
++    // into kHostFrameWidth-stride RGBA bytes. sourceId keys the VRAM upload cache
++    // (0 = always re-upload, e.g. a live no-flip snapshot). Returns false -- with
++    // outPixels untouched -- when the device is unavailable, the psm is unsupported
++    // (only CT32/CT24/CT16/CT16S display formats), or vram is not the full 4MB;
++    // the caller then runs the CPU decode.
++    bool DecodeFrameRect(const uint8_t *vram,
++                         uint32_t vramSize,
++                         uint64_t sourceId,
++                         const GSFrameReg &frame,
++                         uint32_t width,
++                         uint32_t height,
++                         bool frameBaseIsPages,
++                         uint32_t originX,
++                         uint32_t originY,
++                         bool preserveAlpha,
++                         std::vector<uint8_t> &outPixels);
++
++private:
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++};

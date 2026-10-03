@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index e4dc195..01f41e7 100644
+index e4dc195..3d6e5b7 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -384,6 +384,7 @@ add_library(ps2_runtime STATIC
@@ -43,3 +43,20 @@ index e4dc195..01f41e7 100644
  set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
  set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
  
+@@ -505,6 +532,16 @@ target_include_directories(ps2_runtime PUBLIC
+ )
+ 
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++# GPU presentation decode (gs_gpu_device.cpp): desktop-only, links EGL only -- every GL
++# entry point is resolved at runtime through eglGetProcAddress, so no GL link dependency.
++# PS2X_HAS_GS_GPU_DEVICE gates the gs_cpu_backend.cpp integration (0 = CPU decode only).
++if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
++    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_device.cpp)
++    target_link_libraries(ps2_runtime PUBLIC EGL)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_GS_GPU_DEVICE=1)
++else()
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_GS_GPU_DEVICE=0)
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime

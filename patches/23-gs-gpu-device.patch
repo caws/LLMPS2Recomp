@@ -1,0 +1,618 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
+new file mode 100644
+index 0000000..2dd220b
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_device.cpp
+@@ -0,0 +1,612 @@
++#include "runtime/gs/gs_gpu_device.h"
++#include "runtime/gs/ps2_gs_memory.h"
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++
++#include <condition_variable>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <thread>
++
++// GPU presentation-decode device (cont.166, phase 0 of the GPU-backend arc).
++//
++// EGL GL 4.3 core context + one compute kernel replicating the CPU display decode
++// (GSCpuBackend::CopyFrameToHostRgbaCpu, useLocalMemoryLayout path) bit-exactly. The
++// page lookup tables uploaded to the GPU are built with the SAME PixelStorageTraits<>
++// template code as ps2_gs_memory.cpp, from the same hardware block/column layout
++// constants (ps2tek "GS local memory"; PCSX2 GSLocalMemory.cpp holds the equivalent
++// tables), so the address math cannot drift from the CPU path. PS2X_GS_GPU_VERIFY in
++// gs_cpu_backend.cpp additionally proves equality empirically per present.
++//
++// THREADING: all EGL/GL work happens on a dedicated device thread. The presenting main
++// thread already holds raylib's GLX context current, and a thread has ONE current GL
++// context regardless of binding API -- eglMakeCurrent there fails with EGL_BAD_ACCESS
++// (observed 0x3002, run171 of build gpupres0-171). Callers marshal one synchronous job
++// at a time (a present decodes at most two rects); this is also the shape the future
++// GPU raster backend needs (its GL work rides the GS worker's command stream).
++//
++// GL is loaded via eglGetProcAddress with local typedefs -- no GL headers, so this file
++// stays inert to the rest of the build (raylib's GL 3.3 window context is untouched;
++// results return via buffer readback, cheap on this UMA iGPU class of host).
++
++namespace
++{
++    // ---- minimal GL declarations (loaded at runtime; no system GL headers) ----
++    using GLenum = unsigned int;
++    using GLuint = unsigned int;
++    using GLint = int;
++    using GLsizei = int;
++    using GLbitfield = unsigned int;
++    using GLchar = char;
++    using GLubyte = unsigned char;
++    using GLsizeiptr = ptrdiff_t;
++    using GLintptr = ptrdiff_t;
++
++    constexpr GLenum GL_COMPUTE_SHADER = 0x91B9;
++    constexpr GLenum GL_SHADER_STORAGE_BUFFER = 0x90D2;
++    constexpr GLenum GL_STATIC_DRAW = 0x88E4;
++    constexpr GLenum GL_DYNAMIC_DRAW = 0x88E8;
++    constexpr GLenum GL_COMPILE_STATUS = 0x8B81;
++    constexpr GLenum GL_LINK_STATUS = 0x8B82;
++    constexpr GLbitfield GL_SHADER_STORAGE_BARRIER_BIT = 0x00002000;
++    constexpr GLbitfield GL_BUFFER_UPDATE_BARRIER_BIT = 0x00000200;
++    constexpr GLenum GL_RENDERER = 0x1F01;
++    constexpr GLenum GL_VERSION = 0x1F02;
++
++    struct GlApi
++    {
++        const GLubyte *(*GetString)(GLenum) = nullptr;
++        GLenum (*GetError)() = nullptr;
++        GLuint (*CreateShader)(GLenum) = nullptr;
++        void (*ShaderSource)(GLuint, GLsizei, const GLchar *const *, const GLint *) = nullptr;
++        void (*CompileShader)(GLuint) = nullptr;
++        void (*GetShaderiv)(GLuint, GLenum, GLint *) = nullptr;
++        void (*GetShaderInfoLog)(GLuint, GLsizei, GLsizei *, GLchar *) = nullptr;
++        GLuint (*CreateProgram)() = nullptr;
++        void (*AttachShader)(GLuint, GLuint) = nullptr;
++        void (*LinkProgram)(GLuint) = nullptr;
++        void (*GetProgramiv)(GLuint, GLenum, GLint *) = nullptr;
++        void (*GetProgramInfoLog)(GLuint, GLsizei, GLsizei *, GLchar *) = nullptr;
++        void (*DeleteShader)(GLuint) = nullptr;
++        void (*GenBuffers)(GLsizei, GLuint *) = nullptr;
++        void (*BindBuffer)(GLenum, GLuint) = nullptr;
++        void (*BindBufferBase)(GLenum, GLuint, GLuint) = nullptr;
++        void (*BufferData)(GLenum, GLsizeiptr, const void *, GLenum) = nullptr;
++        void (*BufferSubData)(GLenum, GLintptr, GLsizeiptr, const void *) = nullptr;
++        void (*GetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void *) = nullptr;
++        void (*UseProgram)(GLuint) = nullptr;
++        GLint (*GetUniformLocation)(GLuint, const GLchar *) = nullptr;
++        void (*Uniform1ui)(GLint, GLuint) = nullptr;
++        void (*DispatchCompute)(GLuint, GLuint, GLuint) = nullptr;
++        void (*MemoryBarrier)(GLbitfield) = nullptr;
++        void (*Finish)() = nullptr;
++    };
++
++    template <typename Fn>
++    bool loadGlFn(Fn &slot, const char *name)
++    {
++        slot = reinterpret_cast<Fn>(eglGetProcAddress(name));
++        return slot != nullptr;
++    }
++
++    // ---- GS local-memory layout constants ----
++    // Verbatim copies of ps2_gs_memory.cpp's tables (file-static there). These are frozen
++    // hardware constants -- the GS block/column raster order (ps2tek; PCSX2 GSLocalMemory.cpp
++    // blockTable32/16/16S + columnTable32/16) -- fed to the same InitPageLookupTable template.
++    using GSMem::PixelStorageTraits;
++
++    constexpr PixelStorageTraits<GSMem::C32>::BlockLookupTableT kBlockTableC32{{
++        {0, 1, 4, 5, 16, 17, 20, 21},
++        {2, 3, 6, 7, 18, 19, 22, 23},
++        {8, 9, 12, 13, 24, 25, 28, 29},
++        {10, 11, 14, 15, 26, 27, 30, 31},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::C32>::ColumnLookupTableT kColumnTable32{{
++        {0, 1, 4, 5, 8, 9, 12, 13},
++        {2, 3, 6, 7, 10, 11, 14, 15},
++        {16, 17, 20, 21, 24, 25, 28, 29},
++        {18, 19, 22, 23, 26, 27, 30, 31},
++        {32, 33, 36, 37, 40, 41, 44, 45},
++        {34, 35, 38, 39, 42, 43, 46, 47},
++        {48, 49, 52, 53, 56, 57, 60, 61},
++        {50, 51, 54, 55, 58, 59, 62, 63},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::C16>::BlockLookupTableT kBlockTableC16{{
++        {0, 2, 8, 10},
++        {1, 3, 9, 11},
++        {4, 6, 12, 14},
++        {5, 7, 13, 15},
++        {16, 18, 24, 26},
++        {17, 19, 25, 27},
++        {20, 22, 28, 30},
++        {21, 23, 29, 31},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::C16S>::BlockLookupTableT kBlockTableC16S{{
++        {0, 2, 16, 18},
++        {1, 3, 17, 19},
++        {8, 10, 24, 26},
++        {9, 11, 25, 27},
++        {4, 6, 20, 22},
++        {5, 7, 21, 23},
++        {12, 14, 28, 30},
++        {13, 15, 29, 31},
++    }};
++
++    constexpr PixelStorageTraits<GSMem::C16>::ColumnLookupTableT kColumnTable16{{
++        {0, 2, 8, 10, 16, 18, 24, 26, 1, 3, 9, 11, 17, 19, 25, 27},
++        {4, 6, 12, 14, 20, 22, 28, 30, 5, 7, 13, 15, 21, 23, 29, 31},
++        {32, 34, 40, 42, 48, 50, 56, 58, 33, 35, 41, 43, 49, 51, 57, 59},
++        {36, 38, 44, 46, 52, 54, 60, 62, 37, 39, 45, 47, 53, 55, 61, 63},
++        {64, 66, 72, 74, 80, 82, 88, 90, 65, 67, 73, 75, 81, 83, 89, 91},
++        {68, 70, 76, 78, 84, 86, 92, 94, 69, 71, 77, 79, 85, 87, 93, 95},
++        {96, 98, 104, 106, 112, 114, 120, 122, 97, 99, 105, 107, 113, 115, 121, 123},
++        {100, 102, 108, 110, 116, 118, 124, 126, 101, 103, 109, 111, 117, 119, 125, 127},
++    }};
++
++    constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
++    constexpr uint32_t kHostW = 640u;
++    constexpr uint32_t kHostH = 512u;
++    // Flat halfword offsets of each page table in the concatenated table SSBO
++    // ([C32 32x(64x32)][C16 32x(64x64)][C16S 32x(64x64)]).
++    constexpr uint32_t kTabOffC32 = 0u;
++    constexpr uint32_t kTabOffC16 = 32u * 64u * 32u;
++    constexpr uint32_t kTabOffC16S = kTabOffC16 + 32u * 64u * 64u;
++    constexpr uint32_t kTabHalfwords = kTabOffC16S + 32u * 64u * 64u;
++
++    // The kernel: one invocation per host output pixel. Mirrors, in order:
++    // PixelStorageTraits<>::PageId/Address (page tables uploaded), ::Read's
++    // byte-address mask, and CopyFrameToHostRgbaCpu's CT32/CT24/CT16(S) unpack.
++    const char *kDecodeShader = R"GLSL(#version 430
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(std430, binding = 0) readonly buffer Vram { uint vram[]; };
++layout(std430, binding = 1) readonly buffer PageTab { uint ptab[]; };
++layout(std430, binding = 2) writeonly buffer OutBuf { uint outPix[]; };
++uniform uint uMode;          // 0=CT32 1=CT24 2=CT16 3=CT16S
++uniform uint uBlockBase;     // frame base in BLOCKS
++uniform uint uBw;            // effective FBW (64-pixel units)
++uniform uint uOriginX;
++uniform uint uOriginY;
++uniform uint uWidth;
++uniform uint uHeight;
++uniform uint uPreserveAlpha;
++uniform uint uTabOff;        // halfword offset of this mode's page table
++
++uint tab16(uint idx)
++{
++    uint h = uTabOff + idx;
++    uint w = ptab[h >> 1u];
++    return ((h & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
++}
++
++void main()
++{
++    uint x = gl_GlobalInvocationID.x;
++    uint y = gl_GlobalInvocationID.y;
++    if (x >= 640u || y >= 512u)
++        return;
++    uint o = y * 640u + x;
++    if (x >= uWidth || y >= uHeight)
++    {
++        outPix[o] = 0u; // CPU path zero-fills the full host buffer first
++        return;
++    }
++    uint sx = uOriginX + x;
++    uint sy = uOriginY + y;
++    bool wide = (uMode >= 2u);            // CT16 family: 64x64 page, 16bpp storage
++    uint pageH = wide ? 64u : 32u;
++    uint pixPerPage = 64u * pageH;
++    uint page = (uBlockBase >> 5u) + (sy / pageH) * uBw + (sx >> 6u);
++    uint lidx = (uBlockBase & 31u) * pixPerPage + (sy % pageH) * 64u + (sx & 63u);
++    uint pixAddr = page * pixPerPage + tab16(lidx);
++    uint value;
++    if (!wide)
++    {
++        uint byteAddr = (pixAddr * 4u) & 0x3FFFFCu;
++        value = vram[byteAddr >> 2u];
++    }
++    else
++    {
++        uint byteAddr = (pixAddr * 2u) & 0x3FFFFEu;
++        uint w = vram[byteAddr >> 2u];
++        value = ((byteAddr & 2u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
++    }
++    uint r, g, b, a;
++    if (uMode <= 1u)
++    {
++        r = value & 0xFFu;
++        g = (value >> 8u) & 0xFFu;
++        b = (value >> 16u) & 0xFFu;
++        a = (uMode == 0u && uPreserveAlpha != 0u) ? ((value >> 24u) & 0xFFu) : 255u;
++    }
++    else
++    {
++        uint r5 = value & 31u;
++        uint g5 = (value >> 5u) & 31u;
++        uint b5 = (value >> 10u) & 31u;
++        r = (r5 << 3u) | (r5 >> 2u);
++        g = (g5 << 3u) | (g5 >> 2u);
++        b = (b5 << 3u) | (b5 >> 2u);
++        a = (uPreserveAlpha != 0u) ? (((value & 0x8000u) != 0u) ? 0x80u : 0u) : 255u;
++    }
++    outPix[o] = r | (g << 8u) | (b << 16u) | (a << 24u);
++}
++)GLSL";
++
++#ifndef EGL_PLATFORM_SURFACELESS_MESA
++#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
++#endif
++#ifndef EGL_CONTEXT_MAJOR_VERSION
++#define EGL_CONTEXT_MAJOR_VERSION 0x3098
++#endif
++#ifndef EGL_CONTEXT_MINOR_VERSION
++#define EGL_CONTEXT_MINOR_VERSION 0x30FB
++#endif
++#ifndef EGL_CONTEXT_OPENGL_PROFILE_MASK
++#define EGL_CONTEXT_OPENGL_PROFILE_MASK 0x30FD
++#endif
++#ifndef EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT
++#define EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT 0x00000001
++#endif
++#ifndef EGL_NO_CONFIG_KHR
++#define EGL_NO_CONFIG_KHR ((EGLConfig)0)
++#endif
++} // namespace
++
++struct GsGpuPresentDevice::Impl
++{
++    enum class State : uint8_t
++    {
++        Untried,
++        Ready,
++        Failed
++    };
++
++    // Job marshalling (one synchronous decode at a time; caller blocks on cvDone).
++    std::mutex mx;
++    std::condition_variable cv;     // wakes the device thread
++    std::condition_variable cvDone; // wakes the caller (init finished / job finished)
++    State state = State::Untried;   // written by the device thread under mx
++    bool haveJob = false;
++    bool jobDone = false;
++    bool stop = false;
++    struct JobDesc
++    {
++        const uint8_t *vram = nullptr;
++        uint32_t vramSize = 0;
++        uint64_t sourceId = 0;
++        GSFrameReg frame{};
++        uint32_t width = 0, height = 0;
++        bool frameBaseIsPages = false;
++        uint32_t originX = 0, originY = 0;
++        bool preserveAlpha = false;
++        std::vector<uint8_t> *out = nullptr;
++        bool result = false;
++    } job;
++    std::thread worker;
++
++    // Device-thread-only state.
++    EGLDisplay display = EGL_NO_DISPLAY;
++    EGLContext context = EGL_NO_CONTEXT;
++    EGLSurface surface = EGL_NO_SURFACE; // pbuffer fallback only
++    GlApi gl{};
++    GLuint program = 0;
++    GLuint vramBuf = 0;
++    GLuint tabBuf = 0;
++    GLuint outBuf = 0;
++    GLint locMode = -1, locBlockBase = -1, locBw = -1, locOriginX = -1, locOriginY = -1;
++    GLint locWidth = -1, locHeight = -1, locPreserveAlpha = -1, locTabOff = -1;
++    uint64_t lastSourceId = 0;
++    bool haveUpload = false;
++    unsigned errorLogs = 0;
++
++    bool fail(const char *stage)
++    {
++        std::fprintf(stderr, "[gsgpu] DISABLED: %s (egl=0x%x)\n", stage,
++                     static_cast<unsigned>(eglGetError()));
++        return false;
++    }
++
++    void threadLoop()
++    {
++        const bool ok = initOnThread();
++        {
++            std::lock_guard<std::mutex> lk(mx);
++            state = ok ? State::Ready : State::Failed;
++        }
++        cvDone.notify_all();
++        if (!ok)
++            return; // callers see Failed and never post a job
++        for (;;)
++        {
++            std::unique_lock<std::mutex> lk(mx);
++            cv.wait(lk, [&] { return stop || haveJob; });
++            if (stop)
++                return;
++            haveJob = false;
++            lk.unlock();
++            // The caller blocks until jobDone, so the job fields (and *job.out) are
++            // stable while unlocked here.
++            job.result = decodeOnThread(job);
++            lk.lock();
++            jobDone = true;
++            lk.unlock();
++            cvDone.notify_all();
++        }
++    }
++
++    bool initOnThread()
++    {
++        // Surfaceless platform display first (no window system involvement at all);
++        // fall back to the default (X11) display, still never drawing to a surface.
++        auto getPlatformDisplay = reinterpret_cast<EGLDisplay (*)(EGLenum, void *, const EGLint *)>(
++            eglGetProcAddress("eglGetPlatformDisplayEXT"));
++        if (getPlatformDisplay)
++            display = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
++        if (display == EGL_NO_DISPLAY)
++            display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++        if (display == EGL_NO_DISPLAY)
++            return fail("no EGL display");
++        EGLint maj = 0, min = 0;
++        if (!eglInitialize(display, &maj, &min))
++            return fail("eglInitialize");
++        if (!eglBindAPI(EGL_OPENGL_API))
++            return fail("eglBindAPI(OPENGL)");
++
++        const EGLint ctxAttribs[] = {
++            EGL_CONTEXT_MAJOR_VERSION, 4,
++            EGL_CONTEXT_MINOR_VERSION, 3,
++            EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
++            EGL_NONE};
++        // No-config context + surfaceless current (Mesa supports both); pbuffer fallback.
++        context = eglCreateContext(display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ctxAttribs);
++        if (context == EGL_NO_CONTEXT)
++        {
++            const EGLint cfgAttribs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
++                                         EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
++            EGLConfig cfg = nullptr;
++            EGLint n = 0;
++            if (!eglChooseConfig(display, cfgAttribs, &cfg, 1, &n) || n == 0)
++                return fail("eglChooseConfig");
++            context = eglCreateContext(display, cfg, EGL_NO_CONTEXT, ctxAttribs);
++            if (context == EGL_NO_CONTEXT)
++                return fail("eglCreateContext(4.3 core)");
++            const EGLint pbAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
++            surface = eglCreatePbufferSurface(display, cfg, pbAttribs);
++            if (surface == EGL_NO_SURFACE)
++                return fail("eglCreatePbufferSurface");
++        }
++        if (!eglMakeCurrent(display, surface, surface, context))
++            return fail("eglMakeCurrent");
++
++        bool ok = true;
++        ok &= loadGlFn(gl.GetString, "glGetString");
++        ok &= loadGlFn(gl.GetError, "glGetError");
++        ok &= loadGlFn(gl.CreateShader, "glCreateShader");
++        ok &= loadGlFn(gl.ShaderSource, "glShaderSource");
++        ok &= loadGlFn(gl.CompileShader, "glCompileShader");
++        ok &= loadGlFn(gl.GetShaderiv, "glGetShaderiv");
++        ok &= loadGlFn(gl.GetShaderInfoLog, "glGetShaderInfoLog");
++        ok &= loadGlFn(gl.CreateProgram, "glCreateProgram");
++        ok &= loadGlFn(gl.AttachShader, "glAttachShader");
++        ok &= loadGlFn(gl.LinkProgram, "glLinkProgram");
++        ok &= loadGlFn(gl.GetProgramiv, "glGetProgramiv");
++        ok &= loadGlFn(gl.GetProgramInfoLog, "glGetProgramInfoLog");
++        ok &= loadGlFn(gl.DeleteShader, "glDeleteShader");
++        ok &= loadGlFn(gl.GenBuffers, "glGenBuffers");
++        ok &= loadGlFn(gl.BindBuffer, "glBindBuffer");
++        ok &= loadGlFn(gl.BindBufferBase, "glBindBufferBase");
++        ok &= loadGlFn(gl.BufferData, "glBufferData");
++        ok &= loadGlFn(gl.BufferSubData, "glBufferSubData");
++        ok &= loadGlFn(gl.GetBufferSubData, "glGetBufferSubData");
++        ok &= loadGlFn(gl.UseProgram, "glUseProgram");
++        ok &= loadGlFn(gl.GetUniformLocation, "glGetUniformLocation");
++        ok &= loadGlFn(gl.Uniform1ui, "glUniform1ui");
++        ok &= loadGlFn(gl.DispatchCompute, "glDispatchCompute");
++        ok &= loadGlFn(gl.MemoryBarrier, "glMemoryBarrier");
++        ok &= loadGlFn(gl.Finish, "glFinish");
++        if (!ok)
++            return fail("eglGetProcAddress(GL 4.3 core fn)");
++
++        const GLuint shader = gl.CreateShader(GL_COMPUTE_SHADER);
++        gl.ShaderSource(shader, 1, &kDecodeShader, nullptr);
++        gl.CompileShader(shader);
++        GLint status = 0;
++        gl.GetShaderiv(shader, GL_COMPILE_STATUS, &status);
++        if (!status)
++        {
++            char log[1024] = {};
++            gl.GetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
++            std::fprintf(stderr, "[gsgpu] shader compile log:\n%s\n", log);
++            return fail("compute shader compile");
++        }
++        program = gl.CreateProgram();
++        gl.AttachShader(program, shader);
++        gl.LinkProgram(program);
++        gl.GetProgramiv(program, GL_LINK_STATUS, &status);
++        gl.DeleteShader(shader);
++        if (!status)
++        {
++            char log[1024] = {};
++            gl.GetProgramInfoLog(program, sizeof(log) - 1, nullptr, log);
++            std::fprintf(stderr, "[gsgpu] program link log:\n%s\n", log);
++            return fail("compute program link");
++        }
++        locMode = gl.GetUniformLocation(program, "uMode");
++        locBlockBase = gl.GetUniformLocation(program, "uBlockBase");
++        locBw = gl.GetUniformLocation(program, "uBw");
++        locOriginX = gl.GetUniformLocation(program, "uOriginX");
++        locOriginY = gl.GetUniformLocation(program, "uOriginY");
++        locWidth = gl.GetUniformLocation(program, "uWidth");
++        locHeight = gl.GetUniformLocation(program, "uHeight");
++        locPreserveAlpha = gl.GetUniformLocation(program, "uPreserveAlpha");
++        locTabOff = gl.GetUniformLocation(program, "uTabOff");
++
++        // Build the page lookup tables with the same template code as ps2_gs_memory.cpp
++        // (heap: ~640KB total) and upload the concatenation once.
++        std::vector<uint16_t> flat(kTabHalfwords);
++        {
++            auto t32 = std::make_unique<PixelStorageTraits<GSMem::C32>::PageLookupTableT>();
++            PixelStorageTraits<GSMem::C32>::InitPageLookupTable(*t32, kBlockTableC32, kColumnTable32);
++            std::memcpy(flat.data() + kTabOffC32, t32->data(), sizeof(*t32));
++            auto t16 = std::make_unique<PixelStorageTraits<GSMem::C16>::PageLookupTableT>();
++            PixelStorageTraits<GSMem::C16>::InitPageLookupTable(*t16, kBlockTableC16, kColumnTable16);
++            std::memcpy(flat.data() + kTabOffC16, t16->data(), sizeof(*t16));
++            auto t16s = std::make_unique<PixelStorageTraits<GSMem::C16S>::PageLookupTableT>();
++            PixelStorageTraits<GSMem::C16S>::InitPageLookupTable(*t16s, kBlockTableC16S, kColumnTable16);
++            std::memcpy(flat.data() + kTabOffC16S, t16s->data(), sizeof(*t16s));
++        }
++
++        gl.GenBuffers(1, &vramBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, vramBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, kVramBytes, nullptr, GL_DYNAMIC_DRAW);
++        gl.GenBuffers(1, &tabBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, tabBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(flat.size() * 2u),
++                      flat.data(), GL_STATIC_DRAW);
++        gl.GenBuffers(1, &outBuf);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, outBuf);
++        gl.BufferData(GL_SHADER_STORAGE_BUFFER, kHostW * kHostH * 4u, nullptr, GL_DYNAMIC_DRAW);
++        if (gl.GetError() != 0u)
++            return fail("buffer setup");
++
++        std::fprintf(stderr, "[gsgpu] ready: %s | %s%s\n",
++                     reinterpret_cast<const char *>(gl.GetString(GL_RENDERER)),
++                     reinterpret_cast<const char *>(gl.GetString(GL_VERSION)),
++                     surface == EGL_NO_SURFACE ? " (surfaceless)" : " (pbuffer)");
++        return true;
++    }
++
++    bool decodeOnThread(JobDesc &j)
++    {
++        if (!j.vram || j.vramSize < kVramBytes || !j.out)
++            return false;
++        if (j.width == 0u || j.height == 0u || j.width > kHostW || j.height > kHostH)
++            return false;
++
++        uint32_t mode = 0, tabOff = kTabOffC32;
++        switch (j.frame.psm)
++        {
++        case GS_PSM_CT32:
++            mode = 0u;
++            break;
++        case GS_PSM_CT24:
++            mode = 1u;
++            break;
++        case GS_PSM_CT16:
++            mode = 2u;
++            tabOff = kTabOffC16;
++            break;
++        case GS_PSM_CT16S:
++            mode = 3u;
++            tabOff = kTabOffC16S;
++            break;
++        default:
++            return false; // CPU path also rejects non-CT display formats
++        }
++
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, vramBuf);
++        if (!haveUpload || j.sourceId == 0u || j.sourceId != lastSourceId)
++        {
++            gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, kVramBytes, j.vram);
++            lastSourceId = j.sourceId;
++            haveUpload = true;
++        }
++
++        // Same defaults as CopyFrameToHostRgbaCpu: FBW 0 reads as the host width,
++        // page-unit bases convert to blocks (framePageBaseToBlock).
++        const uint32_t effFbw = j.frame.fbw ? j.frame.fbw : kHostW / 64u;
++        const uint32_t blockBase = j.frameBaseIsPages ? (j.frame.fbp << 5u) : j.frame.fbp;
++
++        gl.UseProgram(program);
++        gl.Uniform1ui(locMode, mode);
++        gl.Uniform1ui(locBlockBase, blockBase);
++        gl.Uniform1ui(locBw, effFbw);
++        gl.Uniform1ui(locOriginX, j.originX);
++        gl.Uniform1ui(locOriginY, j.originY);
++        gl.Uniform1ui(locWidth, j.width);
++        gl.Uniform1ui(locHeight, j.height);
++        gl.Uniform1ui(locPreserveAlpha, j.preserveAlpha ? 1u : 0u);
++        gl.Uniform1ui(locTabOff, tabOff);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, vramBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, tabBuf);
++        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, outBuf);
++        gl.DispatchCompute(kHostW / 8u, kHostH / 8u, 1u);
++        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++
++        j.out->resize(kHostW * kHostH * 4u);
++        gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, outBuf);
++        gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, kHostW * kHostH * 4u, j.out->data());
++
++        const GLenum err = gl.GetError();
++        if (err != 0u)
++        {
++            if (errorLogs < 8u)
++            {
++                ++errorLogs;
++                std::fprintf(stderr,
++                             "[gsgpu] GL error 0x%x during decode (psm=0x%x fbp=%u) -> CPU fallback\n",
++                             err, j.frame.psm, j.frame.fbp);
++            }
++            haveUpload = false; // buffer state suspect; re-upload next time
++            return false;
++        }
++        return true;
++    }
++};
++
++GsGpuPresentDevice::GsGpuPresentDevice() : m_impl(std::make_unique<Impl>()) {}
++
++// Stop and join the device thread; skip EGL teardown (the device is a process-lifetime
++// static in the present path -- the context dies with the process, and tearing it down
++// during exit races the window-system shutdown for nothing).
++GsGpuPresentDevice::~GsGpuPresentDevice()
++{
++    Impl &d = *m_impl;
++    {
++        std::lock_guard<std::mutex> lk(d.mx);
++        d.stop = true;
++    }
++    d.cv.notify_all();
++    if (d.worker.joinable())
++        d.worker.join();
++}
++
++bool GsGpuPresentDevice::EnsureInitialized()
++{
++    Impl &d = *m_impl;
++    std::unique_lock<std::mutex> lk(d.mx);
++    if (d.state == Impl::State::Untried && !d.worker.joinable())
++        d.worker = std::thread([&d] { d.threadLoop(); });
++    d.cvDone.wait(lk, [&] { return d.state != Impl::State::Untried; });
++    return d.state == Impl::State::Ready;
++}
++
++bool GsGpuPresentDevice::DecodeFrameRect(const uint8_t *vram,
++                                         uint32_t vramSize,
++                                         uint64_t sourceId,
++                                         const GSFrameReg &frame,
++                                         uint32_t width,
++                                         uint32_t height,
++                                         bool frameBaseIsPages,
++                                         uint32_t originX,
++                                         uint32_t originY,
++                                         bool preserveAlpha,
++                                         std::vector<uint8_t> &outPixels)
++{
++    if (!EnsureInitialized())
++        return false;
++    Impl &d = *m_impl;
++    std::unique_lock<std::mutex> lk(d.mx);
++    d.job = {vram, vramSize, sourceId, frame, width, height,
++             frameBaseIsPages, originX, originY, preserveAlpha, &outPixels, false};
++    d.haveJob = true;
++    d.jobDone = false;
++    d.cv.notify_all();
++    d.cvDone.wait(lk, [&] { return d.jobDone; });
++    return d.job.result;
++}

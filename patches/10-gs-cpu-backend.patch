@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..c7969c8 100644
+index 9c39ae2..c777795 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-@@ -10,6 +10,7 @@
+@@ -10,9 +10,19 @@
  #include <algorithm>
  #include <cmath>
  #include <cstdio>
@@ -10,7 +10,19 @@ index 9c39ae2..c7969c8 100644
  #include <cstring>
  #include <fstream>
  #include <iostream>
-@@ -468,12 +469,147 @@ namespace
++#include <unordered_map>
++
++// PS2X_HAS_GS_GPU_DEVICE comes from CMake (desktop=1; Vita/Android=0, no EGL there).
++#if !defined(PS2X_HAS_GS_GPU_DEVICE)
++#define PS2X_HAS_GS_GPU_DEVICE 0
++#endif
++#if PS2X_HAS_GS_GPU_DEVICE
++#include "runtime/gs/gs_gpu_device.h"
++#endif
+ 
+ using namespace GSInternal;
+ 
+@@ -468,12 +478,169 @@ namespace
      }
  }
  
@@ -47,6 +59,28 @@ index 9c39ae2..c7969c8 100644
 +// CLUT shadow (default ON; =0 disables) -- see the m_clutShadow member comment (cont.165).
 +static const bool s_gsClutShadow = []
 +{ const char *e = std::getenv("PS2X_GS_CLUTSHADOW"); return !(e && e[0] == '0'); }();
++// ---- GPU present decode (cont.166, phase 0 of the GPU-backend arc; desktop only) ----
++// PS2X_GS_GPU_PRESENT (default OFF): decode the presented display rects with the GPU
++// compute kernel (EGL surfaceless GL 4.3 -- gs_gpu_device.cpp) instead of the per-pixel
++// CPU walk in CopyFrameToHostRgbaCpu; the CPU path remains the automatic fallback
++// (device init failure, non-CT display psm, non-owner thread). PS2X_GS_GPU_VERIFY
++// (default OFF; implies attempting the GPU decode): run BOTH decodes per rect and
++// byte-compare -- the CPU result stays authoritative. Same shadow-verify rollout
++// pattern PS2X_GS_THREAD used.
++static const bool s_gsGpuPresent = []
++{ const char *e = std::getenv("PS2X_GS_GPU_PRESENT"); return e && e[0] && e[0] != '0'; }();
++static const bool s_gsGpuVerify = []
++{ const char *e = std::getenv("PS2X_GS_GPU_VERIFY"); return e && e[0] && e[0] != '0'; }();
++#if PS2X_HAS_GS_GPU_DEVICE
++static GsGpuPresentDevice *gs2GpuDevice()
++{
++    static GsGpuPresentDevice s_device; // deliberately never torn down (see its dtor note)
++    return s_device.EnsureInitialized() ? &s_device : nullptr;
++}
++#endif
++static unsigned long g_gpuVerifyCompares = 0;
++static unsigned long g_gpuVerifyMismatchRects = 0;
++static unsigned long long g_gpuVerifyMismatchPixels = 0;
 +// PS2X_GS_FONTTRACE (env, default OFF): LOTR menu-text RE (cont.165). Traces (a) every transfer
 +// whose destination is the font-CLUT blocks 12288-12290 with its first payload words, and (b)
 +// every draw that samples a T4HL/T4HH texture with its CLUT at those blocks. Diagnostic for the
@@ -158,7 +192,7 @@ index 9c39ae2..c7969c8 100644
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +667,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +698,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -175,7 +209,7 @@ index 9c39ae2..c7969c8 100644
              break;
          }
      }
-@@ -541,14 +683,22 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,14 +714,22 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -198,7 +232,7 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      ResetUnlocked();
  }
-@@ -561,10 +711,21 @@ void GSCpuBackend::ResetUnlocked()
+@@ -561,10 +742,21 @@ void GSCpuBackend::ResetUnlocked()
      m_transferState.direction = 3u;
      m_localToHostBuffer.clear();
      m_localToHostReadPos = 0u;
@@ -220,7 +254,7 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +734,109 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,22 +765,111 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -276,6 +310,7 @@ index 9c39ae2..c7969c8 100644
 +        std::lock_guard<std::mutex> lock(m_mutex);
 +        std::lock_guard<std::mutex> plock(m_presentCopyMutex);
 +        m_presentCopy.assign(m_vram, m_vram + m_vramSize);
++        ++m_presentCopySeq;
 +        m_presentCopyHasRegs = false; // a Sync capture pairs with the LIVE display registers
 +        m_presentCopyTickMs.store(
 +            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -304,6 +339,7 @@ index 9c39ae2..c7969c8 100644
 +        std::lock_guard<std::mutex> lock(m_mutex);
 +        std::lock_guard<std::mutex> plock(m_presentCopyMutex);
 +        m_presentCopy.assign(m_vram, m_vram + m_vramSize);
++        ++m_presentCopySeq;
 +        m_presentCopyHasRegs = true;
 +        m_presentCopyDispfb1 = preFlipDispfb1;
 +        m_presentCopyDispfb2 = preFlipDispfb2;
@@ -335,7 +371,7 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -602,6 +850,9 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+@@ -602,6 +883,9 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
  
  void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
  {
@@ -345,7 +381,7 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      WriteVramUnlocked(psm, base, bw, x, y, value);
  }
-@@ -613,8 +864,26 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+@@ -613,8 +897,26 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
      m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
  }
  
@@ -372,7 +408,7 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || m_vramSize == 0u)
      {
-@@ -627,6 +896,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+@@ -627,6 +929,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
  
  GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
  {
@@ -380,7 +416,7 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      GSTransferSnapshot result = m_transferState;
      result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
-@@ -635,10 +905,293 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+@@ -635,10 +938,424 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
      return result;
  }
  
@@ -410,6 +446,135 @@ index 9c39ae2..c7969c8 100644
 +static bool g_gs2EraOpen = false;
 +static unsigned long g_gs2EraOpenDraw = 0;
 +static bool g_gs2DegenReset = false;
++
++    // ---- Draw-state census (PS2X_GS_STATECENSUS, default OFF; cont.166 GPU-arc phase 0) ----
++    // Enumerates the DISTINCT draw-state combinations the game submits -- the coverage list
++    // the future GPU raster ubershader must honor (anything absent from it can take a loud
++    // fallback path). Key = one packed uint64, bit layout mirroring THIS backend's own
++    // register decodes (TEST bits from passesAlphaTest/classifyAlphaTest/DATE/ZTST, CLAMP
++    // wms/wmt = bits 0-3, ALPHA A/B/C/D = bits 0-7). Counted per DrawPrimitive on the
++    // raster thread (worker-serialized, so no lock); cumulative sorted dump every ~10s.
++    // Bit 63 = the PS2X_GS_ERA_FILE era gate -- run with PS2X_GS_CENSUS2=1 as well, the
++    // gate only advances inside its block.
++    static const bool s_gsStateCensus = []
++    { const char *e = std::getenv("PS2X_GS_STATECENSUS"); return e && e[0] && e[0] != '0'; }();
++    static std::unordered_map<uint64_t, uint64_t> g_stateCensus;
++    static unsigned long g_stateCensusN = 0;
++    static uint64_t g_stateCensusLastDumpMs = 0;
++
++    uint64_t stateCensusKey(const GSPrimitiveBatch &batch)
++    {
++        const GSDrawState &st = batch.state;
++        const GSContext &ctx = st.context;
++        uint64_t k = 0;
++        k |= static_cast<uint64_t>(st.prim.type & 7u);
++        k |= static_cast<uint64_t>(st.prim.iip ? 1u : 0u) << 3;
++        k |= static_cast<uint64_t>(st.prim.tme ? 1u : 0u) << 4;
++        k |= static_cast<uint64_t>(st.prim.fge ? 1u : 0u) << 5;
++        k |= static_cast<uint64_t>(st.prim.abe ? 1u : 0u) << 6;
++        k |= static_cast<uint64_t>(st.prim.fst ? 1u : 0u) << 7;
++        k |= static_cast<uint64_t>(ctx.frame.psm & 0x3Fu) << 8;
++        const uint32_t msk = ctx.frame.fbmsk;
++        k |= (msk == 0u ? 0ull : msk == 0xFF000000u ? 1ull : msk == 0x00FFFFFFu ? 2ull : 3ull) << 14;
++        k |= static_cast<uint64_t>(ctx.zbuf.psm & 0xFu) << 16;
++        k |= static_cast<uint64_t>(ctx.zbuf.zmask ? 1u : 0u) << 20;
++        const uint64_t test = ctx.test;
++        k |= (test & 1u) << 21;         // ATE
++        k |= ((test >> 1) & 7u) << 22;  // ATST
++        k |= ((test >> 12) & 3u) << 25; // AFAIL
++        k |= ((test >> 14) & 1u) << 27; // DATE
++        k |= ((test >> 15) & 1u) << 28; // DATM
++        k |= ((test >> 16) & 1u) << 29; // ZTE
++        k |= ((test >> 17) & 3u) << 30; // ZTST
++        k |= (ctx.alpha & 0xFFu) << 32; // blend A/B/C/D
++        if (st.prim.tme)
++        {
++            k |= static_cast<uint64_t>(ctx.tex0.psm & 0x3Fu) << 40;
++            k |= static_cast<uint64_t>(ctx.tex0.cpsm & 0xFu) << 46;
++            k |= static_cast<uint64_t>(ctx.tex0.csm & 1u) << 50;
++            k |= static_cast<uint64_t>(ctx.tex0.tfx & 3u) << 51;
++            k |= static_cast<uint64_t>(ctx.tex0.tcc & 1u) << 53;
++            k |= static_cast<uint64_t>(st.linearFilter ? 1u : 0u) << 54;
++            k |= (ctx.clamp & 0xFu) << 55; // WMS | WMT<<2
++        }
++        k |= static_cast<uint64_t>(st.pabe ? 1u : 0u) << 59;
++        k |= (st.dthe & 1u) << 60;
++        k |= (st.colclamp & 1u) << 61;
++        k |= static_cast<uint64_t>((st.scanmsk & 3u) != 0u ? 1u : 0u) << 62;
++        k |= static_cast<uint64_t>(g_gs2EraOpen ? 1u : 0u) << 63;
++        return k;
++    }
++
++    void stateCensusDump()
++    {
++        std::vector<std::pair<uint64_t, uint64_t>> rows(g_stateCensus.begin(), g_stateCensus.end());
++        std::sort(rows.begin(), rows.end(),
++                  [](const std::pair<uint64_t, uint64_t> &a, const std::pair<uint64_t, uint64_t> &b)
++                  { return a.second > b.second; });
++        std::fprintf(stderr, "[gs2:sc] === draws=%lu combos=%zu (desc, top 96) ===\n",
++                     g_stateCensusN, rows.size());
++        static const char *kPrimNames[8] = {"pt", "ln", "ls", "tri", "ts", "tf", "spr", "?"};
++        static const char *kMskNames[4] = {"0", "A", "RGB", "mix"};
++        size_t shown = 0;
++        for (const auto &row : rows)
++        {
++            if (++shown > 96u)
++                break;
++            const uint64_t k = row.first;
++            char tex[96] = "un-tex";
++            if ((k >> 4) & 1u)
++                std::snprintf(tex, sizeof(tex),
++                              "tpsm=0x%02x cpsm=0x%x csm=%u tfx=%u tcc=%u lin=%u wms=%u wmt=%u",
++                              static_cast<unsigned>((k >> 40) & 0x3Fu),
++                              static_cast<unsigned>((k >> 46) & 0xFu),
++                              static_cast<unsigned>((k >> 50) & 1u),
++                              static_cast<unsigned>((k >> 51) & 3u),
++                              static_cast<unsigned>((k >> 53) & 1u),
++                              static_cast<unsigned>((k >> 54) & 1u),
++                              static_cast<unsigned>((k >> 55) & 3u),
++                              static_cast<unsigned>((k >> 57) & 3u));
++            std::fprintf(stderr,
++                         "[gs2:sc] n=%llu era=%u key=%016llx %s iip=%u fge=%u abe=%u fst=%u | "
++                         "fpsm=0x%02x msk=%s zpsm=0x%x zmsk=%u | ate=%u atst=%u afail=%u date=%u "
++                         "datm=%u zte=%u ztst=%u | abcd=%u%u%u%u | %s | pabe=%u dthe=%u cclamp=%u smsk=%u\n",
++                         static_cast<unsigned long long>(row.second),
++                         static_cast<unsigned>(k >> 63),
++                         static_cast<unsigned long long>(k),
++                         kPrimNames[k & 7u],
++                         static_cast<unsigned>((k >> 3) & 1u), static_cast<unsigned>((k >> 5) & 1u),
++                         static_cast<unsigned>((k >> 6) & 1u), static_cast<unsigned>((k >> 7) & 1u),
++                         static_cast<unsigned>((k >> 8) & 0x3Fu),
++                         kMskNames[(k >> 14) & 3u],
++                         static_cast<unsigned>((k >> 16) & 0xFu), static_cast<unsigned>((k >> 20) & 1u),
++                         static_cast<unsigned>((k >> 21) & 1u), static_cast<unsigned>((k >> 22) & 7u),
++                         static_cast<unsigned>((k >> 25) & 3u), static_cast<unsigned>((k >> 27) & 1u),
++                         static_cast<unsigned>((k >> 28) & 1u), static_cast<unsigned>((k >> 29) & 1u),
++                         static_cast<unsigned>((k >> 30) & 3u),
++                         static_cast<unsigned>((k >> 32) & 3u), static_cast<unsigned>((k >> 34) & 3u),
++                         static_cast<unsigned>((k >> 36) & 3u), static_cast<unsigned>((k >> 38) & 3u),
++                         tex,
++                         static_cast<unsigned>((k >> 59) & 1u), static_cast<unsigned>((k >> 60) & 1u),
++                         static_cast<unsigned>((k >> 61) & 1u), static_cast<unsigned>((k >> 62) & 1u));
++        }
++    }
++
++    void stateCensusRecord(const GSPrimitiveBatch &batch)
++    {
++        ++g_stateCensusN;
++        ++g_stateCensus[stateCensusKey(batch)];
++        if ((g_stateCensusN & 255u) != 0u)
++            return;
++        const uint64_t now = gs2NowMs();
++        if (g_stateCensusLastDumpMs == 0u)
++        {
++            g_stateCensusLastDumpMs = now;
++            return;
++        }
++        if (now - g_stateCensusLastDumpMs < 10000u)
++            return;
++        g_stateCensusLastDumpMs = now;
++        stateCensusDump();
++    }
 +    struct Gs2XferStats
 +    {
 +        unsigned long n = 0;
@@ -441,6 +606,8 @@ index 9c39ae2..c7969c8 100644
  {
      const GSDrawState &state = batch.state;
      const auto &ctx = state.context;
++    if (s_gsStateCensus)
++        stateCensusRecord(batch);
 +    // PS2X_GS_FONTTRACE: draw-ORDER stamps -- a glyph draw vs the full-screen cover quad. The
 +    // menu text is drawn with white texels (proven by [gs2:fontsamp]) yet the completed frame
 +    // holds none: if an untextured full-width sprite lands on fbp 0/128 AFTER the glyphs (seq
@@ -674,7 +841,7 @@ index 9c39ae2..c7969c8 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,6 +1298,59 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,6 +1462,59 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -734,7 +901,7 @@ index 9c39ae2..c7969c8 100644
      switch (state.prim.type)
      {
      case GS_PRIM_SPRITE:
-@@ -762,15 +1368,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -762,15 +1532,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
      case GS_PRIM_POINT:
      {
          const GSVertex &v = batch.vertices[0];
@@ -762,7 +929,7 @@ index 9c39ae2..c7969c8 100644
  }
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
-@@ -792,11 +1407,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +1571,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -777,7 +944,7 @@ index 9c39ae2..c7969c8 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -817,7 +1431,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -817,7 +1595,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      u32 fbrgba = 0;
      if (frmw)
      {
@@ -786,7 +953,7 @@ index 9c39ae2..c7969c8 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +1461,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +1625,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -800,7 +967,7 @@ index 9c39ae2..c7969c8 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +1544,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +1708,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -834,7 +1001,7 @@ index 9c39ae2..c7969c8 100644
      }
  }
  
-@@ -947,15 +1580,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +1744,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -883,7 +1050,7 @@ index 9c39ae2..c7969c8 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,26 +1631,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,26 +1795,52 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -945,7 +1112,7 @@ index 9c39ae2..c7969c8 100644
      }
      else
      {
-@@ -1002,7 +1690,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +1854,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -954,7 +1121,7 @@ index 9c39ae2..c7969c8 100644
  
          switch (tex.psm)
          {
-@@ -1024,7 +1712,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +1876,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -969,7 +1136,7 @@ index 9c39ae2..c7969c8 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +1919,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,6 +2083,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -1010,7 +1177,7 @@ index 9c39ae2..c7969c8 100644
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +2009,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +2173,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -1019,7 +1186,7 @@ index 9c39ae2..c7969c8 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +2027,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +2191,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -1052,7 +1219,7 @@ index 9c39ae2..c7969c8 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1376,7 +2130,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +2294,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -1073,7 +1240,7 @@ index 9c39ae2..c7969c8 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +2152,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +2316,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -1095,7 +1262,7 @@ index 9c39ae2..c7969c8 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,7 +2175,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,7 +2339,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -1118,7 +1285,7 @@ index 9c39ae2..c7969c8 100644
      if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
          return;
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
-@@ -1406,6 +2203,69 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +2367,69 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -1188,7 +1355,7 @@ index 9c39ae2..c7969c8 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1610,6 +2470,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +2634,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -1196,7 +1363,7 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,6 +2483,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,6 +2647,9 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -1206,7 +1373,127 @@ index 9c39ae2..c7969c8 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || context.frame.fbw == 0u)
          return false;
-@@ -1759,16 +2623,42 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1679,6 +2707,72 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+     return false;
+ }
+ 
++namespace
++{
++    // PS2X_GS_GPU_VERIFY bookkeeping: byte-compare the GPU rect against the CPU rect
++    // (identical source bytes, identical parameters). Loud on the first few divergences,
++    // then a periodic summary. Zero mismatches over a long soak is the promotion gate
++    // for defaulting PS2X_GS_GPU_PRESENT on.
++    void gs2GpuVerifyCompare(bool cpuOk,
++                             const std::vector<uint8_t> &cpuPixels,
++                             const std::vector<uint8_t> &gpuPixels,
++                             const GSFrameReg &frame,
++                             uint32_t width,
++                             uint32_t height)
++    {
++        ++g_gpuVerifyCompares;
++        if (!cpuOk)
++        {
++            // GPU decoded a rect the CPU rejected -- a support-matrix divergence, not a
++            // pixel bug. Should be impossible (same psm set); scream once.
++            static bool s_logged = false;
++            if (!s_logged)
++            {
++                s_logged = true;
++                std::fprintf(stderr, "[gsgpu:verify] CPU rejected a GPU-decoded rect (psm=0x%x)\n",
++                             frame.psm);
++            }
++            return;
++        }
++        if (cpuPixels.size() == gpuPixels.size() &&
++            std::memcmp(cpuPixels.data(), gpuPixels.data(), cpuPixels.size()) != 0)
++        {
++            ++g_gpuVerifyMismatchRects;
++            unsigned long long rectPixels = 0;
++            uint32_t firstX = 0, firstY = 0, firstCpu = 0, firstGpu = 0;
++            for (uint32_t y = 0; y < height; ++y)
++                for (uint32_t x = 0; x < width; ++x)
++                {
++                    const size_t o = (static_cast<size_t>(y) * kHostFrameWidth + x) * 4u;
++                    uint32_t c, g;
++                    std::memcpy(&c, cpuPixels.data() + o, 4u);
++                    std::memcpy(&g, gpuPixels.data() + o, 4u);
++                    if (c != g)
++                    {
++                        if (rectPixels == 0u)
++                        {
++                            firstX = x;
++                            firstY = y;
++                            firstCpu = c;
++                            firstGpu = g;
++                        }
++                        ++rectPixels;
++                    }
++                }
++            g_gpuVerifyMismatchPixels += rectPixels;
++            if (g_gpuVerifyMismatchRects <= 8u)
++                std::fprintf(stderr,
++                             "[gsgpu:verify] MISMATCH rect#%lu psm=0x%x fbp=%u fbw=%u %ux%u: "
++                             "%llu px differ, first (%u,%u) cpu=%08x gpu=%08x\n",
++                             g_gpuVerifyMismatchRects, frame.psm, frame.fbp, frame.fbw,
++                             width, height, rectPixels, firstX, firstY, firstCpu, firstGpu);
++        }
++        if ((g_gpuVerifyCompares % 512u) == 0u)
++            std::fprintf(stderr, "[gsgpu:verify] compares=%lu mismatch-rects=%lu mismatch-px=%llu\n",
++                         g_gpuVerifyCompares, g_gpuVerifyMismatchRects, g_gpuVerifyMismatchPixels);
++    }
++}
++
+ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+                                        uint32_t width,
+                                        uint32_t height,
+@@ -1688,6 +2782,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+                                        bool frameBaseIsPages,
+                                        uint32_t sourceOriginX,
+                                        uint32_t sourceOriginY) const
++{
++#if PS2X_HAS_GS_GPU_DEVICE
++    // GPU present decode (m_gpuDecode is only ever set on Present()'s snapshot backend).
++    // The linear (non-local-memory) layout path is CPU-only -- it is dead in the present
++    // flow (every present call site passes useLocalMemoryLayout=true).
++    if (m_gpuDecode && useLocalMemoryLayout)
++    {
++        thread_local std::vector<uint8_t> gpuPixels;
++        if (m_gpuDecode->DecodeFrameRect(m_vram, m_vramSize, m_gpuSourceId, frame, width, height,
++                                         frameBaseIsPages, sourceOriginX, sourceOriginY,
++                                         preserveAlpha, gpuPixels))
++        {
++            if (!s_gsGpuVerify)
++            {
++                outPixels.swap(gpuPixels);
++                return true;
++            }
++            const bool cpuOk = CopyFrameToHostRgbaCpu(frame, width, height, outPixels,
++                                                      preserveAlpha, useLocalMemoryLayout,
++                                                      frameBaseIsPages, sourceOriginX,
++                                                      sourceOriginY);
++            gs2GpuVerifyCompare(cpuOk, outPixels, gpuPixels, frame, width, height);
++            return cpuOk; // CPU stays authoritative under verify
++        }
++    }
++#endif
++    return CopyFrameToHostRgbaCpu(frame, width, height, outPixels, preserveAlpha,
++                                  useLocalMemoryLayout, frameBaseIsPages,
++                                  sourceOriginX, sourceOriginY);
++}
++
++bool GSCpuBackend::CopyFrameToHostRgbaCpu(const GSFrameReg &frame,
++                                          uint32_t width,
++                                          uint32_t height,
++                                          std::vector<uint8_t> &outPixels,
++                                          bool preserveAlpha,
++                                          bool useLocalMemoryLayout,
++                                          bool frameBaseIsPages,
++                                          uint32_t sourceOriginX,
++                                          uint32_t sourceOriginY) const
+ {
+     if (!m_vram || m_vramSize == 0u)
+         return false;
+@@ -1759,16 +2893,62 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -1225,10 +1512,14 @@ index 9c39ae2..c7969c8 100644
 +        std::chrono::duration_cast<std::chrono::milliseconds>(
 +            std::chrono::steady_clock::now().time_since_epoch())
 +            .count());
++    bool usedPresentCopy = false;
++    uint64_t copySeq = 0;
 +    if (copyTick != 0u && nowMs - copyTick <= 500u)
 +    {
++        usedPresentCopy = true;
 +        std::lock_guard<std::mutex> plock(m_presentCopyMutex);
 +        snapshot = m_presentCopy;
++        copySeq = m_presentCopySeq;
 +        // A display-flip snapshot pairs the VRAM copy with the DISPLAY REGISTERS from the
 +        // same instant (the pre-flip front buffer, the one the frame was completed in --
 +        // its UI text included). Rendering the copy with the LIVE registers would show the
@@ -1249,11 +1540,27 @@ index 9c39ae2..c7969c8 100644
      thread_local GSCpuBackend snapshotBackend;
      snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
 -    return snapshotBackend.PresentFromLocalMemory(request);
++    snapshotBackend.m_gpuDecode = nullptr;
++#if PS2X_HAS_GS_GPU_DEVICE
++    if (s_gsGpuPresent || s_gsGpuVerify)
++    {
++        // Upload-cache key: flip/Sync captures use the capture SEQUENCE number (unique
++        // per capture -- the capture tick is milliseconds and collides, which made the
++        // GPU decode a stale upload in run172; both rects of a present, and consecutive
++        // presents of the same capture, still hit the cached upload); a live snapshot
++        // gets a fresh id per Present, shared by that present's rects. Bit 63 separates
++        // the two id spaces.
++        static uint64_t s_livePresentSeq = 0;
++        snapshotBackend.m_gpuDecode = gs2GpuDevice();
++        snapshotBackend.m_gpuSourceId =
++            usedPresentCopy ? (copySeq | (1ull << 63)) : ++s_livePresentSeq;
++    }
++#endif
 +    return snapshotBackend.PresentFromLocalMemory(effectiveRequest);
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +2702,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +2992,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;
