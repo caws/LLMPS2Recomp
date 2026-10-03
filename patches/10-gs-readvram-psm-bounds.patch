@@ -1,0 +1,35 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_gs_gpu.h b/ps2xRuntime/include/runtime/ps2_gs_gpu.h
+index 1991f95..5479bd6 100644
+--- a/ps2xRuntime/include/runtime/ps2_gs_gpu.h
++++ b/ps2xRuntime/include/runtime/ps2_gs_gpu.h
+@@ -462,8 +468,15 @@ private:
+     using WriteVramFunc = std::function<void(u8*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)>;
+     using ReadVramFunc = std::function<u32(u8*, u32, u32, u32, u32)>;
+ 
+-    std::array<ReadVramFunc, 0x3F> m_read_vram_funcs{ };
+-    std::array<WriteVramFunc, 0x3F> m_write_vram_funcs{ };
++    // 0x40 entries, not 0x3F: ReadVram/WriteVram index by `psm & 0x3F`, whose range is 0..0x3F (0..63),
++    // so index 0x3F must exist. The PS2 PSM field is 6 bits; an undefined value must resolve to the Null
++    // handler, not read one past the end of a 0x3F-sized array (a garbage std::function -> SIGSEGV).
++    // Observed concretely: the ZBUF psm decode `((zbuf>>24)&0xF)|0x30` yields 0x3F for nibble 0xF, so the
++    // per-pixel z-test read hits index 0x3F (gdb-confirmed the game never writes FRAME.PSM=0x3f). The ctor
++    // fills every slot incl. 0x3F with ReadNull(->0)/WriteNull(no-op) — a no-op z-read is benign (z-test
++    // passes) and cannot corrupt VRAM. Matches PCSX2's m_psm[64] sizing. See patch 10-gs-readvram-psm-bounds.
++    std::array<ReadVramFunc, 0x40> m_read_vram_funcs{ };
++    std::array<WriteVramFunc, 0x40> m_write_vram_funcs{ };
+ };
+ 
+ inline u32 GS::ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const
+diff --git a/ps2xRuntime/src/lib/ps2_gs_gpu.cpp b/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
+index f1f2bde..1083028 100644
+--- a/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
++++ b/ps2xRuntime/src/lib/ps2_gs_gpu.cpp
+@@ -365,7 +367,7 @@ GS::GS()
+ 
+     InitLookupTables();
+ 
+-    for (usz i = 0; i < 0x3F; ++i)
++    for (usz i = 0; i < 0x40; ++i)   // 0..0x3F: every 6-bit psm value; undefined -> ReadNull/WriteNull (patch 10)
+     {
+         switch (i)
+         {
