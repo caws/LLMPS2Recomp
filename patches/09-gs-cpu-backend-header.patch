@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..8504366 100644
+index 71e8032..ec1f5d7 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 @@ -3,14 +3,24 @@
@@ -41,7 +41,7 @@ index 71e8032..8504366 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +53,185 @@ private:
+@@ -36,18 +53,192 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -212,6 +212,13 @@ index 71e8032..8504366 100644
 +    // the pool is off or the primitive is too short to be worth the handoff.
 +    void RasterFanOut(const GSPrimitiveBatch &batch, int minY, int maxY);
 +    // cont.208: deterministic rasterizer capture + replay bench (see gs_cpu_backend.cpp).
++    // Resolve the per-batch draw state into this thread's m_draw. Every band thread calls it for
++    // every primitive it rasterizes.
++    void resolveDraw(const GSDrawState &state);
++    // Rasterize a whole RUN of primitives, one band per thread. One fan-out amortised over the
++    // entire run, so even single-pixel primitives are parallel -- which per-primitive fan-out
++    // could not do (only ~5% of prims cleared its threshold).
++    void RasterRunFanOut(const GSPrimitiveBatch *items, size_t count);
 +    void rasterCapRecord(const GSPrimitiveBatch &batch);
 +    void rasterBenchRun();
 +    void startBandPool();
@@ -231,7 +238,7 @@ index 71e8032..8504366 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +241,36 @@ private:
+@@ -57,9 +248,36 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -270,11 +277,16 @@ index 71e8032..8504366 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +278,69 @@ private:
+@@ -67,9 +285,80 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
-+    ResolvedDraw m_draw{};
++    // ★ cont.209: PER-THREAD. Under batch-level banding every rasterizer thread walks the whole
++    // run at its own pace, so at any instant two threads are on DIFFERENT primitives and therefore
++    // different resolved state. A single shared copy would be a data race and would draw with the
++    // wrong psm handlers. Static (not per-instance) is fine: each thread resolves it before use,
++    // and only one backend rasterizes.
++    static thread_local ResolvedDraw m_draw;
  
      GSTransferCommand m_transfer{};
      GSTransferSnapshot m_transferState{};
@@ -328,6 +340,12 @@ index 71e8032..8504366 100644
 +    unsigned m_bandPending = 0;        // helpers still working on the current fan-out
 +    bool m_bandStop = false;
 +    unsigned long long m_bandFanOuts = 0, m_bandDirect = 0;
++    // cont.209 run fan-out: the run is published once and every thread walks all of it.
++    const GSPrimitiveBatch *m_bandRunItems = nullptr;
++    size_t m_bandRunCount = 0;
++    bool m_bandRunActive = false;   // coordinator is inside a run fan-out -> band 0 only, no nesting
++    int m_bandRunY0 = 0, m_bandRunY1 = 0;
++    unsigned long long m_bandRuns = 0, m_bandRunPrims = 0;
 +    // GPU present decode (cont.166 phase 0, PS2X_GS_GPU_PRESENT / PS2X_GS_GPU_VERIFY):
 +    // non-owning; Present() points its thread_local snapshot backend at the process-wide
 +    // device before PresentFromLocalMemory, with m_gpuSourceId keying the device's VRAM
