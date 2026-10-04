@@ -2,8 +2,8 @@
 
 > **DESIGN ONLY, and GAME-AGNOSTIC.** Nothing here is built. This file is the *method*; each game's
 > numbers, ordered work, module ranking and enhancement targets live in that game's
-> `docs/native-lift-plan.md` (for the example game,
-> `rotk_recomp/docs/native-lift-plan.md`). Keep this file free of any one game's facts. This doc exists so the arc is decided before it is
+> `docs/platform-plan.md` (for the example game,
+> `rotk_recomp/docs/platform-plan.md`). Keep this file free of any one game's facts. This doc exists so the arc is decided before it is
 > started, because its failure modes are ordering mistakes that are expensive to unwind.
 > Companion to [`gl-renderer.md`](gl-renderer.md) and [`vu1-jit.md`](vu1-jit.md).
 
@@ -41,7 +41,7 @@ infrastructure — a renderer, audio, ffmpeg, a window/input library — like an
   new dispatch machinery. This is the single fact that makes the arc possible at all.
 - **Scale is per game and must be measured, not assumed** — generated function count and line
   count vs the game's current real (non-diagnostic) hook count. Record it in that game's
-  `docs/native-lift-plan.md`; it is the honest denominator for every progress claim, and for a
+  `docs/platform-plan.md`; it is the honest denominator for every progress claim, and for a
   mid-size PS2 title it is a five-digit function count against a three-digit hook count.
 - **Guest static data is loaded from the ELF at runtime** (`ps2_runtime.h:304` `loadELF`). Hooks
   receive `rdram` and read `.data`/`.rodata` out of it. **Lifting code does not lift data.**
@@ -145,7 +145,7 @@ not re-execution diffing. Design it before lifting the kernel, not during.
 done; there is always another level, cutscene, or edge case. Gate on something testable.
 
 - **Phase 0 — reach a game that can be played through.** Its *content* is per game and belongs in
-  that game's `docs/native-lift-plan.md`; what is general is the shape: close out whatever
+  that game's `docs/platform-plan.md`; what is general is the shape: close out whatever
   performance work still has a measured ceiling (and **stop** when the ceiling is small — size it
   before investing), settle any subsystem whose flags are still experiment-gated so the playthrough
   exercises them, **measure each newly-enabled subsystem's cost on the same binary with the flag
@@ -170,7 +170,7 @@ low hardware contact; cheaply verifiable.
 - **Late:** anything with a broad interface into gameplay state.
 - **Last:** anything touching VU microcode or the EE threading model.
 
-The per-game ranking belongs in that game's `docs/native-lift-plan.md`.
+The per-game ranking belongs in that game's `docs/platform-plan.md`.
 
 **Do not faithfully reimplement middleware.** A large share of the 890k lines is Sony SDK and
 linked middleware, not EA game code. That code should be *deleted and replaced* with a native
