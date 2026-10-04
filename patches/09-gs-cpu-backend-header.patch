@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..b4e75a8 100644
+index 71e8032..edd60b1 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 @@ -3,14 +3,24 @@
@@ -41,7 +41,7 @@ index 71e8032..b4e75a8 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +53,192 @@ private:
+@@ -36,18 +53,201 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -215,6 +215,15 @@ index 71e8032..b4e75a8 100644
 +    // Resolve the per-batch draw state into this thread's m_draw. Every band thread calls it for
 +    // every primitive it rasterizes.
 +    void resolveDraw(const GSDrawState &state);
++    // cont.228: fill the mip-dependent half of the resolved texture state. Split out of
++    // resolveDraw because the mip is not known until the primitive's own setup (DrawTriangle
++    // computes triMip after the winding/denominator), so SampleTexture calls it on its first
++    // fetch of each draw.
++    void resolveTexMip(const GSDrawState &state, uint32_t mip);
++    // cont.228: the PSMT4 fast path's diagnostics (PS2X_GS_CLUTVERIFY / _CLUTMUTATE), deliberately
++    // out-of-line so they cost the production path one predicted branch and nothing else.
++    uint32_t sampleFastP4Diag(const GSDrawState &state, uint32_t tbp, uint32_t tbw,
++                              int sampleU, int sampleV);
 +    // Rasterize a whole RUN of primitives, one band per thread. One fan-out amortised over the
 +    // entire run, so even single-pixel primitives are parallel -- which per-primitive fan-out
 +    // could not do (only ~5% of prims cleared its threshold).
@@ -238,7 +247,7 @@ index 71e8032..b4e75a8 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +248,61 @@ private:
+@@ -57,9 +257,83 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -298,11 +307,33 @@ index 71e8032..b4e75a8 100644
 +        uint64_t clutGen = ~0ull;
 +        uint32_t clutPage = ~0u;
 +        bool clutStomped = false;
++        // ★★ cont.228: the SampleTexture PROLOGUE, resolved once per primitive. Every field here
++        // is invariant for a draw -- the mip is constant per primitive (`triMip` is computed once
++        // per triangle, and sprites always pass 0) -- yet all of it was recomputed on EVERY texel
++        // fetch: the MIPTBP1/2 decode, texW/texH, and the six CLAMP fields. `texMip` is the mip
++        // they hold; resolveDraw sets it to ~0u so the first SampleTexture call of each primitive
++        // refills them, which needs no change at the call sites.
++        uint32_t texMip = ~0u;
++        uint32_t texTbp = 0;
++        uint32_t texTbw = 0;
++        int texW = 1;
++        int texH = 1;
++        float texWf = 1.0f;
++        float texHf = 1.0f;
++        // 1 / (16 << mip). Exact: the divisor is a power of two, so multiplying by the reciprocal
++        // is bit-identical to the division it replaces.
++        float texFstScale = 1.0f / 16.0f;
++        uint8_t texWrapU = 0;
++        uint8_t texWrapV = 0;
++        uint16_t texMinU = 0, texMaxU = 0, texMinV = 0, texMaxV = 0;
++        // PSMT4 with a decoded CLUT: the devirtualised sampler, which calls
++        // PixelStorageTraits<P4> directly instead of going through m_draw.texRead.
++        bool texFastP4 = false;
 +    };
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +310,80 @@ private:
+@@ -67,9 +341,80 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};

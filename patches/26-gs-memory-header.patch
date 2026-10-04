@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
-index 095e4e5..f3bb973 100644
+index 095e4e5..c073762 100644
 --- a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
 +++ b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
 @@ -263,6 +263,14 @@ namespace GSMem
@@ -45,7 +45,7 @@ index 095e4e5..f3bb973 100644
  		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + BitOffset();
  		const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
  		const u32 shift = bits % 8;
-@@ -536,6 +554,14 @@ namespace GSMem
+@@ -536,6 +554,19 @@ namespace GSMem
  		return 0xFFFF00FFu;
  	}
  
@@ -56,6 +56,11 @@ index 095e4e5..f3bb973 100644
 +	// as ReadZ24/WriteZ24 already do.)
 +	extern PixelStorageTraits<C32>::PageLookupTableT PageTableC32;
 +	extern PixelStorageTraits<Z32>::PageLookupTableT PageTableZ32;
++	// ★★ cont.228: the same treatment for the dominant TEXTURE format. A per-texel census
++	// (PS2X_GS_TEXCENSUS) measured 83.0% of all texel fetches as PSMT4, and each one reached VRAM
++	// through the m_draw.texRead function pointer -> ReadP4 -> here. Exposing the table lets
++	// SampleTexture call the traits directly so the whole lookup inlines.
++	extern PixelStorageTraits<P4>::PageLookupTableT PageTableP4;
 +
  	void InitLookupTables();
  

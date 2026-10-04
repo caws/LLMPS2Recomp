@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..37b0323 100644
+index 9c39ae2..fd63462 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -9,10 +9,26 @@
@@ -29,7 +29,7 @@ index 9c39ae2..37b0323 100644
  
  using namespace GSInternal;
  
-@@ -468,12 +484,792 @@ namespace
+@@ -468,12 +484,806 @@ namespace
      }
  }
  
@@ -523,6 +523,15 @@ index 9c39ae2..37b0323 100644
 +// into m_buff32 on a dirty TEX0/TEXA and the sampler indexes that buffer, never VRAM.
 +static const bool s_gsFastClut = []
 +{ const char *e = std::getenv("PS2X_GS_FASTCLUT"); return !(e && e[0] == '0'); }();
++// ★★★ cont.228 DEVIRTUALISED TEXTURE PATH (PS2X_GS_FASTTEX, default ON, "=0" restores the
++// per-texel prologue + the m_draw.texRead function pointer). Two changes, both the cont.225 move
++// of REMOVING indirect calls and recomputation: (a) the SampleTexture prologue -- MIPTBP decode,
++// texW/texH, the six CLAMP fields -- is resolved once per primitive instead of per texel;
++// (b) a PSMT4 texel is read by calling PixelStorageTraits<P4> directly so the whole swizzled
++// lookup inlines, and its CLUT hit comes from the cont.227 decoded palette. The census says the
++// target is narrow enough to be worth specialising: 83.0% of texel fetches are PSMT4.
++static const bool s_gsFastTex = []
++{ const char *e = std::getenv("PS2X_GS_FASTTEX"); return !(e && e[0] == '0'); }();
 +// PS2X_GS_CLUTVERIFY=1 (default OFF): differential oracle -- every cached hit is compared against
 +// a live LookupCLUT of the same texel. The bench's VRAM hash already proves pixel-equality, but it
 +// cannot distinguish "never sampled differently" from "correct", and per the cont.216 lesson a
@@ -533,6 +542,11 @@ index 9c39ae2..37b0323 100644
 +{ const char *e = std::getenv("PS2X_GS_CLUTVERIFY"); return e && e[0] && e[0] != '0'; }();
 +static const int s_gsClutMutate = []
 +{ const char *e = std::getenv("PS2X_GS_CLUTMUTATE"); return e ? std::atoi(e) : 0; }();
++// ★ One flag for BOTH diagnostics, so the PSMT4 fast path carries exactly ONE predicted branch.
++// Measured, not assumed: inlining the verify block into the sampling lambda cost ~5% (73.3 -> 78.0
++// ms at 1T) -- it is called four times per bilinear pixel, and the extra live state stopped it
++// inlining. Everything diagnostic now lives behind this flag in a noinline function.
++static const bool s_gsClutDiag = s_gsClutVerify || s_gsClutMutate != 0;
 +
 +namespace
 +{
@@ -822,7 +836,7 @@ index 9c39ae2..37b0323 100644
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +1327,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +1341,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -839,7 +853,7 @@ index 9c39ae2..37b0323 100644
              break;
          }
      }
-@@ -541,30 +1343,59 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,30 +1357,59 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -899,7 +913,7 @@ index 9c39ae2..37b0323 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +1404,136 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,22 +1418,136 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -1041,7 +1055,7 @@ index 9c39ae2..37b0323 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -602,43 +1547,2637 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+@@ -602,43 +1561,2688 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
  
  void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
  {
@@ -3094,6 +3108,7 @@ index 9c39ae2..37b0323 100644
 +    // sampling from (that is exactly why the cont.165 CLUT shadow exists), and a cross-draw reuse
 +    // key would have to model that invalidation. PCSX2 does model it
 +    // (GSClut::InvalidateRange(start, end, is_draw)); re-decoding per draw makes it moot.
++    m_draw.texMip = ~0u; // cont.228: force resolveTexMip on this draw's first texel fetch
 +    m_draw.clutValid = false;
 +    if (s_gsFastClut && state.prim.tme && m_vram != nullptr)
 +    {
@@ -3150,6 +3165,56 @@ index 9c39ae2..37b0323 100644
 +        if (s_gsClutVerify || s_gsTexCensus)
 +            ++g_clutVerify.stompsArmed;
 +    }
++}
++
++// ★★ cont.228: the mip-dependent half of the resolved texture state. Everything here was
++// recomputed on EVERY texel fetch even though the mip is constant for a primitive.
++void GSCpuBackend::resolveTexMip(const GSDrawState &state, uint32_t mip)
++{
++    const auto &ctx = state.context;
++    const auto &tex = ctx.tex0;
++
++    uint32_t mipTbp = tex.tbp0;
++    uint32_t mipTbw = tex.tbw;
++    int texW = state.textureWidth;
++    int texH = state.textureHeight;
++    if (mip > 0u)
++    {
++        const uint64_t m1 = ctx.miptbp1;
++        const uint64_t m2 = ctx.miptbp2;
++        switch (mip)
++        {
++        case 1: mipTbp = static_cast<uint32_t>(m1 & 0x3FFFu); mipTbw = static_cast<uint32_t>((m1 >> 14) & 0x3Fu); break;
++        case 2: mipTbp = static_cast<uint32_t>((m1 >> 20) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m1 >> 34) & 0x3Fu); break;
++        case 3: mipTbp = static_cast<uint32_t>((m1 >> 40) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m1 >> 54) & 0x3Fu); break;
++        case 4: mipTbp = static_cast<uint32_t>(m2 & 0x3FFFu); mipTbw = static_cast<uint32_t>((m2 >> 14) & 0x3Fu); break;
++        case 5: mipTbp = static_cast<uint32_t>((m2 >> 20) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m2 >> 34) & 0x3Fu); break;
++        default: mipTbp = static_cast<uint32_t>((m2 >> 40) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m2 >> 54) & 0x3Fu); break;
++        }
++        texW = std::max(1, texW >> mip);
++        texH = std::max(1, texH >> mip);
++    }
++    const uint64_t clamp = ctx.clamp;
++    m_draw.texTbp = mipTbp;
++    m_draw.texTbw = mipTbw;
++    m_draw.texW = texW;
++    m_draw.texH = texH;
++    m_draw.texWf = static_cast<float>(texW);
++    m_draw.texHf = static_cast<float>(texH);
++    // 16 << mip is a power of two, so the reciprocal is exact and this multiply is bit-identical
++    // to the division it replaces.
++    m_draw.texFstScale = 1.0f / (16.0f * static_cast<float>(1u << mip));
++    m_draw.texWrapU = static_cast<uint8_t>(clamp & 0x3u);
++    m_draw.texWrapV = static_cast<uint8_t>((clamp >> 2) & 0x3u);
++    m_draw.texMinU = static_cast<uint16_t>(((clamp >> 4) & 0x3FFu) >> mip);
++    m_draw.texMaxU = static_cast<uint16_t>(((clamp >> 14) & 0x3FFu) >> mip);
++    m_draw.texMinV = static_cast<uint16_t>(((clamp >> 24) & 0x3FFu) >> mip);
++    m_draw.texMaxV = static_cast<uint16_t>(((clamp >> 34) & 0x3FFu) >> mip);
++    // Only plain PSMT4 takes the inlined read: T4HL/T4HH are the SAME 4-bit index but live in the
++    // high nibbles of a CT32 page (ReadP4HL/HH use PageTableC32), and the census saw zero of them.
++    m_draw.texFastP4 = s_gsFastTex && m_draw.clutValid &&
++                       static_cast<uint8_t>(tex.psm & 0x3Fu) == GS_PSM_T4;
++    m_draw.texMip = mip;
 +}
 +
 +// ★★ cont.209: BATCH-LEVEL banding. Bands here are FIXED SCREEN STRIPS for the whole run, not
@@ -3695,7 +3760,7 @@ index 9c39ae2..37b0323 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,34 +4284,191 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,34 +4349,191 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -3895,7 +3960,7 @@ index 9c39ae2..37b0323 100644
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
  {
      const auto &ctx = state.context;
-@@ -792,11 +4488,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +4553,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -3910,7 +3975,7 @@ index 9c39ae2..37b0323 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -813,11 +4508,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -813,11 +4573,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      // TODO: only one address lookup for rmw
      const bool frmw = destinationAlphaTestNeedsRead || (writeMask.writesFramebuffer() && ((ctx.frame.fbmsk != 0) || alphaBlendEnabled || preserveDestinationAlpha));
  
@@ -3937,7 +4002,7 @@ index 9c39ae2..37b0323 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +4556,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +4621,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -3965,7 +4030,7 @@ index 9c39ae2..37b0323 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +4653,45 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +4718,45 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -4013,7 +4078,7 @@ index 9c39ae2..37b0323 100644
      }
  }
  
-@@ -947,15 +4703,60 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +4768,60 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -4078,11 +4143,44 @@ index 9c39ae2..37b0323 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,26 +4770,53 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,32 +4835,90 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
 -uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
++// ★★ cont.228: every diagnostic for the PSMT4 fast path, kept OUT of the sampling lambda so the
++// production path is one branch and two loads. PS2X_GS_CLUTVERIFY compares the inlined read plus
++// decoded-palette hit against the original composition (m_draw.texRead -> LookupCLUT), which is
++// what keeps the oracle on the REAL path -- without this the verifier would silently stop covering
++// 83% of all texel fetches. PS2X_GS_CLUTMUTATE proves it can fail: 2 rotates the palette index,
++// 3 corrupts the READ's coordinate (so the address computation is covered too, not just the hit).
++__attribute__((noinline))
++uint32_t GSCpuBackend::sampleFastP4Diag(const GSDrawState &state, uint32_t tbp, uint32_t tbw,
++                                        int sampleU, int sampleV)
++{
++    const auto &tex = state.context.tex0;
++    const u32 mu = static_cast<u32>(s_gsClutMutate == 3 ? (sampleU ^ 1) : sampleU);
++    uint32_t idx = GSMem::PixelStorageTraits<GSMem::P4>::Read(
++                       GSMem::PageTableP4, m_vram, tbp, tbw, mu,
++                       static_cast<u32>(sampleV)) & 15u;
++    if (s_gsClutMutate == 2)
++        idx = (idx + 1u) & 15u;
++    const uint32_t fast = m_draw.clut[idx];
++    if (s_gsClutVerify)
++    {
++        const u32 ref = m_draw.texRead(m_vram, tbp, tbw, sampleU, sampleV);
++        const uint32_t live = LookupCLUT(state, static_cast<u8>(ref), tex.cbp, tex.cpsm,
++                                         tex.csm, tex.csa, tex.psm);
++        ++g_clutVerify.checks;
++        if (fast != live && g_clutVerify.mismatches++ < 8ull)
++            std::fprintf(stderr,
++                         "[gs2:clutverify] FASTP4 MISMATCH u=%d v=%d idx=%u ref=%u"
++                         " fast=%08x live=%08x tbp=%u tbw=%u\n",
++                         sampleU, sampleV, idx, ref, fast, live, tbp, tbw);
++    }
++    return fast;
++}
++
 +uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v, uint32_t mip)
  {
      const auto &ctx = state.context;
@@ -4090,37 +4188,24 @@ index 9c39ae2..37b0323 100644
  
 -    const int texW = state.textureWidth;
 -    const int texH = state.textureHeight;
-+    uint32_t mipTbp = tex.tbp0;
-+    uint32_t mipTbw = tex.tbw;
-+    int texW = state.textureWidth;
-+    int texH = state.textureHeight;
-+    if (mip > 0u)
-+    {
-+        const uint64_t m1 = ctx.miptbp1;
-+        const uint64_t m2 = ctx.miptbp2;
-+        switch (mip)
-+        {
-+        case 1: mipTbp = static_cast<uint32_t>(m1 & 0x3FFFu); mipTbw = static_cast<uint32_t>((m1 >> 14) & 0x3Fu); break;
-+        case 2: mipTbp = static_cast<uint32_t>((m1 >> 20) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m1 >> 34) & 0x3Fu); break;
-+        case 3: mipTbp = static_cast<uint32_t>((m1 >> 40) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m1 >> 54) & 0x3Fu); break;
-+        case 4: mipTbp = static_cast<uint32_t>(m2 & 0x3FFFu); mipTbw = static_cast<uint32_t>((m2 >> 14) & 0x3Fu); break;
-+        case 5: mipTbp = static_cast<uint32_t>((m2 >> 20) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m2 >> 34) & 0x3Fu); break;
-+        default: mipTbp = static_cast<uint32_t>((m2 >> 40) & 0x3FFFu); mipTbw = static_cast<uint32_t>((m2 >> 54) & 0x3Fu); break;
-+        }
-+        texW = std::max(1, texW >> mip);
-+        texH = std::max(1, texH >> mip);
-+    }
-     const uint64_t clamp = ctx.clamp;
-     const uint8_t wrapU = static_cast<uint8_t>(clamp & 0x3u);
-     const uint8_t wrapV = static_cast<uint8_t>((clamp >> 2) & 0x3u);
+-    const uint64_t clamp = ctx.clamp;
+-    const uint8_t wrapU = static_cast<uint8_t>(clamp & 0x3u);
+-    const uint8_t wrapV = static_cast<uint8_t>((clamp >> 2) & 0x3u);
 -    const uint16_t minU = static_cast<uint16_t>((clamp >> 4) & 0x3FFu);
 -    const uint16_t maxU = static_cast<uint16_t>((clamp >> 14) & 0x3FFu);
 -    const uint16_t minV = static_cast<uint16_t>((clamp >> 24) & 0x3FFu);
 -    const uint16_t maxV = static_cast<uint16_t>((clamp >> 34) & 0x3FFu);
-+    const uint16_t minU = static_cast<uint16_t>(((clamp >> 4) & 0x3FFu) >> mip);
-+    const uint16_t maxU = static_cast<uint16_t>(((clamp >> 14) & 0x3FFu) >> mip);
-+    const uint16_t minV = static_cast<uint16_t>(((clamp >> 24) & 0x3FFu) >> mip);
-+    const uint16_t maxV = static_cast<uint16_t>(((clamp >> 34) & 0x3FFu) >> mip);
++    // ★★ cont.228: the whole prologue below used to run on EVERY texel fetch. It depends only on
++    // TEX0/CLAMP and the mip, all constant for a primitive, so it is resolved once per draw --
++    // keyed on the mip so the call sites need no change (DrawTriangle's triMip is not known until
++    // after its winding setup).
++    // ★ With the flag OFF this resolves on EVERY call, which is exactly the pre-cont.228
++    // behaviour -- so the kill switch reverts BOTH halves of the change (the hoist and the
++    // devirtualised read) without keeping a second copy of the prologue that could drift.
++    // It is very slightly pessimistic: the OFF path stores into m_draw where the original
++    // computed into locals, so a measured gain is an upper bound by those few stores.
++    if (m_draw.texMip != mip || !s_gsFastTex)
++        resolveTexMip(state, mip);
 +
 +    if (s_gsTexCensus)
 +    {
@@ -4128,35 +4213,73 @@ index 9c39ae2..37b0323 100644
 +        if (state.linearFilter) ++g_texCensus.linear;
 +        if (mip > 0u) ++g_texCensus.mipped;
 +        if (state.prim.fst) ++g_texCensus.fst;
-+        ++g_texCensus.wrap[wrapU & 3u][wrapV & 3u];
++        ++g_texCensus.wrap[m_draw.texWrapU & 3u][m_draw.texWrapV & 3u];
 +    }
++
++    const uint32_t mipTbp = m_draw.texTbp;
++    const uint32_t mipTbw = m_draw.texTbw;
++    const int texW = m_draw.texW;
++    const int texH = m_draw.texH;
++    const uint8_t wrapU = m_draw.texWrapU;
++    const uint8_t wrapV = m_draw.texWrapV;
++    const uint16_t minU = m_draw.texMinU;
++    const uint16_t maxU = m_draw.texMaxU;
++    const uint16_t minV = m_draw.texMinV;
++    const uint16_t maxV = m_draw.texMaxV;
++    const bool fastP4 = m_draw.texFastP4;
++    const uint32_t *const clut = m_draw.clut;
  
      float texUf, texVf;
      if (state.prim.fst)
      {
 -        texUf = static_cast<float>(u) / 16.0f;
 -        texVf = static_cast<float>(v) / 16.0f;
-+        texUf = static_cast<float>(u) / (16.0f * static_cast<float>(1u << mip));
-+        texVf = static_cast<float>(v) / (16.0f * static_cast<float>(1u << mip));
++        // Multiply by the exact reciprocal of 16 << mip -- bit-identical to the old division.
++        texUf = static_cast<float>(u) * m_draw.texFstScale;
++        texVf = static_cast<float>(v) * m_draw.texFstScale;
      }
      else
      {
-@@ -1002,7 +4830,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+         const float invQ = 1.0f / fabsQ(q);
+-        texUf = s * invQ * static_cast<float>(texW);
+-        texVf = t * invQ * static_cast<float>(texH);
++        texUf = s * invQ * m_draw.texWf;
++        texVf = t * invQ * m_draw.texHf;
+     }
+ 
+     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+@@ -1002,7 +4926,29 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
 -        u32 out = ReadVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
-+        u32 out = m_draw.texRead(m_vram, mipTbp, mipTbw, sampleU, sampleV);
-+
++        // ★★ The devirtualised path: 83.0% of this game's texel fetches. Calling the traits
++        // directly inlines the whole swizzled lookup (no m_draw.texRead indirect call, no ReadP4
++        // frame), and the palette hit is the cont.227 decoded CLUT -- so a PSMT4 texel is now an
++        // inlined address computation plus two loads. `fastP4` is loop-invariant, so the branch
++        // hoists out of the four bilinear taps.
++        // Census before the fast path, so it still counts every texel fetch (it is what
++        // characterises the workload; a census blind to 83% of it would be worthless).
 +        if (s_gsTexCensus)
 +        {
 +            ++g_texCensus.texels;
 +            ++g_texCensus.texelByPsm[tex.psm & 0x3Fu];
 +        }
++
++        if (fastP4)
++        {
++            if (s_gsClutDiag)
++                return sampleFastP4Diag(state, mipTbp, mipTbw, sampleU, sampleV);
++            return clut[GSMem::PixelStorageTraits<GSMem::P4>::Read(
++                            GSMem::PageTableP4, m_vram, mipTbp, mipTbw,
++                            static_cast<u32>(sampleU), static_cast<u32>(sampleV)) & 15u];
++        }
++
++        u32 out = m_draw.texRead(m_vram, mipTbp, mipTbw, sampleU, sampleV);
  
          switch (tex.psm)
          {
-@@ -1021,10 +4855,37 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1021,10 +4967,37 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          case GS_PSM_T4:
          case GS_PSM_T4HL:
          case GS_PSM_T4HH:
@@ -4195,7 +4318,7 @@ index 9c39ae2..37b0323 100644
      };
  
      if (!state.linearFilter)
-@@ -1073,7 +4934,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1073,7 +5046,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
             (static_cast<uint32_t>(a) << 24);
  }
  
@@ -4204,7 +4327,7 @@ index 9c39ae2..37b0323 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1110,6 +4971,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1110,6 +5083,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
      const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
      const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
      const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
@@ -4215,7 +4338,7 @@ index 9c39ae2..37b0323 100644
  
      const uint64_t alphaReg = ctx.alpha;
      const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
-@@ -1148,8 +5013,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1148,8 +5125,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
          if (spriteH < 1.0f)
              spriteH = 1.0f;
  
@@ -4228,7 +4351,7 @@ index 9c39ae2..37b0323 100644
              float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
              float texVf = v0f + (v1f - v0f) * ty;
  
-@@ -1183,13 +5051,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1183,13 +5163,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
      }
      else
      {
@@ -4249,7 +4372,7 @@ index 9c39ae2..37b0323 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1225,8 +5098,18 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,8 +5210,18 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -4268,7 +4391,7 @@ index 9c39ae2..37b0323 100644
          float py = static_cast<float>(y) + 0.5f;
          for (int x = minX; x <= maxX; ++x)
          {
-@@ -1281,7 +5164,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +5276,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -4277,7 +4400,7 @@ index 9c39ae2..37b0323 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +5182,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +5294,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -4310,7 +4433,7 @@ index 9c39ae2..37b0323 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1307,7 +5216,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1307,7 +5328,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      }
  }
  
@@ -4319,7 +4442,7 @@ index 9c39ae2..37b0323 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1354,7 +5263,10 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1354,7 +5375,10 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
          double z = (v0.z + (v1.z - v0.z) * t);
          const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
@@ -4331,7 +4454,7 @@ index 9c39ae2..37b0323 100644
  
          if (x0 == x1 && y0 == y1)
              break;
-@@ -1376,7 +5288,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +5400,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -4352,7 +4475,7 @@ index 9c39ae2..37b0323 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +5310,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +5422,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -4374,7 +4497,7 @@ index 9c39ae2..37b0323 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,9 +5333,31 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,9 +5445,31 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -4406,7 +4529,7 @@ index 9c39ae2..37b0323 100644
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
          return;
  
-@@ -1406,6 +5368,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +5480,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -4558,7 +4681,7 @@ index 9c39ae2..37b0323 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1496,12 +5603,49 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1496,12 +5715,49 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
              return;
          }
      }
@@ -4608,7 +4731,7 @@ index 9c39ae2..37b0323 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1536,6 +5680,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1536,6 +5792,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  
      m_transferState.copiedPixels = total;
      m_transferState.direction = 3u;
@@ -4631,7 +4754,7 @@ index 9c39ae2..37b0323 100644
  }
  
  void GSCpuBackend::PerformLocalToHostTransfer()
-@@ -1610,6 +5770,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +5882,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -4639,7 +4762,7 @@ index 9c39ae2..37b0323 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,9 +5783,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,9 +5895,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -4655,7 +4778,7 @@ index 9c39ae2..37b0323 100644
  
      const uint32_t x0 = context.scissor.x0;
      const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
-@@ -1656,6 +5823,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1656,6 +5935,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -4666,7 +4789,7 @@ index 9c39ae2..37b0323 100644
          return true;
      }
  
-@@ -1674,11 +5845,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1674,11 +5957,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -4748,7 +4871,7 @@ index 9c39ae2..37b0323 100644
  bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         uint32_t width,
                                         uint32_t height,
-@@ -1688,6 +5929,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1688,6 +6041,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         bool frameBaseIsPages,
                                         uint32_t sourceOriginX,
                                         uint32_t sourceOriginY) const
@@ -4795,7 +4918,7 @@ index 9c39ae2..37b0323 100644
  {
      if (!m_vram || m_vramSize == 0u)
          return false;
-@@ -1759,16 +6040,66 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +6152,66 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -4866,7 +4989,7 @@ index 9c39ae2..37b0323 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +6143,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +6255,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;

@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
-index fecf9fd..b769a9c 100644
+index fecf9fd..0a1b722 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
 +++ b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
-@@ -192,8 +192,10 @@ namespace GSMem
+@@ -192,14 +192,16 @@ namespace GSMem
      }};
  
      // this is going to be massive (an entire page of addess lookups)
@@ -15,3 +15,10 @@ index fecf9fd..b769a9c 100644
      static C16PageLookupTable  PageTableC16{ };
      static C16SPageLookupTable PageTableC16S{ };
      static Z16PageLookupTable  PageTableZ16{ };
+     static Z16SPageLookupTable PageTableZ16S{ };
+     static P8PageLookupTable   PageTableP8{ };
+-    static P4PageLookupTable   PageTableP4{ };
++    P4PageLookupTable          PageTableP4{ }; // cont.228: extern, see the header
+ 
+     void InitLookupTables()
+     {
