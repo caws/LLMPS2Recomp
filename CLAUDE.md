@@ -22,16 +22,18 @@ first disc/file read, fixing crashes/stalls one frontier at a time. Readability 
 <game-repo>/
   <ELF>            # the PS2 executable; its path is declared in recomp/config.toml `input`
   recomp/          # PROVIDED inputs: config.toml + functions.csv
-  src/             # OUR work: register_overrides.cpp (the control plane: the one
-                   #   PS2_REGISTER_GAME_OVERRIDE + every registerFunction call, in order)
+  src/             # OUR work, THE FAITHFUL BASE GAME: register_overrides.cpp (the control plane:
+                   #   the one PS2_REGISTER_GAME_OVERRIDE + every registerFunction call, in order)
                    #   + src/<domain>/ modules holding the hook BODIES (docs/overrides.md)
+  mods/            # OPTIONAL: enhancements that CHANGE the original, one subfolder per mod
+                   #   (mods/<mod>/ = bodies only; registered from the control plane's END block)
   docs/            # game-specific human docs (elf.md = static facts, progress.md = journal)
   tmp/             # per-game scratch: generated/ (ps2_recomp output), logs
   gamefiles/       # disc/CD data (for the eventual file/disk reads)
 ```
 
 `config.toml`, `functions.csv`, the ELF, and `gamefiles/` are **provided per game** — never
-generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored: the ELF
+generate them. Committed in the game repo: `recomp/` + `src/` + `mods/` + `docs/`. Ignored: the ELF
 (copyright), `gamefiles/`, `tmp/`. The example game lives at
 `~/Documents/projects/decompilations/rotk_recomp`.
 
@@ -64,6 +66,13 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   - Hook **bodies** live in `src/<domain>/` (`dbcman/`, `menu_flow/`, `loader/`, `font_text/`, …) as
     named `hook_<addr>` functions. New code: registration line here, body in the domain module —
     see [`docs/overrides.md`](docs/overrides.md) for which module (and when a new one is warranted).
+  - **`src/` is the FAITHFUL BASE GAME; a change that alters the original is a MOD** and its body
+    goes in `mods/<mod>/`, never in `src/`. The control plane is still the only registration site:
+    mod registrations sit in **one block at the END** of `applyLOTROverrides`, so last-wins lets a mod
+    take a slot without editing `src/`. Env-gated, **default OFF = original behaviour**, with the gate
+    in the hook body (an unconditional registration cannot drift into a different guard). The build
+    collects `src/` and `mods/` identically — the split is editorial. See the game repo's
+    `mods/README.md` and [`docs/overrides.md`](docs/overrides.md).
   - **★ NEVER RELOCATE A REGISTRATION LINE.** Dispatch is last-wins (one slot per address) and many
     registrations sit inside a conditional, so a line's **position and guard are semantics, not
     formatting** — moving one changes which hook wins, or under which condition it installs. Same

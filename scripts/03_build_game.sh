@@ -21,7 +21,8 @@ set -euo pipefail
 #   <game_dir>/
 #     <ELF>            # path declared in recomp/config.toml `input`
 #     recomp/          # config.toml + functions.csv  (provided inputs)
-#     src/             # register_overrides.cpp (+ .h) (our overrides)
+#     src/             # register_overrides.cpp (+ .h) (our overrides: the base game)
+#     mods/            # OPTIONAL, one subfolder per mod (enhancement hook bodies)
 #     tmp/generated/   # ps2_recomp output            (per-game scratch)
 #
 # All per-game paths come from recomp/config.toml; nothing about the game is
@@ -181,9 +182,16 @@ install_if_changed() {
 # by BASENAME. Two files sharing a basename would flatten onto each other and one would silently
 # vanish from the build — so that is a hard error, not a warning. Same for a basename that
 # collides with a generated file (ours would clobber the recompiled function, or vice versa).
+#
+# TWO trees are collected, and they install identically — the split is editorial, not a build
+# difference: src/ is the faithful base game (the hooks that make the original run) and mods/ holds
+# enhancements, one subfolder per mod. mods/ is OPTIONAL; a game repo without one builds unchanged.
+# The basename namespace is SHARED across both, so a mod cannot shadow a base module by accident.
+GAME_SRC_ROOTS=("$GAME_DIR/src")
+[[ -d "$GAME_DIR/mods" ]] && GAME_SRC_ROOTS+=("$GAME_DIR/mods")
 GAME_SRC_FILES=()
 while IFS= read -r -d '' f; do GAME_SRC_FILES+=("$f"); done \
-    < <(find "$GAME_DIR/src" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 | sort -z)
+    < <(find "${GAME_SRC_ROOTS[@]}" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 | sort -z)
 
 declare -A GAME_SRC_BY_BASE=()
 for f in "${GAME_SRC_FILES[@]}"; do
@@ -192,7 +200,8 @@ for f in "${GAME_SRC_FILES[@]}"; do
         echo "ERROR: duplicate override basename '$base' — the flat install would clobber one:"
         echo "    ${GAME_SRC_BY_BASE[$base]}"
         echo "    $f"
-        echo "  Override sources are installed into the runner by basename; keep them unique."
+        echo "  Override sources (src/ AND mods/) are installed into the runner by basename;"
+        echo "  keep them unique across BOTH trees."
         exit 1
     fi
     if [[ -f "$GENERATED/$base" ]]; then
@@ -205,9 +214,9 @@ done
 
 if [[ "$CHANGED_RECOMP" == true ]]; then
     # Smart install: only touch changed files. Remove stale runner files that are
-    # no longer in the game's generated/ or src/ overrides. NOTE: the override check is
+    # no longer in the game's generated/ or src/ + mods/ overrides. NOTE: the override check is
     # against the recursive basename map above — testing "$GAME_DIR/src/$base" would treat
-    # every file living in an src/ SUBFOLDER as stale and delete it on each fast build.
+    # every file living in an src/ or mods/ SUBFOLDER as stale and delete it on each fast build.
     for f in "$RUNTIME_SRC"/*.cpp; do
         [[ -f "$f" ]] || continue
         base="$(basename "$f")"
@@ -230,7 +239,7 @@ else
 fi
 
 # Always install the game's overrides (they change independently of the recomp). Flattened by
-# basename from the whole src/ tree (see GAME_SRC_FILES above): .cpp -> runner/, .h -> include/.
+# basename from the whole src/ + mods/ tree (see GAME_SRC_FILES above): .cpp -> runner/, .h -> include/.
 OVERRIDE_CPP_BASENAMES=()
 for f in "${GAME_SRC_FILES[@]}"; do
     if [[ "${f##*.}" == "h" ]]; then install_if_changed "$f" "$RUNTIME_INCLUDE"

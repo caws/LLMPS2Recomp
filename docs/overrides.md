@@ -81,6 +81,9 @@ inside a conditional. So a registration's **position and guard are semantics, no
 - A registration is **dead** if a later one for the same address is unconditional — it can never
   win. Dead registrations accumulate and hide broken debug switches (a probe that "does nothing"
   when you enable it is usually this).
+- The **one exception** is promoting a hook into the `mods/` block at the end of the list, which is
+  a relocation *by design* — and only with the equivalence proof spelled out under
+  "`src/` is the base game" below.
 
 After **any** control-plane change:
 `.claude/skills/ps2recomp-fix-next-crash/check_registrations.py --game <game_dir>` — asserts same
@@ -105,11 +108,42 @@ and gets deleted when the frontier moves on. Two failure modes to watch:
   domain's periodic work (LOTR's `0x144B70`: **1,172 lines**). When new work starts landing there,
   give it its own module and split it by what the pieces actually do.
 
+### `src/` is the base game; `mods/` is what changes it
+
+A second tree sits beside `src/`: **`mods/<mod>/`**, one subfolder per mod. The line between them is
+not technical — the build collects both the same way — it is the line that keeps *"is this what the
+disc did?"* answerable:
+
+- **`src/`** = the **faithful base game**: hooks that make the original run as a PS2 ran it (CSV
+  fixes' companions, HLE for hardware we don't emulate, fidelity gaps like rumble).
+- **`mods/`** = anything that **changes** the original: widescreen, HUD layout, framerate, HD
+  texture packs, network play.
+
+The control plane stays the single registration site — a mod does **not** get its own
+`registerFunction` call site. Instead:
+
+- Mod registrations live in **one block at the END** of `applyLOTROverrides`. Dispatch is last-wins,
+  so that position lets a mod take a slot **without editing a line inside `src/`** — the base game
+  keeps reading as one uninterrupted list, and a mod's footprint is its block entry plus its folder.
+- **Append, never insert** within that block, or mods start silently overriding each other.
+- **Env-gated, default OFF = original behaviour**, with the gate in the hook **body** so the
+  registration stays unconditional (a registration behind `if (getenv(...))` is how a "default ON"
+  flag twice became OFF — see the `BUILD_TAG`/flag discipline in [working-rules](working-rules.md)).
+- A mod still has to leave the game running: **call the original** unless replacing it outright.
+
+**Moving an existing hook into `mods/` is the one sanctioned relocation** of a registration line —
+and it is sanctioned only with proof. Before the move: the address must be registered **nowhere
+else** (so a later position cannot change who wins), and the body must move verbatim. After it:
+`check_registrations.py --list` before/after must differ by **exactly** that relocation, at the same
+guard depth, with the **same body hash**, and `--dead` must be unchanged. Anything less is the
+ordinary never-relocate rule.
+
 ### Mechanics
 
 - Sources are installed into the runner **flattened by basename** (its CMake glob is non-recursive,
-  headers are included by bare filename), so **basenames must be globally unique** —
-  `scripts/03_build_game.sh` hard-errors on a collision, including with a generated file.
+  headers are included by bare filename), so **basenames must be globally unique** across `src/`
+  *and* `mods/` — `scripts/03_build_game.sh` hard-errors on a collision, including with a generated
+  file. `mods/` is optional: a game repo without one builds unchanged.
 - Modules are excluded from the runner's unity build (engine patch 08), so each is its own TU:
   adding one recompiles one file instead of reshuffling every unity batch.
 - Namespace each domain (`namespace lotr::<domain>`); the control plane `using namespace`s them.

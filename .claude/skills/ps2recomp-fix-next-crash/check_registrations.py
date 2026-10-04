@@ -148,7 +148,10 @@ def registrations(control, bodies):
             elif control[k] == '}':
                 d -= 1
         ln = control[:s].count('\n')
-        ref = re.search(r',\s*((?:lotr::)?\w+(?:::\w+)?)\s*\)$', call)
+        # any qualified name, however deeply nested: a mod's body is lotr::mods::<mod>::hook_*,
+        # which the old two-segment pattern missed -- it then fell through to the lambda branch
+        # and crashed looking for a brace that a named target does not have.
+        ref = re.search(r',\s*((?:\w+::)*\w+)\s*\)$', call)
         target = ref.group(1) if ref else '<lambda>'
         fn = target.split('::')[-1]
         body = bodies.get(fn)
@@ -169,17 +172,27 @@ def macros(files):
 
 
 def load(game, ref=None):
-    """{relpath: text} for the control plane + every module source, from the tree or a git ref."""
+    """{relpath: text} for the control plane + every module source, from the tree or a git ref.
+
+    Both override trees are read: src/ (the faithful base game) and mods/ (one subfolder per mod,
+    optional). A mod's hook BODY lives in mods/<mod>/, while its registerFunction call stays in the
+    control plane like every other -- so a checker that only read src/ would report a mod's body as
+    a bare lambda and its every edit as "BODY changed"."""
     files = {}
     if ref:
-        listing = subprocess.run(["git", "-C", game, "ls-tree", "-r", "--name-only", ref, "src/"],
+        # `git ls-tree` tolerates a path that does not exist in that ref (empty output, exit 0),
+        # so this still works against a commit from before mods/ existed.
+        listing = subprocess.run(["git", "-C", game, "ls-tree", "-r", "--name-only", ref,
+                                  "src/", "mods/"],
                                  capture_output=True, text=True).stdout.split()
         for p in listing:
             if p.endswith(('.cpp', '.h')):
                 files[p] = subprocess.run(["git", "-C", game, "show", f"{ref}:{p}"],
                                           capture_output=True, text=True).stdout
     else:
-        for p in [CONTROL] + sorted(glob.glob(f"{game}/src/*/*.cpp") + glob.glob(f"{game}/src/*/*.h")):
+        mods = sorted(glob.glob(f"{game}/mods/*/*.cpp") + glob.glob(f"{game}/mods/*/*.h"))
+        for p in [CONTROL] + sorted(glob.glob(f"{game}/src/*/*.cpp")
+                                    + glob.glob(f"{game}/src/*/*.h")) + mods:
             rel = os.path.relpath(p, game) if p.startswith(game) else p
             files[rel] = open(os.path.join(game, rel)).read()
     return files
