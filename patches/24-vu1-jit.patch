@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..9d6ad5c
+index 0000000..cce3025
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,2805 @@
+@@ -0,0 +1,3058 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -286,6 +286,16 @@ index 0000000..9d6ad5c
 +            u8(uint8_t(0x00 | ((reg & 7) << 3) | 4));
 +            u8(uint8_t(((index & 7) << 3) | (base & 7)));
 +        }
++        // [base + index*1 + disp8] : mod=01, rm=100 (SIB), then disp8
++        void modrmSibDisp8(uint8_t reg, uint8_t base, uint8_t index, int8_t disp)
++        {
++            u8(uint8_t(0x40 | ((reg & 7) << 3) | 4));
++            u8(uint8_t(((index & 7) << 3) | (base & 7)));
++            u8(uint8_t(disp));
++        }
++        // movsx r32, WORD [base + index + disp8]
++        void movsx_r32_mem16_sib(uint8_t reg, uint8_t base, uint8_t index, int8_t disp)
++        { u8(0x0F); u8(0xBF); modrmSibDisp8(reg, base, index, disp); }
 +        void movups_load_sib(uint8_t reg, uint8_t base, uint8_t index)
 +        { u8(0x0F); u8(0x10); modrmSib(reg, base, index); }
 +        void movups_store_sib(uint8_t base, uint8_t index, uint8_t reg)
@@ -682,9 +692,22 @@ index 0000000..9d6ad5c
 +        e.mov_mem_r32(7, kOffVi + int32_t(viDst) * 4, 0);
 +    }
 +
++    // PS2X_VU1_BLOCKNOMEM=1 disables the cont.200 memory ops inside blocks, so a batch can be
++    // A/B'd in ONE binary. Comparing two builds across measurement sessions is not trustworthy --
++    // the machine drifts, and the game is real-time driven so a faster run reaches different
++    // content at the same cumulative pair count.
++    inline bool blockNoMem()
++    {
++        static const bool v = []
++        { const char *e = std::getenv("PS2X_VU1_BLOCKNOMEM"); return e && e[0] && e[0] != '0'; }();
++        return v;
++    }
++
 +    enum class LowerOp { Nop, Lq, Sq, IaddIu, IsubIu, Fceq, Fcand, Fcor, Fcget,
 +                         // cont.199: the `lower special` block (opHi 0x40)
-+                         Iadd, Isub, Iaddi, Iand, Ior, Move, Mr32, Mtir, Mfir };
++                         Iadd, Isub, Iaddi, Iand, Ior, Move, Mr32, Mtir, Mfir,
++                         // cont.200: integer + auto-index memory access
++                         Ilw, Isw, Ilwr, Iswr, Lqi, Sqi, Lqd, Sqd };
 +
 +    // Blend xmm(src) into vf at `offDst` under the dest lane mask -- the interpreter's applyDest.
 +    // Clobbers xmm2 and xmm1.
@@ -704,6 +727,90 @@ index 0000000..9d6ad5c
 +        e.pandn_rr(2, 1);
 +        e.por_rr(src, 2);
 +        e.movups_store_d(7, offDst, src);
++    }
++
++    // Address from a VI register with NO immediate, ZERO-extended:
++    //     addr = ((uint32_t)(uint16_t)vi[reg]) * 16;  addr &= (dataSize - 1)
++    // Used by LQI/SQI/LQD/SQD and ILWR/ISWR. (LQ/SQ/ILW/ISW instead sign-extend vi[base] + imm --
++    // a real difference, mirrored exactly.) The `addr + 16 <= dataSize` guard is a tautology after
++    // the mask, exactly as for LQ (§5h), so no branch is emitted.
++    inline void emitVuAddressViOnly(Emitter &e, uint8_t viReg)
++    {
++        if (viReg == 0u)
++            e.mov_r32_imm32(0, 0u);
++        else
++            e.movzx_r32_mem16(0 /*eax*/, 7 /*rdi*/, kOffVi + int32_t(viReg) * 4);
++        e.shl_r32_imm8(0, 4);
++        e.and_r32_r32(0, 2 /*edx*/);
++    }
++
++    // vi[reg] += delta, truncated to int16 (the post-increment / pre-decrement of LQI/SQI/LQD/SQD).
++    inline void emitViStep(Emitter &e, uint8_t viReg, int32_t delta)
++    {
++        if (viReg == 0u)
++            return;
++        e.mov_r32_mem(0 /*eax*/, 7, kOffVi + int32_t(viReg) * 4);
++        e.add_eax_imm32(delta);
++        e.movsx_r32_r16(0, 0);
++        e.mov_mem_r32(7, kOffVi + int32_t(viReg) * 4, 0);
++    }
++
++    // The single component ILW/ILWR selects from the addressed quadword: the FIRST set dest lane.
++    inline uint8_t ilwComponent(uint8_t dest)
++    {
++        if (dest & 0x8u) return 0u;
++        if (dest & 0x4u) return 1u;
++        if (dest & 0x2u) return 2u;
++        return 3u;
++    }
++
++    // ILW / ILWR: vi[it] = (int16_t)(the 16 low bits of the word at addr + comp*4).
++    // `eax` must already hold the masked byte address; vuData is in rsi.
++    inline void emitIlwTail(Emitter &e, uint8_t viDst, uint8_t comp)
++    {
++        if (viDst == 0u)
++            return;
++        e.movsx_r32_mem16_sib(0 /*eax*/, 6 /*rsi*/, 0 /*rax*/, int8_t((comp & 3u) * 4u));
++        e.mov_mem_r32(7, kOffVi + int32_t(viDst) * 4, 0);
++    }
++
++    // ISW / ISWR: broadcast (uint16_t)vi[it] into four words and store under the dest mask.
++    // ★ The VALUE is computed into xmm0 FIRST, because computing the address needs eax.
++    inline void emitIswValue(Emitter &e, uint8_t viSrc)
++    {
++        if (viSrc == 0u)
++            e.mov_r32_imm32(0, 0u);
++        else
++            e.movzx_r32_mem16(0 /*eax*/, 7 /*rdi*/, kOffVi + int32_t(viSrc) * 4);
++        e.movd_xmm_r32(0, 0);
++        e.pshufd_rri(0, 0, 0x00);
++    }
++
++    // Store xmm0 to VU memory at [rsi + eax] under the dest mask (address already in eax).
++    inline void emitVuStoreMasked(Emitter &e, const CodeBuffer &buf, uint8_t dest)
++    {
++        if (dest == 0u)
++            return;
++        if (dest == 0xFu)
++        {
++            e.movups_store_sib(6, 0, 0);
++            return;
++        }
++        e.movaps_rip(2, buf.destMask(dest));
++        e.pand_rr(0, 2);
++        e.movups_load_sib(1, 6, 0);
++        e.pandn_rr(2, 1);
++        e.por_rr(0, 2);
++        e.movups_store_sib(6, 0, 0);
++    }
++
++    // Load a quadword from [rsi + eax] and applyDest it into vf[dst] (address already in eax).
++    inline void emitVuLoadBlend(Emitter &e, const CodeBuffer &buf, uint8_t vfDst, uint8_t dest)
++    {
++        if (vfDst == 0u || dest == 0u)
++            return;
++        e.movups_load_sib(0, 6 /*rsi*/, 0 /*rax*/);
++        emitApplyDestXmm(e, buf, 0, kOffVf + int32_t(vfDst) * 16, dest);
 +    }
 +
 +    // IADD / ISUB / IAND / IOR: vi[id] = vi[is] OP vi[it].
@@ -964,6 +1071,25 @@ index 0000000..9d6ad5c
 +            plan.imm = IMM11(lower);
 +            plan.touchesVuMem = true;
 +            return true;
++        case 0x04: // ILW
++            if (blockNoMem()) return false;
++            plan.op = LowerOp::Ilw;
++            plan.viBase = VIS(lower);
++            plan.viDst = VIT(lower);
++            plan.dest = DEST(lower);
++            plan.imm = IMM11(lower);
++            plan.writesVi = plan.viDst != 0u;
++            plan.touchesVuMem = true;
++            return true;
++        case 0x05: // ISW
++            if (blockNoMem()) return false;
++            plan.op = LowerOp::Isw;
++            plan.viBase = VIS(lower);
++            plan.viSrc = VIT(lower);
++            plan.dest = DEST(lower);
++            plan.imm = IMM11(lower);
++            plan.touchesVuMem = true;
++            return true;
 +        case 0x08: // IADDIU
 +        case 0x09: // ISUBIU
 +            plan.op = (opHi == 0x08u) ? LowerOp::IaddIu : LowerOp::IsubIu;
@@ -1032,6 +1158,46 @@ index 0000000..9d6ad5c
 +                plan.vfReg = FT(lower);
 +                plan.dest = DEST(lower);
 +                plan.writesVf = plan.vfReg != 0u;
++                return true;
++            case 0x34: // LQI (post-increment)
++            case 0x36: // LQD (pre-decrement)
++                if (blockNoMem()) return false;
++                plan.op = (special == 0x34u) ? LowerOp::Lqi : LowerOp::Lqd;
++                plan.viBase = viS2;   // also the register stepped
++                plan.vfReg = FT(lower);
++                plan.dest = DEST(lower);
++                plan.writesVf = plan.vfReg != 0u;
++                plan.writesVi = viS2 != 0u;
++                plan.touchesVuMem = true;
++                plan.delaysNextBranchRead = true;
++                return true;
++            case 0x35: // SQI (post-increment)
++            case 0x37: // SQD (pre-decrement)
++                if (blockNoMem()) return false;
++                plan.op = (special == 0x35u) ? LowerOp::Sqi : LowerOp::Sqd;
++                plan.viBase = viT2;   // also the register stepped
++                plan.vfSrc = FS(lower);
++                plan.dest = DEST(lower);
++                plan.writesVi = viT2 != 0u;
++                plan.touchesVuMem = true;
++                plan.delaysNextBranchRead = true;
++                return true;
++            case 0x3E: // ILWR
++                if (blockNoMem()) return false;
++                plan.op = LowerOp::Ilwr;
++                plan.viBase = viS2;
++                plan.viDst = viT2;
++                plan.dest = DEST(lower);
++                plan.writesVi = viT2 != 0u;
++                plan.touchesVuMem = true;
++                return true;
++            case 0x3F: // ISWR
++                if (blockNoMem()) return false;
++                plan.op = LowerOp::Iswr;
++                plan.viBase = viS2;
++                plan.viSrc = viT2;
++                plan.dest = DEST(lower);
++                plan.touchesVuMem = true;
 +                return true;
 +            case 0x3C: // MTIR
 +                plan.op = LowerOp::Mtir;
@@ -1110,6 +1276,46 @@ index 0000000..9d6ad5c
 +            return;
 +        case LowerOp::Mfir:
 +            emitMfir(e, buf, plan.vfReg, plan.viSrc, plan.dest);
++            return;
++        case LowerOp::Ilw:
++            emitVuAddress(e, plan.viBase, plan.imm);
++            emitIlwTail(e, plan.viDst, ilwComponent(plan.dest));
++            return;
++        case LowerOp::Ilwr:
++            emitVuAddressViOnly(e, plan.viBase);
++            emitIlwTail(e, plan.viDst, ilwComponent(plan.dest));
++            return;
++        case LowerOp::Isw:
++            emitIswValue(e, plan.viSrc);          // value first: the address needs eax
++            emitVuAddress(e, plan.viBase, plan.imm);
++            emitVuStoreMasked(e, buf, plan.dest);
++            return;
++        case LowerOp::Iswr:
++            emitIswValue(e, plan.viSrc);
++            emitVuAddressViOnly(e, plan.viBase);
++            emitVuStoreMasked(e, buf, plan.dest);
++            return;
++        case LowerOp::Lqi:
++            emitVuAddressViOnly(e, plan.viBase);
++            emitVuLoadBlend(e, buf, plan.vfReg, plan.dest);
++            emitViStep(e, plan.viBase, 1);        // post-increment
++            return;
++        case LowerOp::Lqd:
++            emitViStep(e, plan.viBase, -1);       // pre-decrement
++            emitVuAddressViOnly(e, plan.viBase);
++            emitVuLoadBlend(e, buf, plan.vfReg, plan.dest);
++            return;
++        case LowerOp::Sqi:
++            e.movups_load_d(0, 7, kOffVf + int32_t(plan.vfSrc) * 16);
++            emitVuAddressViOnly(e, plan.viBase);
++            emitVuStoreMasked(e, buf, plan.dest);
++            emitViStep(e, plan.viBase, 1);
++            return;
++        case LowerOp::Sqd:
++            e.movups_load_d(0, 7, kOffVf + int32_t(plan.vfSrc) * 16);
++            emitViStep(e, plan.viBase, -1);
++            emitVuAddressViOnly(e, plan.viBase);
++            emitVuStoreMasked(e, buf, plan.dest);
 +            return;
 +        }
 +    }
@@ -1464,6 +1670,12 @@ index 0000000..9d6ad5c
 +        uint8_t accTouched = 0;
 +        bool readsQ = false;
 +        bool readsClip = false;
++        // ★ Issue cycle of the EARLIEST pair that reads clip / Q, relative to block entry
++        // (0xFFFF = none). A clip or Q read does NOT stall -- `calculatePairReadyCycle` ignores
++        // both -- so their visibility is pure timing, and a pending write may be applied early
++        // only if it would have committed before this pair anyway.
++        uint16_t firstClipIssue = 0xFFFFu;
++        uint16_t firstQIssue = 0xFFFFu;
 +        bool writesVuMem = false;   // SQ only
 +        ReadyWrite ready[kMaxReadyWrites];
 +    };
@@ -1482,7 +1694,8 @@ index 0000000..9d6ad5c
 +        // LQ / MOVE / MR32 / MFIR write vf and must therefore come AFTER it, so the upper still
 +        // sees the pre-pair value of their destination -- exactly the interpreter's order.
 +        const bool writesVfLower = (lo.op == LowerOp::Lq || lo.op == LowerOp::Move ||
-+                                    lo.op == LowerOp::Mr32 || lo.op == LowerOp::Mfir);
++                                    lo.op == LowerOp::Mr32 || lo.op == LowerOp::Mfir ||
++                                    lo.op == LowerOp::Lqi || lo.op == LowerOp::Lqd);
 +        if (lo.op != LowerOp::Nop && !writesVfLower)
 +            emitLowerPlan(e, buf, lo);
 +
@@ -1503,7 +1716,15 @@ index 0000000..9d6ad5c
 +            const bool suppressed =
 +                (pi.suppressedLowerVf != 0u && pi.suppressedLowerVf == lo.vfReg);
 +            if (!suppressed && lo.vfReg != 0u)
++            {
 +                emitLowerPlan(e, buf, lo);
++            }
++            else if (lo.op == LowerOp::Lqi || lo.op == LowerOp::Lqd)
++            {
++                // ★ The suppressed VF write is discarded, but the VI step is NOT -- the
++                // interpreter performs it regardless. LQ/MOVE/MR32/MFIR have no such side effect.
++                emitViStep(e, lo.viBase, lo.op == LowerOp::Lqi ? 1 : -1);
++            }
 +        }
 +    }
 +
@@ -1622,10 +1843,18 @@ index 0000000..9d6ad5c
 +        touch->viTouched |= uint16_t(pi.viReadMask | pi.viWriteMask);
 +        touch->accTouched |= uint8_t(pi.accRead | pi.accWrite);
 +        if (up.src == OperandSrc::ScalarQ)
++        {
 +            touch->readsQ = true;
++            if (uint16_t(issue) < touch->firstQIssue)
++                touch->firstQIssue = uint16_t(issue);
++        }
 +        if (lo.op == LowerOp::Fceq || lo.op == LowerOp::Fcand ||
 +            lo.op == LowerOp::Fcor || lo.op == LowerOp::Fcget)
++        {
 +            touch->readsClip = true;
++            if (uint16_t(issue) < touch->firstClipIssue)
++                touch->firstClipIssue = uint16_t(issue);
++        }
 +        if (lo.op == LowerOp::Sq)
 +            touch->writesVuMem = true;
 +    }
@@ -1813,6 +2042,13 @@ index 0000000..9d6ad5c
 +        Block blocks[kMaxBlocks];
 +        int32_t byPair[kPairSlots];
 +        uint64_t generation = ~0ull;
++        // ★ cont.202: the guest re-uploads VU1 microcode constantly, which bumps the generation
++        // even when the BYTES are identical. Wiping the store on every bump meant recompiling the
++        // same blocks over and over -- measured as blocks being 0.5-0.9x (i.e. a LOSS) through the
++        // boot/movie era while the level era ran 3.4x. Keying on a hash of the code instead means
++        // a re-upload of identical microcode costs one hash, not a full recompile.
++        uint64_t codeHash = 0;
++        unsigned long invalidations = 0, hashHits = 0;
 +        uint32_t blockCount = 1; // ★ index 0 is a permanent fn==nullptr "rejected" sentinel, so a
 +                                 // full store still caches its rejections instead of retrying every
 +                                 // pair forever (which is exactly how the first version livelocked)
@@ -1823,8 +2059,25 @@ index 0000000..9d6ad5c
 +        unsigned long gbVf = 0, gbVi = 0, gbAcc = 0, gbStore = 0, gbQ = 0, gbClip = 0,
 +                      gbXgkick = 0, gbBudget = 0;
 +
++        // Returns true when the store was actually wiped.
++        bool revalidate(uint64_t gen, uint64_t hash)
++        {
++            if (generation == gen)
++                return false;
++            if (codeHash == hash && generation != ~0ull)
++            {
++                generation = gen; // same microcode, different generation counter -- keep everything
++                ++hashHits;
++                return false;
++            }
++            codeHash = hash;
++            invalidate(gen);
++            return true;
++        }
++
 +        void invalidate(uint64_t gen)
 +        {
++            ++invalidations;
 +            generation = gen;
 +            blockBufferReset();
 +            blocks[0] = Block{};
