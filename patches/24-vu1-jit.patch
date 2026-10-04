@@ -1,0 +1,712 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+new file mode 100644
+index 0000000..0c353ec
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
+@@ -0,0 +1,706 @@
++#ifndef PS2_VU1_JIT_H
++#define PS2_VU1_JIT_H
++
++// ---------------------------------------------------------------------------
++// cont.182: VU1 block-JIT infrastructure — executable code buffer + a minimal x86-64/SSE4.1
++// emitter, with an exhaustive self-test.
++//
++// WHY A JIT AT ALL (all measured, see docs/vu1-jit.md): the interpreter is at ~120 ns/pair, which
++// is ~420 host cycles to execute two VU instructions. 30 fps needs 17 ns/pair (~60 cycles). The
++// profile is flat — no leaf above 12% — because the cost is per-instruction plumbing (decode fetch,
++// switch dispatch, pipeline queue/commit, memcpy shadow dance), not arithmetic. That shape is what
++// only a code generator fixes.
++//
++// WHY IT IS BUILDABLE NOW: cont.180 adopted PCSX2's FMAC result model, so both VU clamps became
++// pure functions of a lane's bits — branchless quad SSE sequences (cont.181 proved them
++// bit-identical to the scalar reference over 264,192 cases). A translated pair is therefore
++// load / clamp / arithmetic / clamp / blend / store with no branches, ~15-20 SSE ops.
++//
++// This header is INCLUDED ONLY BY ps2_vu1_core.cpp, so everything is static: no new translation
++// unit and no CMakeLists change.
++// ---------------------------------------------------------------------------
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <cstddef>
++#include <sys/mman.h>
++
++namespace vu1jit
++{
++
++    // ---- executable code buffer ------------------------------------------------------------
++    // One RWX region. Kept simple deliberately: blocks are append-only and the whole buffer is
++    // reset when the guest uploads new microcode (the decode cache already detects that).
++    struct CodeBuffer
++    {
++        uint8_t *base = nullptr;   // start of the mapping; the constant pool lives here
++        uint8_t *code = nullptr;   // first byte available for code (after the pool)
++        size_t capacity = 0;
++        size_t used = 0;           // bytes of CODE emitted (relative to `code`)
++        bool failed = false;
++
++        // ★ The constant pool MUST live inside the mapping. x86-64 RIP-relative displacements are
++        // signed 32-bit, and mmap places the code buffer wherever it likes — typically far more
++        // than ±2GB from the binary's data segment, which silently truncates the displacement and
++        // jumps into nowhere. (That is exactly how the first version of this crashed.)
++        static constexpr size_t kPoolBytes = 512;
++
++        bool ensure(size_t bytes)
++        {
++            if (base != nullptr || failed)
++                return base != nullptr;
++            void *p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
++                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++            if (p == MAP_FAILED)
++            {
++                // W^X-hardened kernels can refuse RWX; the JIT simply stays off.
++                failed = true;
++                return false;
++            }
++            base = static_cast<uint8_t *>(p);
++            code = base + kPoolBytes;
++            capacity = bytes;
++            used = 0;
++            initPool();
++            return true;
++        }
++
++        // Pool layout, each entry 16-byte aligned:
++        //   [0] expMask  [16] signMask  [32] maxMag  [48] magMask
++        //   [64 + 16*d]  dest-lane mask for dest nibble d (0..15)
++        void initPool()
++        {
++            auto put = [&](size_t off, uint32_t v) {
++                uint32_t quad[4] = {v, v, v, v};
++                std::memcpy(base + off, quad, sizeof(quad));
++            };
++            put(0, 0x7F800000u);
++            put(16, 0x80000000u);
++            put(32, 0x7F7FFFFFu);
++            put(48, 0x7FFFFFFFu);
++            for (uint32_t d = 0; d < 16u; ++d)
++            {
++                // lane c (0..3) enabled iff d & (1 << (3 - c)) — matches laneForComponent()
++                uint32_t quad[4];
++                for (uint32_t c = 0; c < 4u; ++c)
++                    quad[c] = (d & (1u << (3u - c))) ? 0xFFFFFFFFu : 0u;
++                std::memcpy(base + 64 + 16 * d, quad, sizeof(quad));
++            }
++        }
++        const void *expMask() const { return base + 0; }
++        const void *signMask() const { return base + 16; }
++        const void *maxMag() const { return base + 32; }
++        const void *magMask() const { return base + 48; }
++        const void *destMask(uint8_t d) const { return base + 64 + 16 * (d & 15u); }
++
++        void reset() { used = 0; }
++        size_t room() const { return capacity - kPoolBytes - used; }
++    };
++
++    // ---- minimal x86-64 SSE emitter --------------------------------------------------------
++    // Restricted on purpose to xmm0..xmm7 and base registers rdi/rsi/rdx/rcx, so **no REX prefix
++    // is ever required** — that removes the single most bug-prone part of x86 encoding. Every
++    // instruction here is exercised by selfTest() below.
++    struct Emitter
++    {
++        uint8_t *p = nullptr;
++        uint8_t *end = nullptr;
++        bool overflow = false;
++
++        void u8(uint8_t v)
++        {
++            if (p >= end) { overflow = true; return; }
++            *p++ = v;
++        }
++        void u32(uint32_t v)
++        {
++            u8(uint8_t(v)); u8(uint8_t(v >> 8)); u8(uint8_t(v >> 16)); u8(uint8_t(v >> 24));
++        }
++
++        // ModRM with a register-direct operand (mod = 11).
++        void modrmReg(uint8_t reg, uint8_t rm) { u8(uint8_t(0xC0 | ((reg & 7) << 3) | (rm & 7))); }
++        // ModRM with [base] and no displacement (base must not be rbp/rsp/r12/r13).
++        void modrmMem(uint8_t reg, uint8_t base) { u8(uint8_t(0x00 | ((reg & 7) << 3) | (base & 7))); }
++        // ModRM RIP-relative: mod=00, rm=101, then disp32 from the END of the instruction.
++        void modrmRip(uint8_t reg, const void *target)
++        {
++            u8(uint8_t(0x00 | ((reg & 7) << 3) | 5));
++            // disp32 is relative to the next instruction, i.e. after these 4 bytes.
++            const int64_t delta = reinterpret_cast<const uint8_t *>(target) - (p + 4);
++            u32(uint32_t(int32_t(delta)));
++        }
++
++        // movups xmm(reg), [base]
++        void movups_load(uint8_t reg, uint8_t base) { u8(0x0F); u8(0x10); modrmMem(reg, base); }
++        // movups [base], xmm(reg)
++        void movups_store(uint8_t base, uint8_t reg) { u8(0x0F); u8(0x11); modrmMem(reg, base); }
++        // movaps xmm(dst), xmm(src)
++        void movaps_rr(uint8_t dst, uint8_t src) { u8(0x0F); u8(0x28); modrmReg(dst, src); }
++
++        void pand_rr(uint8_t d, uint8_t s) { u8(0x66); u8(0x0F); u8(0xDB); modrmReg(d, s); }
++        void pandn_rr(uint8_t d, uint8_t s) { u8(0x66); u8(0x0F); u8(0xDF); modrmReg(d, s); }
++        void por_rr(uint8_t d, uint8_t s) { u8(0x66); u8(0x0F); u8(0xEB); modrmReg(d, s); }
++        void pxor_rr(uint8_t d, uint8_t s) { u8(0x66); u8(0x0F); u8(0xEF); modrmReg(d, s); }
++        void pcmpeqd_rr(uint8_t d, uint8_t s) { u8(0x66); u8(0x0F); u8(0x76); modrmReg(d, s); }
++
++        // 128-bit constant loads, RIP-relative (constants live outside the code buffer).
++        void movaps_rip(uint8_t reg, const void *c) { u8(0x0F); u8(0x28); modrmRip(reg, c); }
++        void pand_rip(uint8_t reg, const void *c) { u8(0x66); u8(0x0F); u8(0xDB); modrmRip(reg, c); }
++        void por_rip(uint8_t reg, const void *c) { u8(0x66); u8(0x0F); u8(0xEB); modrmRip(reg, c); }
++        void pcmpeqd_rip(uint8_t reg, const void *c) { u8(0x66); u8(0x0F); u8(0x76); modrmRip(reg, c); }
++
++        // [base + disp32] forms (mod = 10)
++        void modrmDisp32(uint8_t reg, uint8_t base, int32_t disp)
++        {
++            u8(uint8_t(0x80 | ((reg & 7) << 3) | (base & 7)));
++            u32(uint32_t(disp));
++        }
++        void movups_load_d(uint8_t reg, uint8_t base, int32_t disp)
++        { u8(0x0F); u8(0x10); modrmDisp32(reg, base, disp); }
++        void movups_store_d(uint8_t base, int32_t disp, uint8_t reg)
++        { u8(0x0F); u8(0x11); modrmDisp32(reg, base, disp); }
++
++        void mulps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x59); modrmReg(d, s); }
++        void addps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x58); modrmReg(d, s); }
++        void subps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5C); modrmReg(d, s); }
++        // shufps xmm(d), xmm(s), imm8
++        void shufps_rri(uint8_t d, uint8_t s, uint8_t imm)
++        { u8(0x0F); u8(0xC6); modrmReg(d, s); u8(imm); }
++        void pandn_rip(uint8_t reg, const void *c) { u8(0x66); u8(0x0F); u8(0xDF); modrmRip(reg, c); }
++
++        void ret() { u8(0xC3); }
++    };
++
++    // select(mask, a, b) == (a & mask) | (b & ~mask), using pand/pandn/por so that no register is
++    // implicitly constrained (blendvps would force the mask into xmm0).
++    // Clobbers `tmp`; result lands in `a`.
++    inline void emitSelect(Emitter &e, uint8_t a, uint8_t b, uint8_t mask, uint8_t tmp)
++    {
++        e.pand_rr(a, mask);      // a &= mask
++        e.movaps_rr(tmp, mask);  // tmp = mask
++        e.pandn_rr(tmp, b);      // tmp = ~mask & b
++        e.por_rr(a, tmp);        // a |= tmp
++    }
++
++    // Emit the operand clamp (PCSX2 vuDouble / VU1Interpreter::normalizeOperand) on xmm(v).
++    // Uses t0..t3 as scratch. Mirrors vuNormOperandBits in ps2_vu1_detail.h exactly.
++    inline void emitNormOperand(Emitter &e, const CodeBuffer &buf, uint8_t v,
++                                uint8_t t0, uint8_t t1, uint8_t t2, uint8_t t3)
++    {
++        e.movaps_rr(t0, v);
++        e.pand_rip(t0, buf.expMask());      // t0 = exponent field
++        e.movaps_rr(t1, v);
++        e.pand_rip(t1, buf.signMask());     // t1 = sign
++        e.pxor_rr(t2, t2);
++        e.pcmpeqd_rr(t2, t0);               // t2 = isDenorm (exp == 0)
++        e.movaps_rr(t3, t0);
++        e.pcmpeqd_rip(t3, buf.expMask());   // t3 = isInf (exp == 0xFF)
++        // maxv = sign | 0x7F7FFFFF, reuse t0 (exponent no longer needed)
++        e.movaps_rr(t0, t1);
++        e.por_rip(t0, buf.maxMag());
++        // v = select(isInf, maxv, v)  -> compute into t0, then move back
++        emitSelect(e, t0, v, t3, /*tmp*/ t3);
++        e.movaps_rr(v, t0);
++        // v = select(isDenorm, sign, v)
++        emitSelect(e, t1, v, t2, /*tmp*/ t2);
++        e.movaps_rr(v, t1);
++    }
++
++    // Emit the RESULT clamp, value only (== vuNormResultQuadValue == PCSX2 VU_MAC_UPDATE's value
++    // half). Differs from the operand clamp in the zero case: exact zero keeps its bits, only a
++    // nonzero denormal flushes to signed zero. Flags are not produced — lazy flags (cont.177)
++    // proved they are unobservable for the programs this will compile.
++    inline void emitNormResultValue(Emitter &e, const CodeBuffer &buf, uint8_t v,
++                                    uint8_t t0, uint8_t t1, uint8_t t2, uint8_t t3)
++    {
++        e.movaps_rr(t0, v);
++        e.pand_rip(t0, buf.expMask());      // t0 = exponent
++        e.movaps_rr(t1, v);
++        e.pand_rip(t1, buf.signMask());     // t1 = sign
++        e.movaps_rr(t2, v);
++        e.pand_rip(t2, buf.magMask());      // t2 = magnitude
++        e.pxor_rr(t3, t3);
++        e.pcmpeqd_rr(t3, t2);               // t3 = isZero
++        // isDenorm = ~isZero & (exp == 0)  -> reuse t2
++        e.pxor_rr(t2, t2);
++        e.pcmpeqd_rr(t2, t0);               // t2 = (exp == 0)
++        e.pandn_rr(t3, t2);                 // t3 = ~isZero & (exp == 0) = isDenorm
++        e.pcmpeqd_rip(t0, buf.expMask());   // t0 = isInf
++        // v = select(isInf, sign|maxMag, v)
++        e.movaps_rr(t2, t1);
++        e.por_rip(t2, buf.maxMag());        // t2 = sign|maxMag
++        emitSelect(e, t2, v, t0, /*tmp*/ t0);
++        e.movaps_rr(v, t2);
++        // v = select(isDenorm, sign, v)
++        emitSelect(e, t1, v, t3, /*tmp*/ t3);
++        e.movaps_rr(v, t1);
++    }
++
++    // The FMAC shapes this first slice covers. `bc >= 0` selects a broadcast lane of vt.
++    enum class FmacOp { Add, Sub, Mul, Madd, Msub };
++
++    // Emit one complete FMAC pair against a VU state pointer in rdi:
++    //   vd[dest] = clamp( f(clamp(vf[fs]), bcast(clamp(vf[ft])), clamp(acc)) )
++    // Offsets are byte offsets from rdi. Uses xmm0..xmm7; no REX, no branches.
++    inline void emitFmacPair(Emitter &e, const CodeBuffer &buf, FmacOp op, int bc,
++                             int32_t offFs, int32_t offFt, int32_t offAcc, int32_t offFd,
++                             uint8_t dest)
++    {
++        const bool needsAcc = (op == FmacOp::Madd || op == FmacOp::Msub);
++
++        e.movups_load_d(0, 7, offFs);                 // vs raw
++        emitNormOperand(e, buf, 0, 1, 2, 3, 4);
++        e.movaps_rr(5, 0);                            // xmm5 = vs clamped
++
++        e.movups_load_d(0, 7, offFt);                 // vt raw
++        emitNormOperand(e, buf, 0, 1, 2, 3, 4);
++        if (bc >= 0)
++            e.shufps_rri(0, 0, uint8_t(bc * 0x55));   // broadcast lane bc
++        e.movaps_rr(6, 0);                            // xmm6 = vt clamped (maybe broadcast)
++
++        if (needsAcc)
++        {
++            e.movups_load_d(0, 7, offAcc);
++            emitNormOperand(e, buf, 0, 1, 2, 3, 4);
++            e.movaps_rr(7, 0);                        // xmm7 = acc clamped
++        }
++
++        e.movaps_rr(0, 5);
++        switch (op)
++        {
++        case FmacOp::Add: e.addps_rr(0, 6); break;
++        case FmacOp::Sub: e.subps_rr(0, 6); break;
++        case FmacOp::Mul: e.mulps_rr(0, 6); break;
++        case FmacOp::Madd: e.mulps_rr(0, 6); e.addps_rr(0, 7); break; // NOTE: acc + vs*vt
++        case FmacOp::Msub: e.mulps_rr(0, 6); e.movaps_rr(1, 7); e.subps_rr(1, 0); e.movaps_rr(0, 1); break;
++        }
++        emitNormResultValue(e, buf, 0, 1, 2, 3, 4);
++
++        // vd = (result & destMask) | (vd & ~destMask).
++        // `pandn dst, src` is `dst = ~dst & src`, so the MASK must be the destination operand —
++        // putting vd there would compute ~vd & mask instead.
++        e.movaps_rip(2, buf.destMask(dest)); // xmm2 = destMask
++        e.pand_rr(0, 2);                     // result &= destMask
++        e.movups_load_d(1, 7, offFd);        // xmm1 = vd
++        e.pandn_rr(2, 1);                    // xmm2 = ~destMask & vd
++        e.por_rr(0, 2);
++        e.movups_store_d(7, offFd, 0);
++    }
++
++    // ---- instruction compiler + cache ------------------------------------------------------
++    // First integration slice: compile the UPPER instruction of a pair into a native function
++    // `void f(VU1State*)` and call it in place of execUpper's body. Deliberately conservative —
++    // it replicates exactly what execUpper + applyFmacDest(Acc) do for the covered ops (operand
++    // clamp, broadcast, arithmetic, result clamp, dest-lane blend, store), so every other piece of
++    // the interpreter — the write pipeline, the shadow dance in run(), cycle accounting, the lower
++    // instruction — is untouched and keeps working. Anything not covered returns null and falls
++    // back to the interpreter.
++    //
++    // The compiled code depends ONLY on the 32-bit instruction word, so the cache is valid across
++    // programs and code uploads and never needs invalidating.
++    //
++    // ★ Only valid when lazy flags is active for the program: the emitted code deliberately does
++    // not derive MAC/status flags, which cont.177 proved unobservable for those programs.
++
++    // VU1State layout (include/runtime/ps2_vu1.h): float vf[32][4]; int32_t vi[16]; float acc[4];
++    static constexpr int32_t kOffVf = 0;
++    static constexpr int32_t kOffAcc = 32 * 16 + 16 * 4;
++
++    struct Cache
++    {
++        static constexpr uint32_t kSlots = 8192; // power of two, open addressing
++        uint32_t key[kSlots] = {};
++        void *fn[kSlots] = {};
++        bool used[kSlots] = {};
++        unsigned long hits = 0, misses = 0, compiled = 0, rejected = 0;
++
++        static uint32_t hash(uint32_t k)
++        {
++            k ^= k >> 16; k *= 0x7feb352du; k ^= k >> 15; k *= 0x846ca68bu; k ^= k >> 16;
++            return k;
++        }
++        // Returns the slot for `k`; `found` says whether it already holds an entry for it.
++        uint32_t slotFor(uint32_t k, bool &found) const
++        {
++            uint32_t i = hash(k) & (kSlots - 1);
++            for (uint32_t probe = 0; probe < 64u; ++probe)
++            {
++                if (!used[i]) { found = false; return i; }
++                if (key[i] == k) { found = true; return i; }
++                i = (i + 1u) & (kSlots - 1);
++            }
++            found = false;
++            return kSlots; // table too full at this chain
++        }
++    };
++
++    // Decode an upper instruction into the emitter's terms. Returns false if not covered.
++    inline bool classifyUpper(uint32_t instr, FmacOp &op, int &bc, bool &writesAcc)
++    {
++        const uint8_t o = uint8_t(instr & 0x3Fu);
++        uint8_t sel = o;
++        writesAcc = false;
++        if (o >= 0x3Cu)
++        {
++            sel = uint8_t((instr & 3u) | ((instr >> 4) & 0x7Cu));
++            writesAcc = true;
++        }
++        bc = -1;
++        if (sel <= 0x0Fu)
++        {
++            bc = int(sel & 3u);
++            switch (sel >> 2)
++            {
++            case 0: op = FmacOp::Add; return true;  // ADDbc  / ADDAbc
++            case 1: op = FmacOp::Sub; return true;  // SUBbc  / SUBAbc
++            case 2: op = FmacOp::Madd; return true; // MADDbc / MADDAbc
++            case 3: op = FmacOp::Msub; return true; // MSUBbc / MSUBAbc
++            }
++            return false;
++        }
++        if (sel >= 0x18u && sel <= 0x1Bu) { bc = int(sel & 3u); op = FmacOp::Mul; return true; } // MULbc/MULAbc
++        switch (sel)
++        {
++        case 0x28: op = FmacOp::Add; return true;  // ADD  / ADDA
++        case 0x29: op = FmacOp::Madd; return true; // MADD / MADDA
++        case 0x2A: op = FmacOp::Mul; return true;  // MUL  / MULA
++        case 0x2C: op = FmacOp::Sub; return true;  // SUB  / SUBA
++        case 0x2D: op = FmacOp::Msub; return true; // MSUB / MSUBA
++        default: return false;
++        }
++    }
++
++    typedef void (*UpperFn)(void *state);
++
++    inline UpperFn compileUpper(CodeBuffer &buf, Cache &cache, uint32_t instr)
++    {
++        bool found = false;
++        const uint32_t slot = cache.slotFor(instr, found);
++        if (slot >= Cache::kSlots)
++            return nullptr;
++        if (found)
++        {
++            ++cache.hits;
++            return reinterpret_cast<UpperFn>(cache.fn[slot]);
++        }
++        ++cache.misses;
++
++        FmacOp op = FmacOp::Add;
++        int bc = -1;
++        bool writesAcc = false;
++        UpperFn produced = nullptr;
++        if (classifyUpper(instr, op, bc, writesAcc) && buf.room() > 512)
++        {
++            const uint8_t dest = uint8_t((instr >> 21) & 0xFu);
++            const uint8_t ft = uint8_t((instr >> 16) & 0x1Fu);
++            const uint8_t fs = uint8_t((instr >> 11) & 0x1Fu);
++            const uint8_t fd = uint8_t((instr >> 6) & 0x1Fu);
++            Emitter e;
++            e.p = buf.code + buf.used;
++            e.end = buf.base + buf.capacity;
++            uint8_t *const start = e.p;
++            emitFmacPair(e, buf, op, bc,
++                         kOffVf + int32_t(fs) * 16,
++                         kOffVf + int32_t(ft) * 16,
++                         kOffAcc,
++                         writesAcc ? kOffAcc : (kOffVf + int32_t(fd) * 16),
++                         dest);
++            e.ret();
++            if (!e.overflow)
++            {
++                buf.used = size_t(e.p - buf.code);
++                produced = reinterpret_cast<UpperFn>(start);
++                ++cache.compiled;
++            }
++        }
++        else
++        {
++            ++cache.rejected;
++        }
++        cache.used[slot] = true;
++        cache.key[slot] = instr;
++        cache.fn[slot] = reinterpret_cast<void *>(produced); // null = "known uncovered", cached too
++        return produced;
++    }
++
++    // ---- process-wide singletons + the interface the interpreter uses -----------------------
++    // Function-local statics inside inline functions are shared across translation units, so both
++    // ps2_vu1_core.cpp and ps2_vu1_upper.cpp see the same buffer, cache and flags.
++
++    inline CodeBuffer &buffer() { static CodeBuffer b; return b; }
++    inline Cache &cache() { static Cache c; return c; }
++    // Mirrors the interpreter's per-program lazy-flag arming (set by run()); the emitted code
++    // derives no MAC/status flags, so it is only valid while that is true.
++    inline bool &lazyActive() { static bool v = false; return v; }
++    inline bool &inVerify() { static bool v = false; return v; }
++
++    // PS2X_VU1_JIT (default OFF until measured): use compiled upper instructions.
++    inline bool enabled()
++    {
++        static const bool v = []
++        { const char *e = std::getenv("PS2X_VU1_JIT"); return e && e[0] && e[0] != '0'; }();
++        return v;
++    }
++    // PS2X_VU1_JITVERIFY (default OFF): run BOTH and compare on live guest data.
++    inline bool verifyMode()
++    {
++        static const bool v = []
++        { const char *e = std::getenv("PS2X_VU1_JITVERIFY"); return e && e[0] && e[0] != '0'; }();
++        return v;
++    }
++
++    inline UpperFn lookup(uint32_t instr)
++    {
++        CodeBuffer &b = buffer();
++        if (!b.ensure(8u << 20))
++            return nullptr;
++        return compileUpper(b, cache(), instr);
++    }
++
++    struct VerifyStats { unsigned long checked = 0, mismatches = 0, reported = 0; };
++    inline VerifyStats &verifyStats() { static VerifyStats s; return s; }
++
++    inline void noteVerify(uint32_t instr, const float *jitVf, const float *jitAcc,
++                           const float *refVf, const float *refAcc)
++    {
++        VerifyStats &s = verifyStats();
++        ++s.checked;
++        bool bad = false;
++        for (int c = 0; c < 4; ++c)
++        {
++            uint32_t a = 0, b = 0, x = 0, y = 0;
++            std::memcpy(&a, &jitVf[c], 4);
++            std::memcpy(&b, &refVf[c], 4);
++            std::memcpy(&x, &jitAcc[c], 4);
++            std::memcpy(&y, &refAcc[c], 4);
++            if (a != b || x != y)
++                bad = true;
++        }
++        if (bad)
++        {
++            ++s.mismatches;
++            if (s.reported < 10ul)
++            {
++                ++s.reported;
++                uint32_t a = 0, b = 0;
++                std::memcpy(&a, &jitVf[0], 4);
++                std::memcpy(&b, &refVf[0], 4);
++                std::fprintf(stderr, "[vu1:jitverify] MISMATCH instr=%08x jitVf0=%08x refVf0=%08x\n",
++                             instr, a, b);
++            }
++        }
++    }
++
++    inline void report()
++    {
++        Cache &c = cache();
++        VerifyStats &s = verifyStats();
++        std::fprintf(stderr,
++                     "[vu1:jit] hits=%lu misses=%lu compiled=%lu rejected=%lu codeBytes=%zu"
++                     " | verify checked=%lu mismatches=%lu\n",
++                     c.hits, c.misses, c.compiled, c.rejected, buffer().used,
++                     s.checked, s.mismatches);
++    }
++
++    // ---- self-test -------------------------------------------------------------------------
++    // Emits `void f(const float* rdi, float* rsi)` applying the operand clamp, then compares it
++    // against the C++ quad helper over an exhaustive bit sweep. This validates BOTH the
++    // instruction encodings and the emitted clamp sequence, with zero risk to the guest: it runs
++    // only under PS2X_VU1_JITSELFTEST and touches no interpreter state.
++    typedef void (*ClampFn)(const float *, float *);
++
++    inline bool selfTest(CodeBuffer &buf, void (*refQuad)(const float *, float *))
++    {
++        if (!buf.ensure(1u << 20))
++        {
++            std::fprintf(stderr, "[vu1:jit] selftest SKIPPED - could not map RWX memory\n");
++            return false;
++        }
++        buf.reset();
++        Emitter e;
++        e.p = buf.code;
++        e.end = buf.base + buf.capacity;
++
++        ClampFn fn = reinterpret_cast<ClampFn>(buf.code);
++        e.movups_load(0, 7);                       // movups xmm0, [rdi]
++        emitNormOperand(e, buf, 0, 1, 2, 3, 4);    // clamp xmm0, scratch xmm1..xmm4
++        e.movups_store(6, 0);                      // movups [rsi], xmm0
++        e.ret();
++        buf.used = size_t(e.p - buf.code);
++
++        if (e.overflow)
++        {
++            std::fprintf(stderr, "[vu1:jit] selftest FAILED - emitter overflow\n");
++            return false;
++        }
++        if (const char *dump = std::getenv("PS2X_VU1_JITDUMP"))
++        {
++            if (dump[0] && dump[0] != '0')
++            {
++                std::fprintf(stderr, "[vu1:jit] emitted %zu bytes at %p:", buf.used,
++                             static_cast<void *>(buf.code));
++                for (size_t i = 0; i < buf.used; ++i)
++                    std::fprintf(stderr, " %02x", buf.code[i]);
++                std::fprintf(stderr, "\n");
++            }
++        }
++
++        unsigned long cases = 0, mismatches = 0;
++        static const uint32_t mantissas[5] = {0u, 1u, 0x400000u, 0x7FFFFFu, 0x123456u};
++        for (uint32_t exp = 0; exp < 256u; ++exp)
++        {
++            for (uint32_t mi = 0; mi < 5u; ++mi)
++            {
++                for (uint32_t sgn = 0; sgn < 2u; ++sgn)
++                {
++                    const uint32_t bits = (sgn << 31) | (exp << 23) | mantissas[mi];
++                    alignas(16) float in[4];
++                    alignas(16) float gotJit[4];
++                    alignas(16) float gotRef[4];
++                    for (int i = 0; i < 4; ++i)
++                        std::memcpy(&in[i], &bits, 4);
++                    fn(in, gotJit);
++                    refQuad(in, gotRef);
++                    for (int i = 0; i < 4; ++i)
++                    {
++                        uint32_t a = 0, b = 0;
++                        std::memcpy(&a, &gotJit[i], 4);
++                        std::memcpy(&b, &gotRef[i], 4);
++                        ++cases;
++                        if (a != b && ++mismatches <= 6ul)
++                            std::fprintf(stderr,
++                                         "[vu1:jit] selftest MISMATCH bits=%08x jit=%08x ref=%08x\n",
++                                         bits, a, b);
++                    }
++                }
++            }
++        }
++        std::fprintf(stderr, "[vu1:jit] selftest bytes=%zu cases=%lu mismatches=%lu -> %s\n",
++                     buf.used, cases, mismatches, mismatches == 0 ? "PASS" : "FAIL");
++        buf.reset();
++        return mismatches == 0;
++    }
++
++    // ---- FMAC pair self-test ---------------------------------------------------------------
++    // Emits a complete FMAC pair and compares it against a C++ reference built from the SAME
++    // helpers the interpreter uses (vuNormOperandQuad / vuNormResultQuadValue + float arithmetic),
++    // over randomized register state including the interesting bit patterns. Proves the emitted
++    // arithmetic, the broadcast, the result clamp and the dest blend before any of it is wired
++    // into the run loop.
++    typedef void (*PairFn)(void *state);
++
++    struct FakeState // mirrors just the fields the emitted code touches, at known offsets
++    {
++        alignas(16) float vf[32][4];
++        alignas(16) float acc[4];
++    };
++
++    inline bool selfTestFmac(CodeBuffer &buf,
++                             void (*normOperandQuad)(const float *, float *),
++                             void (*normResultValue)(float *, uint8_t))
++    {
++        if (!buf.ensure(1u << 20))
++            return false;
++
++        static const FmacOp ops[5] = {FmacOp::Add, FmacOp::Sub, FmacOp::Mul, FmacOp::Madd, FmacOp::Msub};
++        static const char *opNames[5] = {"ADD", "SUB", "MUL", "MADD", "MSUB"};
++        static const uint32_t pool[8] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u,
++                                         0x7F7FFFFFu, 0x00400000u, 0x7F800000u, 0x4B1ED4A8u};
++
++        unsigned long cases = 0, mismatches = 0;
++        uint32_t rng = 0x12345678u;
++        auto next = [&]() { rng = rng * 1664525u + 1013904223u; return rng; };
++
++        for (int oi = 0; oi < 5; ++oi)
++        {
++            for (int bc = -1; bc < 4; ++bc)
++            {
++                for (uint32_t dest = 0; dest < 16u; ++dest)
++                {
++                    buf.reset();
++                    Emitter e;
++                    e.p = buf.code;
++                    e.end = buf.base + buf.capacity;
++                    const int32_t offFs = int32_t(offsetof(FakeState, vf) + 1 * 16);
++                    const int32_t offFt = int32_t(offsetof(FakeState, vf) + 2 * 16);
++                    const int32_t offFd = int32_t(offsetof(FakeState, vf) + 3 * 16);
++                    const int32_t offAcc = int32_t(offsetof(FakeState, acc));
++                    emitFmacPair(e, buf, ops[oi], bc, offFs, offFt, offAcc, offFd, uint8_t(dest));
++                    e.ret();
++                    if (e.overflow)
++                    {
++                        std::fprintf(stderr, "[vu1:jit] fmac selftest FAILED - overflow\n");
++                        return false;
++                    }
++                    PairFn fn = reinterpret_cast<PairFn>(buf.code);
++
++                    for (int iter = 0; iter < 24; ++iter)
++                    {
++                        FakeState a{};
++                        for (int c = 0; c < 4; ++c)
++                        {
++                            const uint32_t bs = pool[next() & 7u];
++                            const uint32_t bt = pool[next() & 7u];
++                            const uint32_t ba = pool[next() & 7u];
++                            const uint32_t bd = pool[next() & 7u];
++                            std::memcpy(&a.vf[1][c], &bs, 4);
++                            std::memcpy(&a.vf[2][c], &bt, 4);
++                            std::memcpy(&a.acc[c], &ba, 4);
++                            std::memcpy(&a.vf[3][c], &bd, 4);
++                        }
++                        FakeState b = a;
++
++                        fn(&a); // emitted code
++
++                        // --- C++ reference, mirroring the interpreter exactly ---
++                        alignas(16) float vs[4], vt[4], ac[4], res[4];
++                        normOperandQuad(b.vf[1], vs);
++                        normOperandQuad(b.vf[2], vt);
++                        normOperandQuad(b.acc, ac);
++                        if (bc >= 0)
++                        {
++                            const float s = vt[bc];
++                            vt[0] = vt[1] = vt[2] = vt[3] = s;
++                        }
++                        for (int c = 0; c < 4; ++c)
++                        {
++                            switch (ops[oi])
++                            {
++                            case FmacOp::Add: res[c] = vs[c] + vt[c]; break;
++                            case FmacOp::Sub: res[c] = vs[c] - vt[c]; break;
++                            case FmacOp::Mul: res[c] = vs[c] * vt[c]; break;
++                            case FmacOp::Madd: res[c] = ac[c] + vs[c] * vt[c]; break;
++                            case FmacOp::Msub: res[c] = ac[c] - vs[c] * vt[c]; break;
++                            }
++                        }
++                        normResultValue(res, uint8_t(dest));
++                        for (int c = 0; c < 4; ++c)
++                            if (dest & (1u << (3 - c)))
++                                b.vf[3][c] = res[c];
++
++                        for (int c = 0; c < 4; ++c)
++                        {
++                            uint32_t x = 0, y = 0;
++                            std::memcpy(&x, &a.vf[3][c], 4);
++                            std::memcpy(&y, &b.vf[3][c], 4);
++                            ++cases;
++                            if (x != y && ++mismatches <= 8ul)
++                                std::fprintf(stderr,
++                                             "[vu1:jit] fmac MISMATCH op=%s bc=%d dest=%x lane=%d "
++                                             "jit=%08x ref=%08x\n",
++                                             opNames[oi], bc, dest, c, x, y);
++                        }
++                    }
++                }
++            }
++        }
++        std::fprintf(stderr, "[vu1:jit] fmac selftest cases=%lu mismatches=%lu -> %s\n",
++                     cases, mismatches, mismatches == 0 ? "PASS" : "FAIL");
++        buf.reset();
++        return mismatches == 0;
++    }
++
++} // namespace vu1jit
++
++#endif

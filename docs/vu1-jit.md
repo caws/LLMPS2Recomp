@@ -67,10 +67,11 @@ Two conclusions:
 
 ## 2. Already landed — stage 1 (1.37×) and lazy flags (1.20×)
 
-Cumulative: **280.7 → 141.2 ns/pair = 1.99×**, all default ON with kill switches. Stage 1 is below;
+Cumulative: **280.7 → 120.5 ns/pair = 2.33×**, all default ON with kill switches. Stage 1 is below;
 lazy flags (cont.177) is §4; dispatch + operand-prologue overhead (cont.178) is §4b; the PCSX2 FMAC
 result model (cont.180, the one change that is *not* bit-exact — adopted on a user decision with the
-divergence measured at 0.001% of lanes) is §4c.
+divergence measured at 0.001% of lanes) is §4c; the SSE quad clamps (cont.181, **1.206×**) are §4d.
+The JIT itself is §5, where it is now **built and verified** rather than proposed.
 
 ### Stage 1 — 1.37×, bit-exact
 
@@ -270,7 +271,20 @@ verified mechanically against every case label: the only `acc[...]` readers are
 large — the profile is flat. Flat profiles are exactly what a JIT fixes and an interpreter cannot:
 the cost is spread across per-instruction plumbing, not concentrated in one routine worth rewriting.
 
-## 5. Step 2 — the VU1 block JIT
+## 4d. SSE quad clamps ✅ **LANDED (cont.181): 1.206×, bit-identical**
+
+`145.3 → 120.5 ns/pair` (`PS2X_VU1_SIMD`, default ON, `=0` reverts). Unlocked directly by §4c:
+once both clamps are pure functions of a lane's bits, all four lanes go at once. Engine patch
+**19-vu1-detail.patch** adds `vuNormOperandBits`, `vuNormResultQuad` and `vuNormResultQuadValue`
+(the last skips flag derivation entirely when lazy flags proved it dead). `PS2X_VU1_SIMDVERIFY=1`
+sweeps every exponent × mantissa × sign × all 16 dest masks: **264,192 cases, 0 mismatches**.
+
+Two further interpreter micro-optimizations were built, measured and **reverted** in this period —
+per-write visibility resolution (cont.179b, 26.5% of pairs, ~0 net) and a targeted
+`resetScheduler` clear (cont.181b, 0.990×). Together with §4d's success they mark the end of
+interpreter-level work: the profile is flat and only a code generator changes its shape.
+
+## 5. Step 2 — the VU1 block JIT (BUILT AND VERIFIED — see §5b for the measured verdict)
 
 The only route to ~60 host cycles/pair. Translate a **basic block** (start PC → branch / E-bit) to
 native SSE once, cached per `(code generation, start PC)` — the decode cache already has exactly
@@ -453,3 +467,53 @@ code + disasm + gdb.
 | `PS2X_VU1_PIPEVERIFY=1` | stage 1b valid-mask self-check |
 | `PS2X_VU1_COMMITSKIP` | **default ON**, `=0` reverts the cont.158b watermark |
 | `PS2X_VU1_EXACTLD=1` | exact lane math in `long double` instead of `double` |
+
+
+## 5b. What was actually built (cont.182–183), and the number that decides the rest
+
+**Engine patch 24-vu1-jit.patch** — `ps2_vu1_jit.h`: an RWX code buffer, a minimal x86-64/SSE4.1
+emitter, an instruction compiler and a cache. Included only by `ps2_vu1_core.cpp` and
+`ps2_vu1_upper.cpp`, so no new translation unit and no CMakeLists change.
+
+Deliberate constraints that removed bug classes: **xmm0–xmm7 and rdi/rsi/rdx/rcx only, so no REX
+prefix is ever emitted**; `pand`/`pandn`/`por` for select rather than `blendvps` (which would pin
+the mask to xmm0); everything branchless.
+
+> ⚠ **The first version segfaulted for a reason worth remembering: RIP-relative displacements are
+> signed 32-bit, but `mmap` puts the code buffer far more than ±2GB from the binary's data
+> segment**, so the displacement to a `static` constant pool truncated silently. The pool now lives
+> **inside the mapping**. `PS2X_VU1_JITDUMP=1` prints the emitted bytes.
+
+**Verification, three independent layers, all zero-mismatch:**
+
+| layer | cases | result |
+|---|---|---|
+| emitted operand clamp vs C++ | 10,240 | 0 mismatches |
+| emitted **full FMAC pair** (5 ops × 5 broadcasts × all 16 dest masks × 24 random states) | 38,400 | 0 mismatches |
+| **live shadow-verify against the interpreter during real play** | **138,889,257** | **0 mismatches** |
+
+The live harness runs the JIT, captures its writes, restores the state, re-enters `execUpper`
+behind a recursion guard so the interpreter yields the authoritative result, and compares.
+
+**★★ The measurement that decides the architecture: 40.8% of all executed pairs were compiled, and
+it bought 1.032×.**
+
+A pair costs ~420 host cycles. After §4d, `execUpper` is only ~15–20% of that; the rest is the
+interpreter **loop** — decode fetch, the scheduler's queue/commit/mark (26.2% by ablation), the
+shadow-dance memcpys, `execLower`, run() bookkeeping. Replacing `execUpper` alone therefore cannot
+pay, whatever the coverage, and the per-pair call plus cache lookup eats most of what it does save.
+
+**⇒ The remaining work is not more codegen — it is making a compiled block subsume the loop:**
+
+1. **Compile runs of consecutive pairs into one function** (mean block ≈ 6 pairs, §5 census), so
+   there is one call per block instead of per pair and operands stay in registers between pairs.
+2. **Drop the pipeline inside a block** using the cont.179b write-visibility analysis — with its two
+   hard-won details: **branch delay slots must be excluded** (their forward window never executes,
+   and the branch target lands inside the latency window), and the backward direction needs no
+   analysis because bumping `m_vfLatestWrite` supersedes older pending writes.
+3. **Cover the common lower opcodes** so runs are not cut short: `0x01` store 15.1%, `0x00` load
+   5.3%, `0x08` IADDIU 4.6%.
+
+The JIT ships **default OFF** (`PS2X_VU1_JIT=1` to enable): +3% does not justify running
+hand-encoded machine code against guest state by default. It is the verified foundation for step 1
+above, not a shippable optimization at instruction granularity.
