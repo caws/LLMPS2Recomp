@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..4d06793 100644
+index bd75bba..4458ff0 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,6 +3,7 @@
@@ -198,8 +198,8 @@ index bd75bba..4d06793 100644
 +static unsigned long long g_blkRunHist[17] = {}, g_blkPairsInRuns = 0;
 +static unsigned g_blkRunCur = 0;
 +// cont.186: cumulative lower-opcode tiers (see the tier comment in run()).
-+static unsigned long long g_tierPairs[5] = {}, g_tierPairsGe2[5] = {}, g_tierRuns[5] = {};
-+static unsigned g_tierRunCur[5] = {};
++static unsigned long long g_tierPairs[6] = {}, g_tierPairsGe2[6] = {}, g_tierRuns[6] = {};
++static unsigned g_tierRunCur[6] = {};
 +
 +// The ONLY instructions that can observe m_state.mac / m_state.status inside a microprogram
 +// (ps2_vu1_lower.cpp, switch on opHi = (instr >> 25) & 0x7F):
@@ -1877,7 +1877,7 @@ index bd75bba..4d06793 100644
      resetScheduler();
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
-@@ -1633,13 +2596,341 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,13 +2596,345 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -2149,10 +2149,14 @@ index bd75bba..4d06793 100644
 +                        else if (lop == 0x08u || lop == 0x09u) tier = 2u;
 +                        else if (lop == 0x10u || lop == 0x12u || lop == 0x13u || lop == 0x1Cu) tier = 3u;
 +                        else if (lop == 0x04u || lop == 0x05u) tier = 4u;
++                        // ★ Tier 5: a BRANCH is not an opcode gap — it is the block TERMINATOR.
++                        // The census counted it as uncovered, which understates what a real block
++                        // compiler reaches, since a block simply ends there.
++                        else if (lop >= 0x20u && lop <= 0x2Fu) tier = 5u;
 +                    }
 +                    const bool upperOk =
 +                        !decoded.eBit && vu1jit::classifyUpper(decoded.upper, cop, cbc, cacc);
-+                    for (unsigned t = 0; t < 5u; ++t)
++                    for (unsigned t = 0; t < 6u; ++t)
 +                    {
 +                        if (upperOk && tier <= t)
 +                        {
@@ -2220,7 +2224,7 @@ index bd75bba..4d06793 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1647,6 +2938,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1647,6 +2942,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          }
  
          uint64_t readyCycle = calculatePairReadyCycle(decoded);
@@ -2242,7 +2246,7 @@ index bd75bba..4d06793 100644
          while (readyCycle > m_cycle)
          {
              if (readyCycle >= budgetEnd)
-@@ -1656,20 +2962,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1656,20 +2966,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              }
              advanceTo(readyCycle);
              readyCycle = calculatePairReadyCycle(decoded);
@@ -2269,7 +2273,7 @@ index bd75bba..4d06793 100644
          }
  
          const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1677,12 +2982,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1677,12 +2986,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          const bool hasUpperWrite = upperWrite.reg != 0u;
          const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
          const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
@@ -2300,7 +2304,7 @@ index bd75bba..4d06793 100644
          if (hasUpperWrite)
              std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
          if (hasDistinctLowerWrite)
-@@ -1835,4 +3152,116 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1835,4 +3156,116 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_state.cycles = m_cycle;
      if (useVuRounding && previousRoundingMode != -1)
          std::fesetround(previousRoundingMode);
@@ -2377,9 +2381,9 @@ index bd75bba..4d06793 100644
 +                            pairsGe2 += g_blkRunHist[k] * (k < 16u ? k : 16u);
 +                    }
 +                    {
-+                        static const char *tierName[5] = {
-+                            "NOP only", "+SQ/LQ", "+IADDIU", "+clip rd", "+ILW/ISW"};
-+                        for (unsigned t = 0; t < 5u; ++t)
++                        static const char *tierName[6] = {
++                            "NOP only", "+SQ/LQ", "+IADDIU", "+clip rd", "+ILW/ISW", "+branch"};
++                        for (unsigned t = 0; t < 6u; ++t)
 +                            std::fprintf(stderr,
 +                                         "[vu1:tier%u] %-9s compilable=%llu (%.1f%%) runs=%llu "
 +                                         "meanRun=%.2f inRunsGe2=%llu (%.1f%%)\n",

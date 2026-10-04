@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..7ca16ab
+index 0000000..6ed67d5
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,1026 @@
+@@ -0,0 +1,1093 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -97,6 +97,22 @@ index 0000000..7ca16ab
 +                    std::memcpy(base + 320 + 16 * k, quad, sizeof(quad));
 +                }
 +            }
++            // FTOI scale-up factors 2^n (n = 0,4,12,15) at 384/400/416/432, then the positive
++            // saturation threshold and INT32_MAX at 448/464.
++            {
++                const float sc[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
++                for (uint32_t k = 0; k < 4u; ++k)
++                {
++                    float quad[4] = {sc[k], sc[k], sc[k], sc[k]};
++                    std::memcpy(base + 384 + 16 * k, quad, sizeof(quad));
++                }
++                // (float)INT32_MAX rounds to 2147483648.0f, which is the smallest float that
++                // satisfies the interpreter's `scaled >= (double)INT32_MAX` test.
++                const float thr = 2147483648.0f;
++                float tq[4] = {thr, thr, thr, thr};
++                std::memcpy(base + 448, tq, sizeof(tq));
++                put(464, 0x7FFFFFFFu);
++            }
 +            for (uint32_t d = 0; d < 16u; ++d)
 +            {
 +                // lane c (0..3) enabled iff d & (1 << (3 - c)) — matches laneForComponent()
@@ -112,6 +128,9 @@ index 0000000..7ca16ab
 +        const void *magMask() const { return base + 48; }
 +        const void *destMask(uint8_t d) const { return base + 64 + 16 * (d & 15u); }
 +        const void *itofScale(uint8_t k) const { return base + 320 + 16 * (k & 3u); }
++        const void *ftoiScale(uint8_t k) const { return base + 384 + 16 * (k & 3u); }
++        const void *ftoiThreshold() const { return base + 448; }
++        const void *intMax() const { return base + 464; }
 +
 +        void reset() { used = 0; }
 +        size_t room() const { return capacity - kPoolBytes - used; }
@@ -183,6 +202,8 @@ index 0000000..7ca16ab
 +        void movss_load_d(uint8_t reg, uint8_t base, int32_t disp)
 +        { u8(0xF3); u8(0x0F); u8(0x10); modrmDisp32(reg, base, disp); }
 +        void cvtdq2ps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5B); modrmReg(d, s); }
++        void cvttps2dq_rr(uint8_t d, uint8_t s) { u8(0xF3); u8(0x0F); u8(0x5B); modrmReg(d, s); }
++        void cmpps_rri(uint8_t d, uint8_t s, uint8_t imm) { u8(0x0F); u8(0xC2); modrmReg(d, s); u8(imm); }
 +        void mulps_rip(uint8_t reg, const void *c) { u8(0x0F); u8(0x59); modrmRip(reg, c); }
 +        void maxps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5F); modrmReg(d, s); }
 +        void minps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5D); modrmReg(d, s); }
@@ -265,7 +286,7 @@ index 0000000..7ca16ab
 +
 +    // The FMAC shapes covered. Max/Min/Abs use the interpreter's `applyDest` (no result clamp and
 +    // no flags) rather than `applyFmacDest` — a real semantic difference, so it is explicit here.
-+    enum class FmacOp { Add, Sub, Mul, Madd, Msub, Max, Min, Abs, Nop, Itof };
++    enum class FmacOp { Add, Sub, Mul, Madd, Msub, Max, Min, Abs, Nop, Itof, Ftoi };
 +
 +    // Where the second operand comes from. cont.186 showed the q/i-operand family is the single
 +    // biggest gap in upper coverage (MULq alone is 6.8% of executed pairs).
@@ -292,6 +313,36 @@ index 0000000..7ca16ab
 +    {
 +        if (plan.op == FmacOp::Nop)
 +            return; // upper NOP: no operands read, no destination written
++
++        if (plan.op == FmacOp::Ftoi)
++        {
++            // FTOI uses the CLAMPED operand (unlike ITOF) and writes vf[ft] via applyDest.
++            // ★ Saturation differs from the hardware instruction: the interpreter's vuFloatToInt
++            // clamps to INT32_MIN/INT32_MAX, but cvttps2dq yields 0x80000000 for out-of-range in
++            // BOTH directions. Negative overflow therefore already matches (0x80000000 == INT32_MIN),
++            // and only POSITIVE overflow needs fixing up to 0x7FFFFFFF.
++            e.movups_load_d(0, 7, offFs);
++            emitNormOperand(e, buf, 0, 1, 2, 3, 4);
++            if (plan.itofShift != 0u)
++                e.mulps_rip(0, buf.ftoiScale(plan.itofShift));
++            e.movaps_rr(5, 0);          // keep the scaled float for the compare
++            e.cvttps2dq_rr(0, 0);       // truncate toward zero
++            e.movaps_rip(1, buf.ftoiThreshold());
++            e.cmpps_rri(5, 1, 5);       // predicate 5 = NLT, i.e. t >= 2147483648.0f
++            e.movaps_rip(2, buf.intMax());
++            e.pand_rr(2, 5);            // INT32_MAX where saturating
++            e.pandn_rr(5, 0);           // truncated value elsewhere
++            e.por_rr(2, 5);
++            e.movaps_rr(0, 2);
++
++            e.movaps_rip(2, buf.destMask(dest));
++            e.pand_rr(0, 2);
++            e.movups_load_d(1, 7, offDst);
++            e.pandn_rr(2, 1);
++            e.por_rr(0, 2);
++            e.movups_store_d(7, offDst, 0);
++            return;
++        }
 +
 +        if (plan.op == FmacOp::Itof)
 +        {
@@ -430,6 +481,13 @@ index 0000000..7ca16ab
 +        }
 +    };
 +
++    inline bool ftoiTrapArmed()
++    {
++        static const bool v = []
++        { const char *e = std::getenv("PS2X_VU1_FTOITRAP"); return e && e[0] && e[0] != '0'; }();
++        return v;
++    }
++
 +    // Decode an upper instruction into a plan. Returns false if not covered.
 +    // ★ The main and `special` switches DIVERGE in the 0x10-0x1F range — main 0x10-0x17 are
 +    // MAXbc/MINIbc while special 0x10-0x17 are ITOF/FTOI — so the two are classified separately
@@ -516,6 +574,15 @@ index 0000000..7ca16ab
 +        case 0x2A: return arith(FmacOp::Mul, OperandSrc::VtQuad, 0, true, false);   // MULA
 +        case 0x2C: return arith(FmacOp::Sub, OperandSrc::VtQuad, 0, true, false);   // SUBA
 +        case 0x2D: return arith(FmacOp::Msub, OperandSrc::VtQuad, 0, true, true);   // MSUBA
++        case 0x14: case 0x15: case 0x16: case 0x17: // FTOI0 / FTOI4 / FTOI12 / FTOI15
++            // PS2X_VU1_FTOITRAP prints a diagnostic from the interpreter on every saturating FTOI;
++            // the emitted code cannot, so leave FTOI to the interpreter whenever the trap is armed.
++            if (ftoiTrapArmed())
++                return false;
++            plan.writesFt = true;
++            plan.writesAcc = false;
++            plan.itofShift = uint8_t(sel & 3u);
++            return arith(FmacOp::Ftoi, OperandSrc::None, 0, false, false);
 +        case 0x10: case 0x11: case 0x12: case 0x13: // ITOF0 / ITOF4 / ITOF12 / ITOF15
 +            plan.writesFt = true;
 +            plan.writesAcc = false;

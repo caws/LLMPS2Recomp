@@ -647,3 +647,36 @@ moment it executes.
 5. **Block assembly** proper: emit a run as one function, keep operands in registers across pairs,
    and replace the interpreter loop (pc/cycle advance, pipeline) for the run's duration. §5d's
    **7.72 ns/pair at 6-pair blocks (15.6×)** is what this unlocks.
+
+
+## 5f. Branches are TERMINATORS, not gaps (cont.190) — the single largest coverage lever
+
+Every census through §5e counted a **branch** in the lower slot as an uncovered opcode, so a branch
+*split* every run. That is simply the wrong model: a block **ends** at a branch. Reclassifying:
+
+| tier | compilable | mean run | pairs in runs ≥ 2 |
+|---|---|---|---|
+| 4 (+ILW/ISW) | 45.7% | 1.53 | 20.7% |
+| **5 (+branch as terminator)** | **61.3%** | **2.85** | **52.2%** |
+
+**That one change is worth more than every opcode added in §5e combined** (+15.6 pp compilable,
++31.5 pp in runs ≥2, mean run finally above 2). It follows from the block shape: branches occur
+every ~6 pairs, so treating them as gaps capped every run at the inter-branch distance *minus* the
+branch.
+
+### Revised build order
+
+1. **Branch terminators in the block compiler.** Emit the run, then exit to the interpreter with the
+   branch and its delay slot still interpreted. This is what turns 20.7% into 52.2%.
+2. **Lower-slot codegen** — SQ 15.1%, clip readers 10.3%, LQ 5.3%, IADDIU 4.6%. Needs VI registers
+   in GPRs and VU-memory addressing.
+3. **CLIP** (3.7%) — writes the clip flag register through `queueClip`, so it needs flag-pipeline
+   support rather than a plain vf/acc write. Plus OPMULA/OPMSUB.
+
+### Sizing, with §5d's measured block cost
+
+A 2-pair block is 7.90 ns/pair, a 6-pair block 7.72, versus 120.5 interpreted. At 52.2% coverage:
+`0.522 × 7.9 + 0.478 × 120.5 ≈ 62 ns/pair ≈ 1.95×` — **if transitions were free, which they are
+not.** Reaching 17 ns/pair still requires coverage in the 85%+ range, which is what keeps the lower
+slot on the list. But 52.2% is the first figure high enough that block assembly is worth *building*
+rather than simulating.
