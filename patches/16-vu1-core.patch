@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..576cf02 100644
+index bd75bba..b64f370 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,6 +3,7 @@
@@ -1220,12 +1220,12 @@ index bd75bba..576cf02 100644
          return;
 -    for (PendingViWrite &write : m_viWritePipeline)
 +    if (s_vu1NoSched)
-     {
--        if (!write.valid)
++    {
 +        m_state.vi[reg] = static_cast<int16_t>(value);
 +        return;
 +    }
-+    {
+     {
+-        if (!write.valid)
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_viWritePipeline, pipe.vi, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
@@ -1309,7 +1309,7 @@ index bd75bba..576cf02 100644
 +        if (readyCycle < nextReady)
 +            nextReady = readyCycle;
 +    };
-+
+ 
 +    if (s_vu1PipeVerify && tracked)
 +    {
 +        // Self-check (PS2X_VU1_PIPEVERIFY=1): the only dangerous direction is a mask that
@@ -1333,7 +1333,7 @@ index bd75bba..576cf02 100644
 +        check("vi", m_viWritePipeline, pipe.vi);
 +        check("acc", m_accWritePipeline, pipe.acc);
 +    }
- 
++
 +    fresh.flag = retirePipe(m_flagPipeline, pipe.flag, tracked, [&](FlagPipelineEntry &entry)
 +    {
 +        if (entry.readyCycle > m_cycle)
@@ -1779,14 +1779,14 @@ index bd75bba..576cf02 100644
      }
  
 -    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
-+    uint32_t viWrite = static_cast<uint32_t>(decoded.lowerUsage.viWrite) & kViRegMask;
-+    if (viWrite != 0u)
-     {
+-    {
 -        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
 -            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
 -    }
 -    for (uint32_t component = 0; component < 4u; ++component)
--    {
++    uint32_t viWrite = static_cast<uint32_t>(decoded.lowerUsage.viWrite) & kViRegMask;
++    if (viWrite != 0u)
+     {
 -        if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
 -            m_accReady[component] = m_cycle + kAccForwardLatency;
 +        const uint64_t viReady = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
@@ -1894,7 +1894,7 @@ index bd75bba..576cf02 100644
      resetScheduler();
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
-@@ -1633,13 +2619,800 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,13 +2619,806 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -2172,6 +2172,8 @@ index bd75bba..576cf02 100644
 +                    pi.lower = d.lower;
 +                    pi.iBit = d.iBit;
 +                    pi.eBit = d.eBit;
++                    pi.dBit = d.dBit;
++                    pi.tBit = d.tBit;
 +                    pi.upperWriteReg = d.upperUsage.vfWrite.reg;
 +                    pi.upperWriteLanes = d.upperUsage.vfWrite.lanes;
 +                    pi.upperLatency = d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency
@@ -2203,7 +2205,7 @@ index bd75bba..576cf02 100644
 +                    ++avail;
 +                }
 +                blk = vu1jit::buildBlock(vu1jit::blockBuffer(), bstore, blockGen, m_state.pc,
-+                                         infos, avail);
++                                         microAddressMask(), infos, avail);
 +            }
 +            // ★ Valid-slot bitmasks (cont.175 PipeTrack) so every check below walks only live
 +            // entries instead of whole arrays. They are only trustworthy while this instance owns
@@ -2438,10 +2440,14 @@ index bd75bba..576cf02 100644
 +                    if (tailReg != 0u)
 +                        recordViWriteForBranch(tailReg, tailOld);
 +
-+                    uint32_t nextPc = m_state.pc + 8u * blk->pairs;
-+                    if (nextPc >= codeSize)
-+                        nextPc = 0u;
-+                    m_state.pc = nextPc;
++                    if (!blk->endsWithBranch)
++                    {
++                        uint32_t nextPc = m_state.pc + 8u * blk->pairs;
++                        if (nextPc >= codeSize)
++                            nextPc = 0u;
++                        m_state.pc = nextPc;
++                    }
++                    // else: the block executed the branch and its delay slot and wrote pc itself.
 +
 +                    if (s_vu1BlockProf) g_bpRetire += __rdtsc() - bpT4;
 +                    ++bstore.entered;
@@ -2696,7 +2702,7 @@ index bd75bba..576cf02 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1647,6 +3420,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1647,6 +3426,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          }
  
          uint64_t readyCycle = calculatePairReadyCycle(decoded);
@@ -2718,7 +2724,7 @@ index bd75bba..576cf02 100644
          while (readyCycle > m_cycle)
          {
              if (readyCycle >= budgetEnd)
-@@ -1656,20 +3444,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1656,20 +3450,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              }
              advanceTo(readyCycle);
              readyCycle = calculatePairReadyCycle(decoded);
@@ -2745,7 +2751,7 @@ index bd75bba..576cf02 100644
          }
  
          const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1677,12 +3464,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1677,12 +3470,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          const bool hasUpperWrite = upperWrite.reg != 0u;
          const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
          const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
@@ -2776,7 +2782,7 @@ index bd75bba..576cf02 100644
          if (hasUpperWrite)
              std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
          if (hasDistinctLowerWrite)
-@@ -1820,6 +3619,110 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1820,6 +3625,120 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          }
  
          advanceOneCycle();
@@ -2822,6 +2828,16 @@ index bd75bba..576cf02 100644
 +                                  << std::hex << (vb != nullptr ? vb->startPc : 0u) << std::dec
 +                                  << " CYCLES interp=" << actual
 +                                  << " block=" << blockVerifyCycles);
++            }
++            // ★ For a branch-terminated block the PC is the whole point: the block computed the
++            // condition, the target and the delay slot itself, so a wrong branch shows up here.
++            if (vb != nullptr && vb->endsWithBranch)
++            {
++                ++checked;
++                if (m_state.pc != blockVerifyRef.pc && ++bad <= 4ul)
++                    RUNTIME_ERROR("[VU1 block MISMATCH] pc=0x"
++                                  << std::hex << vb->startPc << " BRANCH interp=0x" << m_state.pc
++                                  << " block=0x" << blockVerifyRef.pc << std::dec);
 +            }
 +            for (uint32_t r = 1; r < 32u; ++r)
 +            {
@@ -2887,7 +2903,7 @@ index bd75bba..576cf02 100644
          if (programEnded)
              break;
      }
-@@ -1835,4 +3738,145 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1835,4 +3754,145 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_state.cycles = m_cycle;
      if (useVuRounding && previousRoundingMode != -1)
          std::fesetround(previousRoundingMode);

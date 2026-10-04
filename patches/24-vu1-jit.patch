@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..540f8c4
+index 0000000..325f40c
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,2366 @@
+@@ -0,0 +1,2620 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -249,6 +249,24 @@ index 0000000..540f8c4
 +        { u8(0x0F); u8(uint8_t(0x90 | (cc & 0xFu))); modrmReg(0, reg); }
 +        // movzx r32, r8
 +        void movzx_r32_r8(uint8_t d, uint8_t s) { u8(0x0F); u8(0xB6); modrmReg(d, s); }
++        // movsx r32, WORD [base + disp32]  -- the (int16_t) a branch compare applies to vi[]
++        void movsx_r32_mem16(uint8_t reg, uint8_t base, int32_t disp)
++        { u8(0x0F); u8(0xBF); modrmDisp32(reg, base, disp); }
++        // movzx r32, WORD [base + disp32]  -- JR/JALR zero-extend vi[is] before *8
++        void movzx_r32_mem16(uint8_t reg, uint8_t base, int32_t disp)
++        { u8(0x0F); u8(0xB7); modrmDisp32(reg, base, disp); }
++        // mov r32, imm32
++        void mov_r32_imm32(uint8_t reg, uint32_t imm) { u8(uint8_t(0xB8 + (reg & 7))); u32(imm); }
++        // cmp r32(a), r32(b)
++        void cmp_r32_r32(uint8_t a, uint8_t b) { u8(0x3B); modrmReg(a, b); }
++        // cmp r32, imm32 (long form, any low reg)
++        void cmp_r32_imm32(uint8_t reg, int32_t imm)
++        { u8(0x81); modrmReg(7, reg); u32(uint32_t(imm)); }
++        // cmovcc r32(d), r32(s).  cc: 4=E 5=NE C=L D=GE E=LE F=G
++        void cmovcc_r32_r32(uint8_t cc, uint8_t d, uint8_t src)
++        { u8(0x0F); u8(uint8_t(0x40 | (cc & 0xFu))); modrmReg(d, src); }
++        // mov r32(d), r32(s)
++        void mov_r32_r32(uint8_t d, uint8_t src) { u8(0x8B); modrmReg(d, src); }
 +
 +        // [base + index*1] via SIB (mod=00, rm=100). Used for VU-memory access: base = rsi
 +        // (vuData), index = rax (the computed byte address).
@@ -485,6 +503,7 @@ index 0000000..540f8c4
 +    static constexpr int32_t kOffI = int32_t(offsetof(VU1State, i));
 +    static constexpr int32_t kOffVi = int32_t(offsetof(VU1State, vi));
 +    static constexpr int32_t kOffClip = int32_t(offsetof(VU1State, clip));
++    static constexpr int32_t kOffPc = int32_t(offsetof(VU1State, pc));
 +
 +    // ---- lower slot: VU-memory access ------------------------------------------------------
 +    // Emitted lower-slot code needs a wider calling convention than the upper slot:
@@ -659,6 +678,148 @@ index 0000000..540f8c4
 +    // bytes: which VI register is written, whether the write carries the branch-delay hazard, and
 +    // whether the instruction touches VU memory (which the XGKICK residual noted for SQ concerns).
 +    enum class LowerOp { Nop, Lq, Sq, IaddIu, IsubIu, Fceq, Fcand, Fcor, Fcget };
++
++    // ---- block terminators: branches (cont.198) --------------------------------------------
++    // A branch ENDS a block, but the block still executes it and its DELAY SLOT, then writes
++    // m_state.pc. That is what turns a "straight-line run" into a real basic block: without it the
++    // interpreter has to run the branch AND its delay slot, which at a branch every ~6.1 pairs is
++    // most of what a block could otherwise cover.
++    //
++    // Every target except JR/JALR is a COMPILE-TIME CONSTANT: `(pc + 8 + imm*8) & pcMask` with pc
++    // known at compile time. The condition compares are on `(int16_t)readBranchVi(reg)`.
++    enum class BranchKind { None, B, Bal, Jr, Jalr, Ibeq, Ibne, Ibltz, Ibgtz, Iblez, Ibgez };
++
++    struct BranchPlan
++    {
++        BranchKind kind = BranchKind::None;
++        uint8_t viS = 0, viT = 0;   // condition / jump-target registers
++        uint8_t linkReg = 0;        // BAL / JALR write (pc+16)/8 here
++        uint32_t target = 0;        // taken target (static kinds)
++        uint32_t fallthrough = 0;   // not-taken pc == branch pc + 16
++        uint32_t linkValue = 0;
++    };
++
++    // `pc` is the branch pair's guest PC; `pcMask` is microAddressMask() (0x3FFF for VU1).
++    inline bool classifyBranch(uint32_t lower, uint32_t pc, uint32_t pcMask, BranchPlan &b)
++    {
++        b = BranchPlan{};
++        const uint8_t opHi = uint8_t((lower >> 25) & 0x7Fu);
++        const int32_t imm = int32_t(IMM11(lower));
++        b.target = (pc + 8u + uint32_t(imm * 8)) & pcMask;
++        b.fallthrough = pc + 16u;
++        b.linkValue = (pc + 16u) / 8u;
++        b.viS = VIS(lower);
++        b.viT = VIT(lower);
++        switch (opHi)
++        {
++        case 0x20: b.kind = BranchKind::B; return true;
++        case 0x21: b.kind = BranchKind::Bal; b.linkReg = VIT(lower); return true;
++        case 0x24: b.kind = BranchKind::Jr; return true;
++        case 0x25: b.kind = BranchKind::Jalr; b.linkReg = VIT(lower); return true;
++        case 0x28: b.kind = BranchKind::Ibeq; return true;
++        case 0x29: b.kind = BranchKind::Ibne; return true;
++        case 0x2C: b.kind = BranchKind::Ibltz; return true;
++        case 0x2D: b.kind = BranchKind::Ibgtz; return true;
++        case 0x2E: b.kind = BranchKind::Iblez; return true;
++        case 0x2F: b.kind = BranchKind::Ibgez; return true;
++        default: return false;
++        }
++    }
++
++    // Emit the branch's TARGET SELECTION into ecx. The delay slot then runs (no emitter touches
++    // ecx), and the block epilogue stores ecx to m_state.pc -- matching the interpreter, which
++    // computes the target at the branch pair and applies it after the delay slot.
++    //
++    // `backupReg`/`backupValid`: when the immediately preceding pair performed a
++    // `delaysNextBranchRead` VI write to a register this branch reads, the architectural value is
++    // already the NEW one, so the OLD one was stashed in ECX before that write (see planBlock) --
++    // and is consumed here. That is the cont.194 branch-delay hazard, honoured inside the block.
++    inline void emitBranch(Emitter &e, const BranchPlan &b, uint32_t pcMask,
++                           uint8_t backupReg, bool backupValid)
++    {
++        // Load a condition operand, preferring the stashed pre-write value when it applies.
++        const auto loadVi = [&](uint8_t dst, uint8_t reg) {
++            if (backupValid && reg == backupReg && reg != 0u)
++                e.movsx_r32_r16(dst, 1 /*ecx*/); // stashed by planBlock's backup emission
++            else if (reg == 0u)
++                e.mov_r32_imm32(dst, 0u);
++            else
++                e.movsx_r32_mem16(dst, 7 /*rdi*/, kOffVi + int32_t(reg) * 4);
++        };
++
++        if (b.linkReg != 0u)
++        {
++            e.mov_r32_imm32(0 /*eax*/, b.linkValue);
++            e.mov_mem_r32(7, kOffVi + int32_t(b.linkReg) * 4, 0);
++        }
++
++        switch (b.kind)
++        {
++        case BranchKind::B:
++        case BranchKind::Bal:
++            e.mov_r32_imm32(1 /*ecx*/, b.target);
++            return;
++        case BranchKind::Jr:
++        case BranchKind::Jalr:
++            // ((uint32_t)(uint16_t)readBranchVi(is) * 8) & pcMask
++            if (b.viS == 0u)
++                e.mov_r32_imm32(0, 0u);
++            else if (backupValid && b.viS == backupReg)
++                e.mov_r32_r32(0, 1); // ecx holds the pre-write value; mask to 16 bits next
++            else
++                e.movzx_r32_mem16(0, 7, kOffVi + int32_t(b.viS) * 4);
++            e.and_eax_imm32(0xFFFFu);
++            e.shl_r32_imm8(0, 3);
++            e.and_eax_imm32(pcMask);
++            e.mov_r32_r32(1, 0); // ecx = target
++            return;
++        default:
++            break;
++        }
++
++        // Conditional forms: eax = first operand, edx is NOT free (dataSizeMask), so the second
++        // operand goes in ecx -- which is safe because the stashed backup has been consumed by
++        // then (it is only ever read into eax/ecx here, before ecx becomes the target).
++        uint8_t cc = 4;
++        switch (b.kind)
++        {
++        case BranchKind::Ibeq:  cc = 0x4; break;
++        case BranchKind::Ibne:  cc = 0x5; break;
++        case BranchKind::Ibltz: cc = 0xC; break;
++        case BranchKind::Ibgtz: cc = 0xF; break;
++        case BranchKind::Iblez: cc = 0xE; break;
++        case BranchKind::Ibgez: cc = 0xD; break;
++        default: break;
++        }
++        if (b.kind == BranchKind::Ibeq || b.kind == BranchKind::Ibne)
++        {
++            loadVi(0 /*eax*/, b.viS);
++            // second operand into esi? rsi is vuData. Use a spill-free trick: compare against a
++            // freshly loaded value in ecx, then rebuild ecx as the target afterwards.
++            loadVi(1 /*ecx*/, b.viT);
++            e.cmp_r32_r32(0, 1);
++        }
++        else
++        {
++            loadVi(0 /*eax*/, b.viS);
++            e.cmp_r32_imm32(0, 0);
++        }
++        e.mov_r32_imm32(1 /*ecx*/, b.fallthrough);
++        e.mov_r32_imm32(0 /*eax*/, b.target);
++        e.cmovcc_r32_r32(cc, 1, 0); // ecx = taken ? target : fallthrough
++    }
++
++    // Stash vi[reg] (pre-write) into ECX, for the branch-delay hazard.
++    inline void emitBranchBackupStash(Emitter &e, uint8_t reg)
++    {
++        e.movsx_r32_mem16(1 /*ecx*/, 7 /*rdi*/, kOffVi + int32_t(reg) * 4);
++    }
++
++    // Block epilogue for a branch-terminated block: m_state.pc = ecx.
++    inline void emitBranchCommit(Emitter &e)
++    {
++        e.mov_mem_r32(7 /*rdi*/, kOffPc, 1 /*ecx*/);
++    }
 +
 +    struct LowerPlan
 +    {
@@ -1066,7 +1227,7 @@ index 0000000..540f8c4
 +        uint8_t vfReadCount = 0;
 +        uint16_t viReadMask = 0;
 +        uint8_t accRead = 0;
-+        bool iBit = false, eBit = false;
++        bool iBit = false, eBit = false, dBit = false, tBit = false;
 +        bool lowerDelaysBranchRead = false;
 +    };
 +
@@ -1112,6 +1273,7 @@ index 0000000..540f8c4
 +        uint32_t readyCount = 0;
 +        bool touchesVuMem = false;   // any SQ or LQ -> pending stores matter
 +        uint8_t tailViBackupReg = 0; // see the branch-delay contract in planBlock()
++        bool endsWithBranch = false; // the block writes m_state.pc itself
 +        // ★ cont.195b: what the block TOUCHES, so the entry guard can be precise instead of
 +        // demanding globally-empty pipelines. A pending incoming write only matters if the block
 +        // reads or writes the very slot it targets (read -> the interpreter would have stalled
@@ -1160,84 +1322,232 @@ index 0000000..540f8c4
 +        }
 +    }
 +
-+    // Plan a block starting at pairs[0]: classify pairs until a terminator, cutting before any
-+    // pair that would stall on an earlier pair of the same block (so `m_cycle += pairs` is exact).
++    // Per-pair helpers, shared by the straight-line path and the branch terminator below.
++
++    // Raise `issue` to satisfy every read of this pair against the block-local ready tables.
++    inline void applyReadStalls(const PairInfo &pi, int32_t &issue,
++                                const int32_t vfReady[32][4], const int32_t viReady[16],
++                                const int32_t accReady[4])
++    {
++        for (uint32_t k = 0; k < pi.vfReadCount && k < 4u; ++k)
++        {
++            uint32_t lanes = pi.vfReadLanes[k] & 0xFu;
++            const uint8_t reg = pi.vfReadReg[k] & 31u;
++            while (lanes != 0u)
++            {
++                const uint32_t bit = uint32_t(__builtin_ctz(lanes));
++                lanes &= lanes - 1u;
++                const int32_t r = vfReady[reg][3u - bit];
++                if (r > issue) issue = r;
++            }
++        }
++        uint32_t vr = pi.viReadMask & 0xFFFEu; // VI0 is hardwired, never pending
++        while (vr != 0u)
++        {
++            const uint32_t reg = uint32_t(__builtin_ctz(vr));
++            vr &= vr - 1u;
++            if (viReady[reg] > issue) issue = viReady[reg];
++        }
++        uint32_t ar = pi.accRead & 0xFu;
++        while (ar != 0u)
++        {
++            const uint32_t bit = uint32_t(__builtin_ctz(ar));
++            ar &= ar - 1u;
++            if (accReady[3u - bit] > issue) issue = accReady[3u - bit];
++        }
++    }
++
++    // Record this pair's writes into the block-local ready tables AND the replay list, exactly as
++    // markPairWrites would (it SETS rather than maxes, so replaying in order reproduces it).
++    inline void recordPairWrites(const PairInfo &pi, int32_t issue,
++                                 ReadyWrite *ready, uint32_t &readyCount,
++                                 int32_t vfReady[32][4], int32_t viReady[16], int32_t accReady[4],
++                                 uint32_t pairIndex)
++    {
++        if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
++        {
++            const uint8_t lat = pi.lowerLatency;
++            uint32_t lanes = pi.lowerWriteLanes & 0xFu;
++            while (lanes != 0u)
++            {
++                const uint32_t bit = uint32_t(__builtin_ctz(lanes));
++                lanes &= lanes - 1u;
++                const uint8_t lane = uint8_t(3u - bit);
++                vfReady[pi.lowerWriteReg][lane] = issue + int32_t(lat);
++                ready[readyCount++] =
++                    ReadyWrite{0u, pi.lowerWriteReg, lane, lat, uint8_t(pairIndex)};
++            }
++        }
++        if (pi.upperWriteReg != 0u)
++        {
++            const uint8_t lat = pi.upperLatency;
++            uint32_t lanes = pi.upperWriteLanes & 0xFu;
++            while (lanes != 0u)
++            {
++                const uint32_t bit = uint32_t(__builtin_ctz(lanes));
++                lanes &= lanes - 1u;
++                const uint8_t lane = uint8_t(3u - bit);
++                vfReady[pi.upperWriteReg][lane] = issue + int32_t(lat);
++                ready[readyCount++] =
++                    ReadyWrite{0u, pi.upperWriteReg, lane, lat, uint8_t(pairIndex)};
++            }
++        }
++        uint32_t vw = pi.viWriteMask & 0xFFFEu;
++        while (vw != 0u)
++        {
++            const uint32_t reg = uint32_t(__builtin_ctz(vw));
++            vw &= vw - 1u;
++            viReady[reg] = issue + int32_t(pi.viLatency);
++            ready[readyCount++] =
++                ReadyWrite{1u, uint8_t(reg), 0u, pi.viLatency, uint8_t(pairIndex)};
++        }
++        uint32_t aw = pi.accWrite & 0xFu;
++        while (aw != 0u)
++        {
++            const uint32_t bit = uint32_t(__builtin_ctz(aw));
++            aw &= aw - 1u;
++            const uint8_t lane = uint8_t(3u - bit);
++            accReady[lane] = issue + 1; // kAccForwardLatency
++            ready[readyCount++] = ReadyWrite{2u, 0u, lane, 1u, uint8_t(pairIndex)};
++        }
++    }
++
++    // Fill the per-pair schedule + touched-slot summary the entry guard and re-derivation use.
++    inline void recordPairTouch(Block *touch, const PairInfo &pi, const UpperPlan &up,
++                                const LowerPlan &lo, int32_t issue, uint32_t pairIndex)
++    {
++        if (touch == nullptr)
++            return;
++        PairSched &ps = touch->sched[pairIndex];
++        ps = PairSched{};
++        ps.vfReadCount = pi.vfReadCount < 4u ? pi.vfReadCount : 4u;
++        for (uint32_t k = 0; k < ps.vfReadCount; ++k)
++        {
++            ps.vfReadReg[k] = pi.vfReadReg[k] & 31u;
++            ps.vfReadLanes[k] = pi.vfReadLanes[k] & 0xFu;
++            touch->vfTouched[ps.vfReadReg[k]] |= ps.vfReadLanes[k];
++        }
++        ps.viRead = uint16_t(pi.viReadMask & 0xFFFEu);
++        ps.accRead = uint8_t(pi.accRead & 0xFu);
++        ps.issue = uint16_t(issue);
++        if (pi.upperWriteReg != 0u)
++            touch->vfTouched[pi.upperWriteReg & 31u] |= (pi.upperWriteLanes & 0xFu);
++        if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
++            touch->vfTouched[pi.lowerWriteReg & 31u] |= (pi.lowerWriteLanes & 0xFu);
++        touch->viTouched |= uint16_t(pi.viReadMask | pi.viWriteMask);
++        touch->accTouched |= uint8_t(pi.accRead | pi.accWrite);
++        if (up.src == OperandSrc::ScalarQ)
++            touch->readsQ = true;
++        if (lo.op == LowerOp::Fceq || lo.op == LowerOp::Fcand ||
++            lo.op == LowerOp::Fcor || lo.op == LowerOp::Fcget)
++            touch->readsClip = true;
++        if (lo.op == LowerOp::Sq)
++            touch->writesVuMem = true;
++    }
++
++    // Plan a block starting at pairs[0] (guest PC `startPc`). Classifies pairs until a terminator,
++    // absorbing internal stalls into the schedule. A BRANCH is not a terminator gap: the block
++    // takes the branch pair AND its delay slot and then writes m_state.pc (cont.198).
 +    // Returns the number of pairs accepted (0 = not compilable).
-+    inline uint32_t planBlock(const PairInfo *pairs, uint32_t avail,
-+                              UpperPlan *ups, LowerPlan *los,
++    inline uint32_t planBlock(const PairInfo *pairs, uint32_t avail, uint32_t startPc,
++                              uint32_t pcMask, UpperPlan *ups, LowerPlan *los,
 +                              ReadyWrite *ready, uint32_t &readyCount,
 +                              bool &touchesVuMem, uint8_t &tailViBackupReg,
-+                              Block *touch, int32_t *issueOf, uint32_t &cycles)
++                              Block *touch, int32_t *issueOf, uint32_t &cycles,
++                              BranchPlan *branchOut, uint8_t &branchBackupReg,
++                              bool &endsWithBranch)
 +    {
-+        cycles = 0;
-+        // Pair index at which each value becomes readable. A write at pair i with latency L is
-+        // readable from pair i+L; a read at pair n stalls iff that exceeds n.
++        // Pair index at which each value becomes readable, in ISSUE cycles relative to entry.
 +        int32_t vfReady[32][4] = {};
 +        int32_t viReady[16] = {};
 +        int32_t accReady[4] = {};
-+        // Which VI regs this block has already written (for the tail branch-backup rule).
-+        uint32_t viWrittenMask = 0u;
-+        int32_t prevIssue = -1;      // issue cycle of the previous pair (block entry == cycle 0)
++        int32_t prevIssue = -1;
 +
 +        readyCount = 0;
 +        touchesVuMem = false;
 +        tailViBackupReg = 0;
++        branchBackupReg = 0;
++        endsWithBranch = false;
++        cycles = 0;
 +
 +        uint32_t n = 0;
 +        for (; n < avail && n < kMaxBlockPairs; ++n)
 +        {
 +            const PairInfo &pi = pairs[n];
-+            if (pi.iBit || pi.eBit)
++            // ★ D/T halt bits end the program when FBRST enables them, and a block does not model
++            // that -- so such a pair never enters one. (FBRST really can enable them; this was a
++            // latent gap before cont.198.)
++            if (pi.iBit || pi.eBit || pi.dBit || pi.tBit)
 +                break;
 +            UpperPlan up;
 +            LowerPlan lo;
 +            if (!classifyUpperPlan(pi.upper, up))
 +                break;
-+            if (!classifyLowerPlan(pi.lower, lo))
-+                break; // branch / ILW / ISW / anything uncovered terminates the block
 +
-+            // --- static stall SCHEDULING (cont.195c) -----------------------------------------
-+            // The first version CUT the block at any pair that would stall on an earlier pair of
-+            // the same block. That threw away most of the reach: FMAC latency is 4, so a run of
-+            // 6 pairs is very likely to contain one such read. The stall is entirely static once
-+            // issue cycles are known, so the block ABSORBS it instead: `issue` is this pair's
-+            // cycle relative to block entry, and every later pair (and every ready-table entry)
-+            // is expressed against it rather than against the pair index.
 +            int32_t issue = prevIssue + 1;
-+            for (uint32_t k = 0; k < pi.vfReadCount && k < 4u; ++k)
-+            {
-+                uint32_t lanes = pi.vfReadLanes[k] & 0xFu;
-+                const uint8_t reg = pi.vfReadReg[k] & 31u;
-+                while (lanes != 0u)
-+                {
-+                    const uint32_t bit = uint32_t(__builtin_ctz(lanes));
-+                    lanes &= lanes - 1u;
-+                    const int32_t r = vfReady[reg][3u - bit];
-+                    if (r > issue) issue = r;
-+                }
-+            }
-+            {
-+                uint32_t vr = pi.viReadMask & 0xFFFEu; // VI0 is hardwired, never pending
-+                while (vr != 0u)
-+                {
-+                    const uint32_t reg = uint32_t(__builtin_ctz(vr));
-+                    vr &= vr - 1u;
-+                    if (viReady[reg] > issue) issue = viReady[reg];
-+                }
-+            }
-+            {
-+                uint32_t ar = pi.accRead & 0xFu;
-+                while (ar != 0u)
-+                {
-+                    const uint32_t bit = uint32_t(__builtin_ctz(ar));
-+                    ar &= ar - 1u;
-+                    if (accReady[3u - bit] > issue) issue = accReady[3u - bit];
-+                }
-+            }
-+            if (issue > int32_t(0xFFFF - 32))
++            applyReadStalls(pi, issue, vfReady, viReady, accReady);
++            if (issue > int32_t(0xFFFF - 64))
 +                break; // pathological; keep `issue` inside its uint16_t field
 +
-+            // --- room for the ready-table updates this pair produces --------------------------
++            const bool lowerOk = classifyLowerPlan(pi.lower, lo);
++            if (!lowerOk)
++            {
++                // ---- BRANCH TERMINATOR: execute the branch AND its delay slot ----------------
++                BranchPlan bp;
++                if (branchOut == nullptr || n + 1u >= avail || n + 1u >= kMaxBlockPairs ||
++                    readyCount + 18u > kMaxReadyWrites ||
++                    !classifyBranch(pi.lower, startPc + 8u * n, pcMask, bp))
++                    break;
++                const PairInfo &ds = pairs[n + 1u];
++                UpperPlan dsUp;
++                LowerPlan dsLo;
++                if (ds.iBit || ds.eBit || ds.dBit || ds.tBit)
++                    break;
++                if (!classifyUpperPlan(ds.upper, dsUp) || !classifyLowerPlan(ds.lower, dsLo))
++                    break; // the delay slot must be compilable, and never a branch itself
++
++                // ★ cont.194 hazard: if the pair immediately before the branch made a
++                // `delaysNextBranchRead` VI write to a register this branch READS, the branch must
++                // still see the OLD value. planBlock records it; emitBlock stashes it in ECX
++                // before that write and emitBranch consumes it.
++                if (n > 0u)
++                {
++                    const PairInfo &prev = pairs[n - 1u];
++                    const uint32_t vw = prev.viWriteMask & 0xFFFEu;
++                    if (prev.lowerDelaysBranchRead && vw != 0u)
++                    {
++                        const uint8_t r = uint8_t(__builtin_ctz(vw));
++                        const bool readsIt =
++                            (bp.kind == BranchKind::Ibeq || bp.kind == BranchKind::Ibne);
++                        if ((r == bp.viS || (readsIt && r == bp.viT)) && r != 0u)
++                            branchBackupReg = r;
++                    }
++                }
++
++                *branchOut = bp;
++                ups[n] = up;
++                los[n] = LowerPlan{}; // the branch's lower is emitted by emitBranch, not emitLowerPlan
++                issueOf[n] = issue;
++                recordPairTouch(touch, pi, up, los[n], issue, n);
++                recordPairWrites(pi, issue, ready, readyCount, vfReady, viReady, accReady, n);
++                prevIssue = issue;
++                ++n;
++
++                int32_t dsIssue = prevIssue + 1;
++                applyReadStalls(ds, dsIssue, vfReady, viReady, accReady);
++                ups[n] = dsUp;
++                los[n] = dsLo;
++                issueOf[n] = dsIssue;
++                if (dsLo.touchesVuMem)
++                    touchesVuMem = true;
++                recordPairTouch(touch, ds, dsUp, dsLo, dsIssue, n);
++                recordPairWrites(ds, dsIssue, ready, readyCount, vfReady, viReady, accReady, n);
++                prevIssue = dsIssue;
++                ++n;
++                endsWithBranch = true;
++                break;
++            }
++
 +            if (readyCount + 9u > kMaxReadyWrites)
 +                break;
 +
@@ -1245,115 +1555,22 @@ index 0000000..540f8c4
 +            los[n] = lo;
 +            issueOf[n] = issue;
 +            prevIssue = issue;
-+            if (touch != nullptr)
-+            {
-+                PairSched &ps = touch->sched[n];
-+                ps = PairSched{};
-+                ps.vfReadCount = pi.vfReadCount < 4u ? pi.vfReadCount : 4u;
-+                for (uint32_t k = 0; k < ps.vfReadCount; ++k)
-+                {
-+                    ps.vfReadReg[k] = pi.vfReadReg[k] & 31u;
-+                    ps.vfReadLanes[k] = pi.vfReadLanes[k] & 0xFu;
-+                }
-+                ps.viRead = uint16_t(pi.viReadMask & 0xFFFEu);
-+                ps.accRead = uint8_t(pi.accRead & 0xFu);
-+                ps.issue = uint16_t(issue);
-+            }
 +            if (lo.touchesVuMem)
 +                touchesVuMem = true;
-+
-+            // --- touched-slot summary for the entry guard -----------------------------------
-+            if (touch != nullptr)
-+            {
-+                for (uint32_t k = 0; k < pi.vfReadCount && k < 4u; ++k)
-+                    touch->vfTouched[pi.vfReadReg[k] & 31u] |= (pi.vfReadLanes[k] & 0xFu);
-+                if (pi.upperWriteReg != 0u)
-+                    touch->vfTouched[pi.upperWriteReg & 31u] |= (pi.upperWriteLanes & 0xFu);
-+                if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
-+                    touch->vfTouched[pi.lowerWriteReg & 31u] |= (pi.lowerWriteLanes & 0xFu);
-+                touch->viTouched |= uint16_t(pi.viReadMask | pi.viWriteMask);
-+                touch->accTouched |= uint8_t(pi.accRead | pi.accWrite);
-+                if (up.src == OperandSrc::ScalarQ)
-+                    touch->readsQ = true;
-+                if (lo.op == LowerOp::Fceq || lo.op == LowerOp::Fcand ||
-+                    lo.op == LowerOp::Fcor || lo.op == LowerOp::Fcget)
-+                    touch->readsClip = true;
-+                if (lo.op == LowerOp::Sq)
-+                    touch->writesVuMem = true;
-+            }
-+
-+            // --- record writes, exactly as markPairWrites would ------------------------------
-+            // Order matters only in that the interpreter SETS (never maxes), and the C++ side
-+            // replays these in this same order, so the last write to a slot wins in both.
-+            if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
-+            {
-+                const uint8_t lat = pi.lowerLatency;
-+                uint32_t lanes = pi.lowerWriteLanes & 0xFu;
-+                while (lanes != 0u)
-+                {
-+                    const uint32_t bit = uint32_t(__builtin_ctz(lanes));
-+                    lanes &= lanes - 1u;
-+                    const uint8_t lane = uint8_t(3u - bit);
-+                    vfReady[pi.lowerWriteReg][lane] = issue + int32_t(lat);
-+                    ready[readyCount++] =
-+                        ReadyWrite{0u, pi.lowerWriteReg, lane, lat, uint8_t(n)};
-+                }
-+            }
-+            if (pi.upperWriteReg != 0u)
-+            {
-+                const uint8_t lat = pi.upperLatency;
-+                uint32_t lanes = pi.upperWriteLanes & 0xFu;
-+                while (lanes != 0u)
-+                {
-+                    const uint32_t bit = uint32_t(__builtin_ctz(lanes));
-+                    lanes &= lanes - 1u;
-+                    const uint8_t lane = uint8_t(3u - bit);
-+                    vfReady[pi.upperWriteReg][lane] = issue + int32_t(lat);
-+                    ready[readyCount++] =
-+                        ReadyWrite{0u, pi.upperWriteReg, lane, lat, uint8_t(n)};
-+                }
-+            }
-+            {
-+                uint32_t vw = pi.viWriteMask & 0xFFFEu;
-+                while (vw != 0u)
-+                {
-+                    const uint32_t reg = uint32_t(__builtin_ctz(vw));
-+                    vw &= vw - 1u;
-+                    viReady[reg] = issue + int32_t(pi.viLatency);
-+                    ready[readyCount++] =
-+                        ReadyWrite{1u, uint8_t(reg), 0u, pi.viLatency, uint8_t(n)};
-+                    viWrittenMask |= (1u << reg);
-+                }
-+            }
-+            {
-+                uint32_t aw = pi.accWrite & 0xFu;
-+                while (aw != 0u)
-+                {
-+                    const uint32_t bit = uint32_t(__builtin_ctz(aw));
-+                    aw &= aw - 1u;
-+                    const uint8_t lane = uint8_t(3u - bit);
-+                    accReady[lane] = issue + 1; // kAccForwardLatency
-+                    ready[readyCount++] = ReadyWrite{2u, 0u, lane, 1u, uint8_t(n)};
-+                }
-+            }
++            recordPairTouch(touch, pi, up, lo, issue, n);
++            recordPairWrites(pi, issue, ready, readyCount, vfReady, viReady, accReady, n);
 +        }
 +
-+        // ★★ THE cont.194 BRANCH-DELAY CONTRACT, honoured here.
-+        // Blocks terminate at branches, so the pair AFTER a block is very often the branch that
-+        // must still read the OLD value of a VI register written by the block's final pair
-+        // (`delaysNextBranchRead` — true for IADDIU/ISUBIU). The block writes VI immediately, so
-+        // that old value would be gone. The C++ driver therefore captures it BEFORE the call and
-+        // replays `recordViWriteForBranch` after — which is only valid if no EARLIER pair of the
-+        // block wrote that same register (otherwise the value at the final pair is not the one at
-+        // block entry). When it did, drop the final pair and let the interpreter run it.
-+        while (n > 0u)
++        // ★★ The cont.194 branch-delay contract for the pair AFTER the block. Only applies when the
++        // block does NOT end with a branch (if it does, the block already consumed the delay slot
++        // and the next pair is a fresh basic block).
++        while (!endsWithBranch && n > 0u)
 +        {
 +            const PairInfo &last = pairs[n - 1u];
 +            const uint32_t vw = last.viWriteMask & 0xFFFEu;
 +            if (!last.lowerDelaysBranchRead || vw == 0u)
-+                break; // nothing to preserve
++                break;
 +            const uint8_t reg = uint8_t(__builtin_ctz(vw));
-+            // was this register written by an earlier pair of the block?
 +            bool earlier = false;
 +            for (uint32_t k = 0; k + 1u < n; ++k)
 +                if ((pairs[k].viWriteMask & (1u << reg)) != 0u)
@@ -1363,13 +1580,29 @@ index 0000000..540f8c4
 +                tailViBackupReg = reg;
 +                break;
 +            }
-+            --n; // shorten and re-test the new final pair
-+            // recompute the ready list for the shortened block
++            --n;
 +            uint32_t rc = 0;
 +            for (uint32_t k = 0; k < readyCount; ++k)
 +                if (ready[k].pair < n)
 +                    ready[rc++] = ready[k];
 +            readyCount = rc;
++        }
++        if (endsWithBranch && n > 0u)
++        {
++            const PairInfo &last = pairs[n - 1u]; // the delay slot
++            const uint32_t vw = last.viWriteMask & 0xFFFEu;
++            if (last.lowerDelaysBranchRead && vw != 0u)
++            {
++                const uint8_t reg = uint8_t(__builtin_ctz(vw));
++                bool earlier = false;
++                for (uint32_t k = 0; k + 1u < n; ++k)
++                    if ((pairs[k].viWriteMask & (1u << reg)) != 0u)
++                        earlier = true;
++                if (!earlier)
++                    tailViBackupReg = reg;
++                else
++                    return 0u; // cannot preserve the old value; leave the whole block alone
++            }
 +        }
 +        if (n == 0u)
 +        {
@@ -1377,8 +1610,6 @@ index 0000000..540f8c4
 +            cycles = 0;
 +            return 0u;
 +        }
-+        // The interpreter consumes one cycle per pair plus every stall cycle it advanced through,
-+        // which is exactly the last pair's issue cycle + 1.
 +        cycles = uint32_t(issueOf[n - 1u] + 1);
 +        return n;
 +    }
@@ -1468,7 +1699,8 @@ index 0000000..540f8c4
 +    }
 +
 +    inline const Block *buildBlock(CodeBuffer &buf, BlockStore &store, uint64_t generation,
-+                                   uint32_t startPc, const PairInfo *pairs, uint32_t avail)
++                                   uint32_t startPc, uint32_t pcMask,
++                                   const PairInfo *pairs, uint32_t avail)
 +    {
 +        if (store.generation != generation)
 +            store.invalidate(generation);
@@ -1494,8 +1726,12 @@ index 0000000..540f8c4
 +        uint8_t tailViBackupReg = 0;
 +        static int32_t issueOf[kMaxBlockPairs];
 +        uint32_t cycles = 0;
-+        const uint32_t n = planBlock(pairs, avail, ups, los, b.ready, readyCount,
-+                                     touchesVuMem, tailViBackupReg, &b, issueOf, cycles);
++        BranchPlan branch;
++        uint8_t branchBackupReg = 0;
++        bool endsWithBranch = false;
++        const uint32_t n = planBlock(pairs, avail, startPc, pcMask, ups, los, b.ready, readyCount,
++                                     touchesVuMem, tailViBackupReg, &b, issueOf, cycles,
++                                     &branch, branchBackupReg, endsWithBranch);
 +
 +        // A 1-pair block cannot pay for the call, and the interpreter already handles it well.
 +        if (n >= 2u && buf.room() > 1024u * (n + 1u))
@@ -1505,7 +1741,24 @@ index 0000000..540f8c4
 +            e.end = buf.base + buf.capacity;
 +            uint8_t *const start = e.p;
 +            for (uint32_t j = 0; j < n; ++j)
++            {
++                // Stash the pre-write VI value for the branch-delay hazard, before the pair that
++                // overwrites it (see planBlock).
++                // The pair that OVERWRITES the branch's operand sits two before the end
++                // (branch is n-2, delay slot n-1), so the stash goes before pair n-3.
++                if (endsWithBranch && branchBackupReg != 0u && j + 3u == n)
++                    emitBranchBackupStash(e, branchBackupReg);
++                if (endsWithBranch && j + 1u == n - 1u)
++                {
++                    // the branch pair: upper only, then the target selection into ECX
++                    emitPairInto(e, buf, pairs[j], ups[j], los[j]);
++                    emitBranch(e, branch, pcMask, branchBackupReg, branchBackupReg != 0u);
++                    continue;
++                }
 +                emitPairInto(e, buf, pairs[j], ups[j], los[j]);
++            }
++            if (endsWithBranch)
++                emitBranchCommit(e); // m_state.pc = ECX, after the delay slot has run
 +            e.ret();
 +            if (!e.overflow)
 +            {
@@ -1516,6 +1769,7 @@ index 0000000..540f8c4
 +                b.readyCount = readyCount;
 +                b.touchesVuMem = touchesVuMem;
 +                b.tailViBackupReg = tailViBackupReg;
++                b.endsWithBranch = endsWithBranch;
 +                ++store.compiled;
 +            }
 +        }
