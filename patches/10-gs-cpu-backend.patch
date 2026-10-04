@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..4a5f962 100644
+index 9c39ae2..d8217fa 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -9,10 +9,26 @@
@@ -29,7 +29,7 @@ index 9c39ae2..4a5f962 100644
  
  using namespace GSInternal;
  
-@@ -468,12 +484,898 @@ namespace
+@@ -468,12 +484,1118 @@ namespace
      }
  }
  
@@ -462,12 +462,29 @@ index 9c39ae2..4a5f962 100644
 +// Called from DrawPrimitive. `vram` is the live VRAM at the moment the first batch is recorded.
 +void GSCpuBackend::rasterCapRecord(const GSPrimitiveBatch &batch)
 +{
-+    if (g_capDone || s_rasterCapAfter == 0ull || m_vram == nullptr)
++    // ★★ cont.230: PS2X_GS_RASTERCAP_TRIGGER=<path> arms the capture when that FILE APPEARS
++    // instead of at a guessed primitive count. An artifact you have to catch by eye cannot be
++    // pinned to a prim number in advance -- the player sees it, touches the file, and the very
++    // next primitives are recorded. Setting the trigger makes PS2X_GS_RASTERCAP a floor only.
++    static const char *const s_capTrigger = std::getenv("PS2X_GS_RASTERCAP_TRIGGER");
++    if (g_capDone || m_vram == nullptr)
++        return;
++    if (s_capTrigger == nullptr && s_rasterCapAfter == 0ull)
 +        return;
 +    if (!g_capArmed)
 +    {
 +        if (g_perfCpuPrims < s_rasterCapAfter)
 +            return;
++        if (s_capTrigger != nullptr)
++        {
++            // stat() at most once per 512 primitives -- this runs on the draw path.
++            static unsigned long s_poll = 0;
++            if ((++s_poll & 511ul) != 0ul)
++                return;
++            if (::access(s_capTrigger, F_OK) != 0)
++                return;
++            std::fprintf(stderr, "[gs2:rastercap] TRIGGER seen (%s)\n", s_capTrigger);
++        }
 +        // Snapshot VRAM BEFORE the first recorded batch draws into it, so the replay starts from
 +        // exactly the state this stream expects.
 +        g_capVram.assign(m_vram, m_vram + m_vramSize);
@@ -540,6 +557,181 @@ index 9c39ae2..4a5f962 100644
 +// forces the band fan-out off exactly as PS2X_GS_CENSUS2 does.
 +static const bool s_gsTriCensus = []
 +{ const char *e = std::getenv("PS2X_GS_TRICENSUS"); return e && e[0] && e[0] != '0'; }();
++// ---- Degenerate-geometry census (PS2X_GS_GEOCENSUS, default OFF; cont.230) -----------------
++// Is the geometry ALREADY WRONG when it reaches the GS? The rasterizer is the least likely source
++// of the on-screen streaks -- the GPU-mirror arc shadow-verified the whole pixel pipeline against
++// this oracle (0 divergent words over 199,673 range compares) and every cont.227-229 change is
++// hash-identical -- so this counts what the VU/VIF path actually HANDS us. A triangle crossing the
++// near plane without being clipped projects to enormous screen coordinates and rasterises as a
++// long streak across the frame, which is exactly the artifact class being chased.
++static const bool s_gsGeoCensus = []
++{ const char *e = std::getenv("PS2X_GS_GEOCENSUS"); return e && e[0] && e[0] != '0'; }();
++// ---- Big-primitive detector (PS2X_GS_BIGPRIM=<percent>, default OFF; cont.230) -------------
++// The user's screenshots show large flat DARK wedges extruded from character silhouettes and thin
++// geometry, and frames where the whole scene goes black while the HUD stays perfect. That is the
++// shape of a shadow/volume pass being drawn VISIBLY instead of only masking. Rather than guess
++// which state makes it invisible on hardware (DATE, FBMSK and the blend equation are all already
++// implemented), make the offending primitive report ITSELF: log the complete draw state of any
++// primitive covering more than <percent> of the scissor.
++static const int s_gsBigPrim = []
++{ const char *e = std::getenv("PS2X_GS_BIGPRIM"); return e ? std::atoi(e) : 0; }();
++// PS2X_GS_DROPBIG=<percent> (default 0 = OFF) -- DIAGNOSTIC ABLATION, never a fix. Skips
++// untextured, alpha-blended, near-black primitives covering >= <percent> of the scissor. If the
++// blacked-out frames come back with the scene visible, that identifies the culprit draw exactly
++// instead of arguing about it.
++static const int s_gsDropBig = []
++{ const char *e = std::getenv("PS2X_GS_DROPBIG"); return e ? std::atoi(e) : 0; }();
++
++namespace
++{
++    unsigned long long g_bigPrimHits = 0;
++    void gs2BigPrimReport(const char *kind, const GSDrawState &state,
++                          int minX, int maxX, int minY, int maxY,
++                          unsigned r, unsigned g, unsigned b, unsigned a,
++                          const uint32_t *clut, bool clutValid,
++                          double zv0, double zv1, double zv2)
++    {
++        const auto &ctx = state.context;
++        const double sw = std::max(1.0, (double)ctx.scissor.x1 - (double)ctx.scissor.x0);
++        const double sh = std::max(1.0, (double)ctx.scissor.y1 - (double)ctx.scissor.y0);
++        const double cover = 100.0 * (((double)maxX - minX) * ((double)maxY - minY)) / (sw * sh);
++        if (cover < (double)s_gsBigPrim)
++            return;
++        // ★ Dedupe by draw state + target, otherwise one repeated effect floods the log and hides
++        // every other big draw (the first pass reported the same 512x512 render-to-texture 40
++        // times). "Identify before you fix": a big primitive into an OFF-SCREEN target is not
++        // what the player sees.
++        {
++            // ★ Dedupe REPORTS but keep COUNTS: a state that draws once during a scripted
++            // fade and a state that draws every frame look identical in a deduped list, and
++            // that difference is the whole question here.
++            static std::vector<std::pair<uint64_t, unsigned long long>> tally;
++            static unsigned long long calls = 0;
++            uint64_t k = (uint64_t)ctx.frame.fbp * 1000003ull;
++            k ^= (uint64_t)ctx.frame.fbmsk * 31ull;
++            k ^= (uint64_t)ctx.alpha * 131ull;
++            k ^= (uint64_t)ctx.test * 17ull;
++            k ^= (uint64_t)ctx.tex0.psm * 7919ull;
++            k ^= (uint64_t)ctx.scissor.x1 * 65537ull;
++            k ^= (uint64_t)ctx.scissor.y1 * 257ull;
++            k ^= (uint64_t)(state.prim.abe ? 2u : 0u) | (state.prim.tme ? 1u : 0u);
++            bool known = false;
++            for (auto &e : tally)
++                if (e.first == k) { ++e.second; known = true; break; }
++            if (!known && tally.size() < 64u)
++                tally.push_back({k, 1ull});
++            if ((++calls % 20000ull) == 0ull)
++            {
++                std::fprintf(stderr, "[gs2:bigtally] bigDraws=%llu distinctStates=%zu counts:",
++                             calls, tally.size());
++                for (auto &e : tally)
++                    std::fprintf(stderr, " %llu", e.second);
++                std::fprintf(stderr, "\n");
++            }
++            if (known) return;
++        }
++        ++g_bigPrimHits;
++        std::fprintf(stderr,
++                     "[gs2:bigprim] #%llu %s cover=%.1f%% bbox=[%d,%d]x[%d,%d]"
++                     " fbp=%u fbw=%u scis=[%u,%u]x[%u,%u] | tme=%u abe=%u"
++                     " iip=%u fst=%u | rgba=(%u,%u,%u,%u) | fbmsk=%08x fpsm=0x%x zmsk=%u"
++                     " zpsm=0x%x | test=%016llx alpha=%016llx | tex0psm=0x%x tfx=%u tcc=%u"
++                     " | fba=%llu pabe=%u | z=(%.0f,%.0f,%.0f)\n",
++                     g_bigPrimHits, kind, cover, minX, maxX, minY, maxY,
++                     ctx.frame.fbp, ctx.frame.fbw,
++                     ctx.scissor.x0, ctx.scissor.x1, ctx.scissor.y0, ctx.scissor.y1,
++                     state.prim.tme ? 1u : 0u, state.prim.abe ? 1u : 0u,
++                     state.prim.iip ? 1u : 0u, state.prim.fst ? 1u : 0u,
++                     r, g, b, a, ctx.frame.fbmsk, ctx.frame.psm, ctx.zbuf.zmask ? 1u : 0u,
++                     ctx.zbuf.psm,
++                     (unsigned long long)ctx.test, (unsigned long long)ctx.alpha,
++                     ctx.tex0.psm, ctx.tex0.tfx, ctx.tex0.tcc,
++                     (unsigned long long)ctx.fba, state.pabe ? 1u : 0u,
++                     (double)zv0, (double)zv1, (double)zv2);
++        // ★★ cont.230: the decoded palette. With tfx=MODULATE and tcc=1 the fragment alpha is
++        // (texAlpha * vertexAlpha) >> 7, and this draw's vertex alpha is 128 (= 1.0 on PS2), so
++        // the quad's opacity IS the CLUT alpha. Print it so "the alpha is wrong" stops being a
++        // hypothesis. PS2 alpha is 0-128 nominal (0x80 = fully opaque); anything above 0x80 is an
++        // over-range value, which is exactly the class of bug that would turn a faint haze opaque.
++        if (clutValid && clut != nullptr)
++        {
++            std::fprintf(stderr, "[gs2:bigprim]    cbp=%u cpsm=0x%x csa=%u csm=%u palette:",
++                         ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csa, ctx.tex0.csm);
++            for (int i = 0; i < 16; ++i)
++                std::fprintf(stderr, " %02x:%08x", i, clut[i]);
++            std::fprintf(stderr, "\n");
++            unsigned aMin = 255, aMax = 0, aOver = 0;
++            for (int i = 0; i < 16; ++i)
++            {
++                const unsigned av = (clut[i] >> 24) & 0xFFu;
++                aMin = std::min(aMin, av);
++                aMax = std::max(aMax, av);
++                if (av > 0x80u) ++aOver;
++            }
++            std::fprintf(stderr,
++                         "[gs2:bigprim]    palette alpha: min=%u max=%u over0x80=%u\n",
++                         aMin, aMax, aOver);
++        }
++    }
++}
++
++namespace
++{
++    struct Gs2GeoCensus
++    {
++        unsigned long long tris = 0;
++        unsigned long long nonFinite = 0;      // any NaN/Inf vertex coordinate
++        unsigned long long magBucket[5] = {};  // max(|x|,|y|): <1k, <10k, <100k, <1e6, >=1e6
++        unsigned long long overScissor2 = 0;   // unclipped bbox > 2x the scissor extent
++        unsigned long long overScissor8 = 0;
++        unsigned long long overScissor64 = 0;  // streak candidates
++        unsigned long long thin = 0;           // aspect >= 64:1 and long side > 256 px
++        unsigned long long tinyQ = 0;          // non-FST prim with |q| < 1e-3 on a vertex
++        unsigned long long dumped = 0;
++        double worstMag = 0.0;
++        // ★★ cont.230: vertex-COLOUR distribution. With TFX=MODULATE the fragment is
++        // (texel * vertex) >> 7, so the vertex colour IS the lighting -- and a light texture
++        // rendering near-black means dark vertex colours, not a texture problem. Positions were
++        // censused; colours never were, and they come from the same VU1 program.
++        unsigned long long lumBucket[8] = {};
++        double lumSum = 0.0;
++        unsigned long long lumN = 0;
++    };
++    Gs2GeoCensus g_geoCensus;
++
++    void gs2GeoCensusDump(const char *where)
++    {
++        if (!s_gsGeoCensus)
++            return;
++        const Gs2GeoCensus &c = g_geoCensus;
++        const double t = c.tris ? static_cast<double>(c.tris) : 1.0;
++        std::fprintf(stderr,
++                     "[gs2:geocensus/%s] tris=%llu nonFinite=%llu tinyQ=%llu(%.3f%%) worstMag=%.4g\n",
++                     where, c.tris, c.nonFinite, c.tinyQ, 100.0 * static_cast<double>(c.tinyQ) / t,
++                     c.worstMag);
++        std::fprintf(stderr,
++                     "[gs2:geocensus/%s] maxCoord <1k=%.3f%% <10k=%.4f%% <100k=%.4f%% <1e6=%.4f%%"
++                     " >=1e6=%.4f%%\n", where,
++                     100.0 * static_cast<double>(c.magBucket[0]) / t,
++                     100.0 * static_cast<double>(c.magBucket[1]) / t,
++                     100.0 * static_cast<double>(c.magBucket[2]) / t,
++                     100.0 * static_cast<double>(c.magBucket[3]) / t,
++                     100.0 * static_cast<double>(c.magBucket[4]) / t);
++        std::fprintf(stderr,
++                     "[gs2:geocensus/%s] overScissor 2x=%.4f%% 8x=%.4f%% 64x=%.4f%% | thin=%.4f%%\n",
++                     where,
++                     100.0 * static_cast<double>(c.overScissor2) / t,
++                     100.0 * static_cast<double>(c.overScissor8) / t,
++                     100.0 * static_cast<double>(c.overScissor64) / t,
++                     100.0 * static_cast<double>(c.thin) / t);
++        const double ln = c.lumN ? (double)c.lumN : 1.0;
++        std::fprintf(stderr, "[gs2:geocensus/%s] vertexLum mean=%.1f | buckets(0-31,..,224+):",
++                     where, c.lumSum / ln);
++        for (int i = 0; i < 8; ++i)
++            std::fprintf(stderr, " %.1f%%", 100.0 * (double)c.lumBucket[i] / ln);
++        std::fprintf(stderr, "\n");
++    }
++}
 +// ★★★ cont.229 ANALYTIC ROW SPAN (PS2X_GS_FASTTRI, default ON, "=0" restores the full-bbox walk).
 +// The census above measured 85.45% of all edge tests as pure waste: 42.79% of scanlines cover
 +// NOTHING, and lead+trail waste is another 48.6%. The textbook fix -- incremental DDA edge
@@ -877,6 +1069,33 @@ index 9c39ae2..4a5f962 100644
 +        std::fprintf(stderr, "[gs2:rasterbench] rep %u: %.2f ms  vramHash=%016llx\n",
 +                     rep, ms, static_cast<unsigned long long>(hash));
 +    }
++    // ★★ cont.230: PS2X_GS_RASTERBENCH_PPM=<prefix> decodes the replayed framebuffers to images.
++    // The capture replays deterministically, so this is the artifact frozen in a file -- which is
++    // what makes a bisect possible at all. Uses the engine's own verified CT32 addressing rather
++    // than re-deriving the swizzle.
++    if (const char *pp = std::getenv("PS2X_GS_RASTERBENCH_PPM"))
++    {
++        for (uint32_t fbpPage : {0u, 128u, 384u})
++        {
++            char path[600];
++            std::snprintf(path, sizeof(path), "%s_fbp%u.ppm", pp, fbpPage);
++            std::FILE *g = std::fopen(path, "wb");
++            if (g == nullptr)
++                continue;
++            const uint32_t blk = GSInternal::framePageBaseToBlock(fbpPage);
++            std::fprintf(g, "P6\n512 512\n255\n");
++            for (uint32_t yy = 0; yy < 512u; ++yy)
++                for (uint32_t xx = 0; xx < 512u; ++xx)
++                {
++                    const uint32_t px = GSMem::ReadCT32(vram.data(), blk, 8u, xx, yy);
++                    std::fputc(px & 0xFFu, g);
++                    std::fputc((px >> 8) & 0xFFu, g);
++                    std::fputc((px >> 16) & 0xFFu, g);
++                }
++            std::fclose(g);
++            std::fprintf(stderr, "[gs2:rasterbench] wrote %s\n", path);
++        }
++    }
 +    if (const char *vo = std::getenv("PS2X_GS_RASTERBENCH_VRAMOUT"))
 +    {
 +        std::FILE *g = std::fopen(vo, "wb");
@@ -894,6 +1113,7 @@ index 9c39ae2..4a5f962 100644
 +    gs2ClutVerifyDump("bench");
 +    gs2TriCensusDump("bench");
 +    gs2SpanVerifyDump("bench");
++    gs2GeoCensusDump("bench");
 +}
 +
 +
@@ -928,7 +1148,7 @@ index 9c39ae2..4a5f962 100644
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +1433,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +1653,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -945,7 +1165,7 @@ index 9c39ae2..4a5f962 100644
              break;
          }
      }
-@@ -541,30 +1449,59 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,30 +1669,59 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -1005,7 +1225,7 @@ index 9c39ae2..4a5f962 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +1510,136 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,22 +1730,136 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -1147,7 +1367,7 @@ index 9c39ae2..4a5f962 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -602,43 +1653,2694 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+@@ -602,43 +1873,2705 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
  
  void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
  {
@@ -1159,6 +1379,11 @@ index 9c39ae2..4a5f962 100644
 +    if (s_gsGpuBatchVerify > 0 && !m_gpuBatch.prims.empty())
 +    { ++g_bvFlushExplicit; gpuBatchFlush(); }
      WriteVramUnlocked(psm, base, bw, x, y, value);
+-}
+-
+-void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+-{
+-    if (!m_vram)
 +#if PS2X_HAS_GS_GPU_DEVICE
 +    // Host-side pokes (LOTR's movie frame blit, the CLUT guard, font diagnostics) mutate
 +    // VRAM outside every transfer path -- mirror them too, or the mirror drifts. They
@@ -1210,29 +1435,24 @@ index 9c39ae2..4a5f962 100644
 +            mirrorFlushPokeSlot(slot);
 +    }
 +#endif
- }
- 
- void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
- {
++}
++
++void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
 +    g_gs2VramGen.fetch_add(1, std::memory_order_relaxed); // cont.227b: invalidate cached CLUTs
-     if (!m_vram)
-         return;
-     m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
- }
- 
--void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
++    if (!m_vram)
++        return;
++    m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
++}
++
 +#if PS2X_HAS_GS_GPU_DEVICE
 +namespace
- {
--    std::lock_guard<std::mutex> lock(m_mutex);
--    if (!m_vram || m_vramSize == 0u)
++{
 +    // Page extent in PIXELS per psm -- the same table PixelStorageTraits<>::PageExtent()
 +    // encodes (ps2_gs_memory.h). Undefined psm codes fall through to the CT32 layout,
 +    // matching the psm-handler table's undefined-slot fallback (PCSX2 GSLocalMemory.cpp).
 +    void gs2PageExtent(uint32_t psm, uint32_t &pw, uint32_t &ph)
-     {
--        out.clear();
--        return;
++    {
 +        switch (psm)
 +        {
 +        case GS_PSM_CT16:
@@ -2630,7 +2850,12 @@ index 9c39ae2..4a5f962 100644
 +        uint32_t lastTbp0 = 0, lastPsm = 0, lastTw = 0, lastTh = 0, lastTfx = 0, lastFbp = 0;
 +    } g_gs2Draw;
 +
-+static bool g_gs2EraOpen = false;
++// ★ cont.230 instrument fix: the documented contract is "without PS2X_GS_ERA_FILE the gate is
++// always open", but this started false and was only ever opened inside the PS2X_GS_CENSUS2 block
++// -- so every era-gated dump (PS2X_GS_PRESENT_SAVE, VRAMDUMP) silently required CENSUS2, which
++// forces the band pool off and makes the game too slow to reach the level era at all. Default it
++// open unless an era file was actually requested.
++static bool g_gs2EraOpen = (std::getenv("PS2X_GS_ERA_FILE") == nullptr);
 +static unsigned long g_gs2EraOpenDraw = 0;
 +static bool g_gs2DegenReset = false;
 +
@@ -3317,12 +3542,13 @@ index 9c39ae2..4a5f962 100644
 +void GSCpuBackend::RasterRunFanOut(const GSPrimitiveBatch *items, size_t count)
 +{
 +    if (count == 0)
-+        return;
+         return;
+-    m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
 +    // ★ Never fan out for the diagnostic paths: the per-pixel FONTTRACE counters and the CENSUS2
 +    // cyan probes are plain non-atomic statics, and the raster-verify bisect swaps m_vram around
 +    // the call. RasterFanOut has carried this guard since cont.207; the RUN path needs it too,
 +    // and it matters more now that the pool is on by default (cont.210). All are default OFF.
-+    if (m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus || s_gsTriCensus)
++    if (m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus || s_gsTriCensus || s_gsGeoCensus || s_gsBigPrim > 0)
 +    {
 +        for (size_t i = 0; i < count; ++i)
 +            if (items[i].vertexCount != 0u)
@@ -3440,13 +3666,17 @@ index 9c39ae2..4a5f962 100644
 +        m_bandRunItems = nullptr;
 +        m_bandRunCount = 0;
 +    }
-+}
-+
+ }
+ 
+-void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 +void GSCpuBackend::RasterBand(const GSPrimitiveBatch &batch, int bandY0, int bandY1)
-+{
+ {
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    if (!m_vram || m_vramSize == 0u)
 +    resolveDraw(batch.state);
 +    switch (batch.state.prim.type)
-+    {
+     {
+-        out.clear();
 +    case GS_PRIM_SPRITE:
 +        DrawSprite(batch, bandY0, bandY1);
 +        break;
@@ -3533,26 +3763,35 @@ index 9c39ae2..4a5f962 100644
 +void GSCpuBackend::stopBandPool()
 +{
 +    if (m_bandThreads.empty())
-+        return;
+         return;
 +    {
 +        std::lock_guard<std::mutex> lk(m_bandMutex);
 +        m_bandStop = true;
-+    }
+     }
+-    out.resize(m_vramSize);
+-    std::memcpy(out.data(), m_vram, m_vramSize);
 +    m_bandStartCv.notify_all();
 +    for (auto &t : m_bandThreads)
 +        if (t.joinable())
 +            t.join();
 +    m_bandThreads.clear();
-+}
-+
+ }
+ 
+-GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
 +void GSCpuBackend::RasterFanOut(const GSPrimitiveBatch &batch, int minY, int maxY)
-+{
+ {
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    GSTransferSnapshot result = m_transferState;
+-    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
+-                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
+-                                         : 0u;
+-    return result;
 +    const int rows = maxY - minY + 1;
 +    // ★ Never fan out for the diagnostic paths: the per-pixel FONTTRACE counters and the CENSUS2
 +    // cyan probes are plain non-atomic statics, and the raster-verify bisect swaps m_vram around
 +    // the call. All are default OFF, so this costs nothing in a normal run.
 +    const long long approxPix = static_cast<long long>(rows) * gs2BandWidth(batch);
-+    if (m_bandThreads.empty() || m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus || s_gsTriCensus ||
++    if (m_bandThreads.empty() || m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus || s_gsTriCensus || s_gsGeoCensus || s_gsBigPrim > 0 ||
 +        approxPix < s_gsBandMinPix || rows < static_cast<int>(m_bandCount))
 +    {
 +        ++m_bandDirect;
@@ -3584,12 +3823,12 @@ index 9c39ae2..4a5f962 100644
 +        m_bandDoneCv.wait(lk, [&] { return m_bandPending == 0u; });
 +        m_bandBatch = nullptr;
 +    }
-+}
-+
-+void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
-+{
-+    const GSDrawState &state = batch.state;
-+    const auto &ctx = state.context;
+ }
+ 
+ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
 +    if (!m_rawDraw)
 +        rasterCapRecord(batch);
 +    if (s_gsStateCensus)
@@ -3661,6 +3900,12 @@ index 9c39ae2..4a5f962 100644
 +        static unsigned long s_spanVerifyDraws = 0;
 +        if ((++s_spanVerifyDraws % 200000ul) == 0ul)
 +            gs2SpanVerifyDump("game");
++    }
++    if (s_gsGeoCensus)
++    {
++        static unsigned long s_geoCensusDraws = 0;
++        if ((++s_geoCensusDraws % 500000ul) == 0ul)
++            gs2GeoCensusDump("game");
 +    }
 +    if (s_gsCensus2)
 +    {
@@ -3843,32 +4088,17 @@ index 9c39ae2..4a5f962 100644
 +                         g_gs2Draw.lastTfx, g_gs2Draw.lastFbp);
 +            gs2PrintXfer(); // same cadence, so the transfer state is era-resolvable
 +        }
-     }
--    out.resize(m_vramSize);
--    std::memcpy(out.data(), m_vram, m_vramSize);
--}
--
--GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
--{
--    std::lock_guard<std::mutex> lock(m_mutex);
--    GSTransferSnapshot result = m_transferState;
--    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
--                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
--                                         : 0u;
--    return result;
--}
--
--void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
--{
--    const GSDrawState &state = batch.state;
--    const auto &ctx = state.context;
++    }
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,34 +4447,191 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -743,36 +4676,193 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+                       << " alpha=0x" << ctx.alpha
+                       << std::dec << std::endl;
          }
-     });
- 
+-    });
++    });
++
 +    // Per-batch resolved draw state (cont.158c perf): batch.state is immutable for the
 +    // batch, so resolve the psm-table function pointers and block bases ONCE here instead
 +    // of per pixel in WritePixel/SampleTexture. No VRAM = every read 0 / write no-op, so
@@ -3974,7 +4204,7 @@ index 9c39ae2..4a5f962 100644
 +            rasterVerifyBegin(batch, rvCtx);
 +    }
 +#endif
-+
+ 
 +    const bool perfCount = s_gsGpuBatchPerf || s_gsNoRaster || s_gsThruput;
 +    const auto cpuT0 = perfCount ? std::chrono::steady_clock::now()
 +                                 : std::chrono::steady_clock::time_point{};
@@ -4065,7 +4295,7 @@ index 9c39ae2..4a5f962 100644
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
  {
      const auto &ctx = state.context;
-@@ -792,11 +4651,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +4882,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -4080,7 +4310,7 @@ index 9c39ae2..4a5f962 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -813,11 +4671,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -813,11 +4902,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      // TODO: only one address lookup for rmw
      const bool frmw = destinationAlphaTestNeedsRead || (writeMask.writesFramebuffer() && ((ctx.frame.fbmsk != 0) || alphaBlendEnabled || preserveDestinationAlpha));
  
@@ -4107,7 +4337,7 @@ index 9c39ae2..4a5f962 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +4719,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +4950,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -4135,7 +4365,7 @@ index 9c39ae2..4a5f962 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +4816,45 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +5047,45 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -4183,7 +4413,7 @@ index 9c39ae2..4a5f962 100644
      }
  }
  
-@@ -947,15 +4866,60 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +5097,60 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -4248,7 +4478,7 @@ index 9c39ae2..4a5f962 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,32 +4933,90 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,32 +5164,90 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -4353,7 +4583,7 @@ index 9c39ae2..4a5f962 100644
      }
  
      auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
-@@ -1002,7 +5024,29 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +5255,29 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -4384,7 +4614,7 @@ index 9c39ae2..4a5f962 100644
  
          switch (tex.psm)
          {
-@@ -1021,10 +5065,37 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1021,10 +5296,37 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          case GS_PSM_T4:
          case GS_PSM_T4HL:
          case GS_PSM_T4HH:
@@ -4423,7 +4653,7 @@ index 9c39ae2..4a5f962 100644
      };
  
      if (!state.linearFilter)
-@@ -1073,7 +5144,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1073,7 +5375,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
             (static_cast<uint32_t>(a) << 24);
  }
  
@@ -4432,7 +4662,7 @@ index 9c39ae2..4a5f962 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1110,6 +5181,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1110,6 +5412,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
      const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
      const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
      const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
@@ -4443,7 +4673,7 @@ index 9c39ae2..4a5f962 100644
  
      const uint64_t alphaReg = ctx.alpha;
      const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
-@@ -1148,8 +5223,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1148,8 +5454,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
          if (spriteH < 1.0f)
              spriteH = 1.0f;
  
@@ -4456,7 +4686,7 @@ index 9c39ae2..4a5f962 100644
              float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
              float texVf = v0f + (v1f - v0f) * ty;
  
-@@ -1183,13 +5261,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1183,13 +5492,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
      }
      else
      {
@@ -4477,7 +4707,101 @@ index 9c39ae2..4a5f962 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1225,11 +5308,144 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1212,11 +5526,93 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
+     int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
+ 
++    if (s_gsGeoCensus)
++    {
++        Gs2GeoCensus &g = g_geoCensus;
++        ++g.tris;
++        const bool finite = std::isfinite(fx0) && std::isfinite(fy0) && std::isfinite(fx1) &&
++                            std::isfinite(fy1) && std::isfinite(fx2) && std::isfinite(fy2);
++        if (!finite)
++            ++g.nonFinite;
++        else
++        {
++            const double mag = std::max({std::fabs((double)fx0), std::fabs((double)fy0),
++                                         std::fabs((double)fx1), std::fabs((double)fy1),
++                                         std::fabs((double)fx2), std::fabs((double)fy2)});
++            if (mag > g.worstMag) g.worstMag = mag;
++            ++g.magBucket[mag < 1e3 ? 0 : mag < 1e4 ? 1 : mag < 1e5 ? 2 : mag < 1e6 ? 3 : 4];
++            // Unclipped extent vs the scissor: an unclipped near-plane crossing shows up here as
++            // a bbox many times the size of the screen.
++            const double bw = (double)maxX - (double)minX;
++            const double bh = (double)maxY - (double)minY;
++            const double sw = std::max(1.0, (double)ctx.scissor.x1 - (double)ctx.scissor.x0);
++            const double sh = std::max(1.0, (double)ctx.scissor.y1 - (double)ctx.scissor.y0);
++            const double ratio = std::max(bw / sw, bh / sh);
++            if (ratio > 2.0) ++g.overScissor2;
++            if (ratio > 8.0) ++g.overScissor8;
++            if (ratio > 64.0) ++g.overScissor64;
++            const double lo = std::min(bw, bh), hi = std::max(bw, bh);
++            if (hi > 256.0 && lo > 0.0 && hi / lo >= 64.0) ++g.thin;
++            {
++                const double l0 = ((double)v0.r + v0.g + v0.b) / 3.0;
++                const double l1 = ((double)v1.r + v1.g + v1.b) / 3.0;
++                const double l2 = ((double)v2.r + v2.g + v2.b) / 3.0;
++                const double lm = (l0 + l1 + l2) / 3.0;
++                g.lumSum += lm;
++                ++g.lumN;
++                int lb = (int)(lm / 32.0);
++                if (lb < 0) lb = 0;
++                if (lb > 7) lb = 7;
++                ++g.lumBucket[lb];
++            }
++            if (!state.prim.fst && state.prim.tme)
++            {
++                const double qm = std::min({std::fabs((double)v0.q), std::fabs((double)v1.q),
++                                            std::fabs((double)v2.q)});
++                if (qm < 1e-3) ++g.tinyQ;
++            }
++            if (ratio > 8.0 && g.dumped < 12ull)
++            {
++                ++g.dumped;
++                std::fprintf(stderr,
++                             "[gs2:geo] #%llu ratio=%.1f mag=%.4g bbox=[%d,%d]x[%d,%d]"
++                             " scis=[%u,%u]x[%u,%u] tme=%u fst=%u iip=%u |"
++                             " v0=(%.2f,%.2f,q=%.4g) v1=(%.2f,%.2f,q=%.4g) v2=(%.2f,%.2f,q=%.4g)\n",
++                             g.dumped, ratio, mag, minX, maxX, minY, maxY,
++                             ctx.scissor.x0, ctx.scissor.x1, ctx.scissor.y0, ctx.scissor.y1,
++                             state.prim.tme ? 1u : 0u, state.prim.fst ? 1u : 0u,
++                             state.prim.iip ? 1u : 0u,
++                             fx0, fy0, (double)v0.q, fx1, fy1, (double)v1.q,
++                             fx2, fy2, (double)v2.q);
++            }
++        }
++    }
++
+     minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
+     maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
+     minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
+     maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
+ 
++    if (s_gsBigPrim > 0)
++        gs2BigPrimReport("TRI", state, minX, maxX, minY, maxY, v2.r, v2.g, v2.b, v2.a,
++                         m_draw.clut, m_draw.clutValid,
++                         (double)v0.z, (double)v1.z, (double)v2.z);
++
++    if (s_gsDropBig > 0 && !state.prim.tme && state.prim.abe &&
++        v2.r < 16u && v2.g < 16u && v2.b < 16u)
++    {
++        const double sw = std::max(1.0, (double)ctx.scissor.x1 - (double)ctx.scissor.x0);
++        const double sh = std::max(1.0, (double)ctx.scissor.y1 - (double)ctx.scissor.y0);
++        const double cov = 100.0 * (((double)maxX - minX) * ((double)maxY - minY)) / (sw * sh);
++        if (cov >= (double)s_gsDropBig)
++        {
++            static unsigned long long dropped = 0;
++            if ((++dropped & 4095ull) == 1ull)
++                std::fprintf(stderr, "[gs2:dropbig] dropped=%llu (cover=%.1f%%)\n", dropped, cov);
++            return;
++        }
++    }
++
+     float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+     if (std::fabs(denom) < 0.001f)
+         return;
+@@ -1225,11 +5621,144 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -4611,19 +4935,19 @@ index 9c39ae2..4a5f962 100644
 +        }
 +
 +        if (s_gsTriCensus)
-+        {
+         {
 +            ++g_triCensus.rows;
 +            g_triCensus.bboxW += static_cast<unsigned>(maxX - minX + 1);
 +            g_triCensus.walked += static_cast<unsigned>(walkX1 >= walkX0 ? walkX1 - walkX0 + 1 : 0);
 +        }
 +        for (int x = walkX0; x <= walkX1; ++x)
-         {
++        {
 +            if (s_gsTriCensus)
 +                ++g_triCensus.tested;
              float px = static_cast<float>(x) + 0.5f;
  
              float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-@@ -1239,6 +5455,25 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1239,6 +5768,25 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
              if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
                  continue;
  
@@ -4649,7 +4973,7 @@ index 9c39ae2..4a5f962 100644
              double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
  
              uint8_t r, g, b, a;
-@@ -1281,7 +5516,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +5829,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -4658,7 +4982,7 @@ index 9c39ae2..4a5f962 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,15 +5534,54 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,15 +5847,54 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -4714,7 +5038,7 @@ index 9c39ae2..4a5f962 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1354,7 +5628,10 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1354,7 +5941,10 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
          double z = (v0.z + (v1.z - v0.z) * t);
          const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
@@ -4726,7 +5050,7 @@ index 9c39ae2..4a5f962 100644
  
          if (x0 == x1 && y0 == y1)
              break;
-@@ -1376,7 +5653,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +5966,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -4747,7 +5071,7 @@ index 9c39ae2..4a5f962 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +5675,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +5988,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -4769,7 +5093,7 @@ index 9c39ae2..4a5f962 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,9 +5698,31 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,9 +6011,31 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -4801,7 +5125,7 @@ index 9c39ae2..4a5f962 100644
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
          return;
  
-@@ -1406,6 +5733,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +6046,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -4953,7 +5277,7 @@ index 9c39ae2..4a5f962 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1496,12 +5968,49 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1496,12 +6281,49 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
              return;
          }
      }
@@ -5003,7 +5327,7 @@ index 9c39ae2..4a5f962 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1536,6 +6045,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1536,6 +6358,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  
      m_transferState.copiedPixels = total;
      m_transferState.direction = 3u;
@@ -5026,7 +5350,7 @@ index 9c39ae2..4a5f962 100644
  }
  
  void GSCpuBackend::PerformLocalToHostTransfer()
-@@ -1610,6 +6135,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +6448,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -5034,7 +5358,7 @@ index 9c39ae2..4a5f962 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,9 +6148,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,9 +6461,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -5050,7 +5374,7 @@ index 9c39ae2..4a5f962 100644
  
      const uint32_t x0 = context.scissor.x0;
      const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
-@@ -1656,6 +6188,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1656,6 +6501,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -5061,7 +5385,7 @@ index 9c39ae2..4a5f962 100644
          return true;
      }
  
-@@ -1674,11 +6210,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1674,11 +6523,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -5143,7 +5467,7 @@ index 9c39ae2..4a5f962 100644
  bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         uint32_t width,
                                         uint32_t height,
-@@ -1688,6 +6294,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1688,6 +6607,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         bool frameBaseIsPages,
                                         uint32_t sourceOriginX,
                                         uint32_t sourceOriginY) const
@@ -5190,7 +5514,7 @@ index 9c39ae2..4a5f962 100644
  {
      if (!m_vram || m_vramSize == 0u)
          return false;
-@@ -1759,16 +6405,66 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +6718,86 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -5235,6 +5559,26 @@ index 9c39ae2..4a5f962 100644
 +    {
 +        SnapshotVramNoDrain(snapshot);
 +    }
++
++    // ★★ cont.230: how often does the presenter fall back to LIVE, possibly mid-draw VRAM?
++    // The frame-complete snapshot above is used only while it is <= 500 ms old, but a level-era
++    // guest frame can take far longer than that -- and every fallback present can show a
++    // partially rasterised buffer, which is the on-screen "artifact" class being chased.
++    // Always on: two counters and one line per 256 presents costs nothing at ~40 presents/s.
++    {
++        static std::atomic<unsigned long long> s_presents{0}, s_liveFallback{0};
++        const unsigned long long n = ++s_presents;
++        if (!usedPresentCopy)
++            ++s_liveFallback;
++        if ((n & 255ull) == 0ull)
++        {
++            const unsigned long long fb = s_liveFallback.load(std::memory_order_relaxed);
++            std::fprintf(stderr,
++                         "[gs2:presentsrc] presents=%llu liveFallback=%llu (%.1f%%) ageMs=%llu\n",
++                         n, fb, 100.0 * static_cast<double>(fb) / static_cast<double>(n),
++                         (copyTick != 0u && nowMs >= copyTick) ? (nowMs - copyTick) : 0ull);
++        }
++    }
      if (snapshot.empty())
          return {};
  
@@ -5261,7 +5605,7 @@ index 9c39ae2..4a5f962 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +6508,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +6841,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;
