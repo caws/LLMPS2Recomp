@@ -184,7 +184,8 @@ what progress is; when to spawn read-only subagents; when to stop). Then [`worki
 three CSV bug classes — truncated / missing-gap **batchfix** / over-bound **boundfix** — and
 disasm-as-ground-truth validation), [`overrides.md`](docs/overrides.md) (HLE patterns:
 wait-free replacement, clean skip, SIF/IOP handshake fakes, answering raw-transport RPCs via
-`runtime->iop().handleRPC`), and [`workflows.md`](docs/workflows.md) (parallel **read-only**
+`runtime->iop().handleRPC`), [`vu1-jit.md`](docs/vu1-jit.md) (the **VU1 performance arc**: why a block JIT is required, the ablation-measured cost decomposition, the disproven FMAC shortcut, and the lazy-flags design)
+and [`workflows.md`](docs/workflows.md) (parallel **read-only**
 multi-agent RE fan-out for architecture-question frontiers; sub-agents never build — only the
 main agent does; template at `.claude/workflows/re-fanout.js`). Read those for the durable
 strategy; this file + the skill are the quick reference.

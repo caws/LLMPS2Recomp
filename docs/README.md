@@ -49,6 +49,12 @@ mass-rewrite the inputs.**
 - **[overrides.md](overrides.md)** — HLE override patterns: wait-free replacement, clean
   skip, SIF/IOP handshake fakes, **answering raw-transport SIF RPCs via the runtime stub**,
   resumable mid-function entries, calling the original, and the `BUILD_TAG` discipline.
+- **[vu1-jit.md](vu1-jit.md)** — *the VU1 performance arc*: why the interpreter cannot reach a
+  playable frame rate (measured budget + ablation decomposition of its cost), what has landed,
+  what has been **disproven** (don't re-attempt the FMAC shortcut), and the two concrete next
+  steps — **lazy flags** (bit-exact ~1.37×, with the audited VU0/VU1 flag-visibility asymmetry
+  that makes it safe) and the **block JIT**. Also carries the measurement discipline this arc
+  needs: iterate on ns/pair, ablate to size a target, and never pick one from profile leaf share.
 - **[workflows.md](workflows.md)** — *parallel static investigation*: the read-only
   multi-agent RE fan-out (N agents chase sub-questions → one synthesizes a buildable
   override). Use when a frontier is an **architecture question**, not a CSV/override bug.
