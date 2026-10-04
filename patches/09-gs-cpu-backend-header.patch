@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..36fdf2c 100644
+index 71e8032..8504366 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 @@ -3,14 +3,24 @@
@@ -41,7 +41,7 @@ index 71e8032..36fdf2c 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +53,182 @@ private:
+@@ -36,18 +53,185 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -211,6 +211,9 @@ index 71e8032..36fdf2c 100644
 +    // Fan `batch` across the band pool and join. Falls back to a direct full-screen call when
 +    // the pool is off or the primitive is too short to be worth the handoff.
 +    void RasterFanOut(const GSPrimitiveBatch &batch, int minY, int maxY);
++    // cont.208: deterministic rasterizer capture + replay bench (see gs_cpu_backend.cpp).
++    void rasterCapRecord(const GSPrimitiveBatch &batch);
++    void rasterBenchRun();
 +    void startBandPool();
 +    void stopBandPool();
 +    void bandWorkerLoop(unsigned index);
@@ -228,7 +231,7 @@ index 71e8032..36fdf2c 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +238,36 @@ private:
+@@ -57,9 +241,36 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -267,7 +270,7 @@ index 71e8032..36fdf2c 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +275,69 @@ private:
+@@ -67,9 +278,69 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
