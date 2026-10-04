@@ -20,6 +20,7 @@ that the numbered scripts also call.
 | `05_screenshot.sh [--launch] <game_dir> [count] [interval]` | Burst-capture the game window and flag frames that have content. |
 | `06_sendkey.py` | Inject input via XTEST (`xdotool`/`wmctrl` are not installed here). |
 | `verify_disc.sh <game_dir> [--deep|--write]` | Validate the player's disc copy against `recomp/disc.manifest`. Called as a preflight by 02, 03 and 04. |
+| `verify_disc_selftest.sh <game_dir>` | Exercise every failure branch of `verify_disc.sh` against deliberately-broken symlink copies of a **verifying** game dir. Read-only w.r.t. the real disc. |
 | `build_progress.sh` | Report a running build as a percentage. |
 
 ## Verifying a disc copy
