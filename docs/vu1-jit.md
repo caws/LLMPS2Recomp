@@ -46,8 +46,8 @@ deliberately unfaithful — they are measurement instruments, never correctness 
 
 ## 2. Already landed — stage 1 (1.37×) and lazy flags (1.20×)
 
-Cumulative: **280.7 → ~175 ns/pair ≈ 1.6×**, all bit-exact, all default ON with kill switches.
-Stage 1 is below; lazy flags (cont.177) is §4.
+Cumulative: **280.7 → 167.6 ns/pair = 1.67×**, all bit-exact, all default ON with kill switches.
+Stage 1 is below; lazy flags (cont.177) is §4; dispatch overhead (cont.178) is §4b.
 
 ### Stage 1 — 1.37×, bit-exact
 
@@ -196,6 +196,32 @@ Caveats to settle while building: the program-level scan must cover the *whole* 
 branch can reach anywhere), so be conservative — any flag reader anywhere in the program disables
 the optimization for that program; and `flushPipelines()` at program end still commits queued flag
 entries, so the skip must also avoid *queueing* them, not just deriving them.
+
+## 4b. Dispatch overhead ✅ **LANDED (cont.178): 1.061×** — the JIT's third bucket, taken early
+
+`177.9 → 167.6 ns/pair` (`PS2X_VU1_FASTDISPATCH`, default ON, `=0` reverts). A 100-sample profile
+of the lazy-flags build showed the EE thread (96% busy) is no longer dominated by any single
+computation — the biggest identifiable block is **byte-moving and dispatch**:
+
+```
+normalizeOperand 10%  execUpper 7%  <lambda>operator() 6%  run 6%  __memset_avx2_erms 6%
+memcpy 5%  commitReadyPipelines 4%  queueVfWrite 4%  fmacNormOperand 4%
+normalizeFmacResult 4%  getDecodedInstructionPairForPc 4%  fmacExactLane<double> 4%  memmove 2%
+```
+
+Two pieces were takeable without a JIT, both pure "same result, less work":
+
+- **Decode cache resolved once per `run()`, not per pair.** The loop re-ran a five-field freshness
+  check and returned the ~80-byte `DecodedInstructionPair` **by value** every iteration; it now
+  holds a `const &` into `m_decodedCodeCache`. Safe to hoist because the guest cannot upload
+  microcode while its own VU program is running (same argument as arming lazy flags once per run).
+- **`run()`'s six 16-byte vf/acc scratch arrays are no longer zero-initialised** — 96 bytes of dead
+  memset per pair; each is `memcpy`-filled before its only read, under the identical guard.
+
+Verified: identical health counters both ways, clean lazy tallies, and a fully correct level-era
+gameplay frame. **Lesson for the JIT:** with flags and dispatch trimmed, no remaining leaf is large
+— the profile is flat. Flat profiles are exactly what a JIT fixes and an interpreter cannot: the
+cost is spread across per-instruction plumbing, not concentrated in one routine worth rewriting.
 
 ## 5. Step 2 — the VU1 block JIT
 
