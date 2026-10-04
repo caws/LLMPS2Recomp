@@ -48,6 +48,27 @@ if [[ ! -x "$RUNNER" ]]; then
 fi
 [[ -f "$ELF" ]] || { echo "ERROR: ELF not found (from config 'input'): $ELF"; exit 1; }
 
+# --------------------------------------------------
+# Disc preflight
+# --------------------------------------------------
+# A static recompilation is tied to ONE exact executable, so the wrong disc does not fail
+# cleanly -- it fails a long way from the cause. Check before launching. Costs milliseconds
+# (the ELF hash plus a stat sweep); scripts/verify_disc.sh --deep checksums everything.
+if [[ -x "$ROOT_DIR/scripts/verify_disc.sh" ]]; then
+    # `|| DISC_RC=$?` not a bare call: these scripts run under `set -e`, which would abort
+    # here on any non-zero code -- killing the run with no explanation, before the message
+    # below could say which of the failures it was.
+    DISC_RC=0
+    "$ROOT_DIR/scripts/verify_disc.sh" "$GAME_DIR" --quiet || DISC_RC=$?
+    # 5 = no manifest for this game yet: nothing to check against, and verify_disc.sh has
+    # already said so. Everything else is a real finding and its message is the explanation.
+    if [[ $DISC_RC -ne 0 && $DISC_RC -ne 5 ]]; then
+        echo "" >&2
+        echo "Stopping: the disc copy in $GAME_DIR/gamefiles did not verify (see above)." >&2
+        exit $DISC_RC
+    fi
+fi
+
 # Wrap the invocation in `timeout` to cap a spin:
 #   timeout 20 scripts/04_run_game.sh <game_dir> run.txt
 mkdir -p "$GAME_DIR/tmp"
