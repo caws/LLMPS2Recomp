@@ -719,6 +719,75 @@ of only 3.16 pairs. In order:
 3. **Amortise all of it over more pairs** — mean block is 3.16. This is what **linking** buys, and it
    is the only lever that changes the ratio structurally rather than shaving constants.
 
+## 5m. The arc completed: 91.2% coverage, 12.4× frame-matched — and VU1 is no longer the wall
+
+cont.198–205 took the block JIT from "correct but not a speedup" to the thing that removes VU1 as
+the bottleneck. Every step was shadow-verified with zero mismatches.
+
+| step | what | coverage | note |
+|---|---|---|---|
+| cont.198 | **branches execute inside blocks** (branch pair + delay slot, block writes `pc`) | 12.5% → 36.2% | 1.03× → 1.14× |
+| cont.199 | lower-special: IADD/ISUB/IADDI/IAND/IOR, MOVE/MR32, MTIR/MFIR | → 64.9% | 1.27× |
+| cont.200 | ILW/ISW/ILWR/ISWR, LQI/SQI/LQD/SQD | → 74.1% | |
+| cont.201 | **pending clip/Q applied early when provably due** | → 81.6% | guard blocks 41.3M → 826K |
+| cont.204 | **flag-emitting mode** — blocks run in non-lazy programs | → 90.8% | 9.3 → 18.2 fps |
+| cont.205 | CLIP | → **91.2%** | |
+
+### The two ideas that did the work
+
+**1. Branches belong INSIDE the block.** A branch every ~6.1 pairs meant leaving the branch *and its
+delay slot* to the interpreter was most of what a block could otherwise cover. The block now runs
+both and writes `m_state.pc` itself. Targets are compile-time constants except JR/JALR; the selected
+target lives in **ECX**, which no other emitter touches, so it survives the delay slot. ★ That
+reservation is load-bearing and was violated once — a VI ALU form used ECX as a scratch, so an IADD
+in a delay slot clobbered the pending target and the block jumped to a raw VI value (`pc=0x2`,
+`0xffff8000`). The second operand now comes straight from memory.
+
+**2. Stash the inputs, replay the awkward part in C++.** MAC flags, CLIP and the product-sticky
+question all looked like they needed flag-pipeline emission. They did not. The block stores the
+value the interpreter's own helper needs — an FMAC's **pre-clamp result**, or CLIP's two operand
+quads — and the driver replays `updateFmacFlags` / `queueClip` **at that instruction's own issue
+cycle** (by setting `m_cycle` around the call). The result is bit-exact *by construction* because it
+runs the interpreter's code, and it converted the single largest remaining bucket: blocks were
+disabled wholesale for programs with a flag reader, which was **68.8% of all still-interpreted
+cycles**.
+- Its one deliberate gap: `calculateFmacProductSticky` needs the operands, gone by replay time, and
+  only affects `status` — so flag-emitting mode requires the program to contain no STATUS reader.
+  cont.177 measured `stsRd=0` across full runs, so that is the common case.
+
+### ★★★ VU1 IS NO LONGER THE WALL — the GPU arc must be UNPAUSED
+
+**VU1 is now 11.6% of wall time (34.59 s of 297.3 s).** It was ~97% of the EE thread when this arc
+started. *Making VU1 entirely free could not reach 30 fps.*
+
+Ablating the CPU rasterizer (`PS2X_GS_NORASTER=1`) on **matched guest-frame intervals**:
+
+| interval | raster on | raster ablated | ratio |
+|---|---|---|---|
+| f=1920→2040 | 6.6 s | 7.7 s | 0.86× |
+| f=2040→2160 | 12.6 s | 11.8 s | 1.07× |
+| **f=2160→2280** | **58.4 s** | **16.7 s** | **3.50×** |
+
+**⇒ In heavy scenes the GS CPU rasterizer is now the bottleneck.** §1's standing conclusion — that
+the GPU arc stays paused because raster ablation bought nothing — was measured *while VU1 dominated*
+and no longer holds. That is the next frontier, not more VU1 work.
+
+### ⚠ Measurement lessons from this arc (all of them cost a cycle)
+
+1. **Cumulative ns/pair is useless here** and even *interval* ns/pair is confounded: the game is
+   real-time driven, so a faster build reaches different content at the same cumulative pair count.
+   The only honest metric is **wall time for a FIXED guest-frame interval** (`[loadkick:frame] f=`
+   correlated with the `[gsgpu:thruput]` elapsed stamp). It showed 6.4× where cumulative ns/pair
+   showed a *regression*.
+2. **Absolute ns/pair is not comparable across measurement sessions** — machine drift moved the same
+   config from ~128 to ~152 over this arc.
+3. **An rdtsc probe on a path that runs hundreds of millions of times measures itself** (§5l).
+4. **Verify what you just changed, not what you already trusted.** Three separate "mismatch storms"
+   were bugs in the *verifier*, not the codegen — a nested verification overwriting the reference, a
+   flag derivation reading the scratch **before** `blk->fn` ran, and comparing committed
+   `mac`/`clip` in a mode where the driver's replay is deliberately skipped. Each was diagnosed by
+   the pattern of the wrong values (they belonged to a *neighbouring* block).
+
 ## 6. Measurement discipline (non-negotiable for this arc)
 
 - **Iterate on `PS2X_VU1_PERF` — ns per issued instruction pair.** 0.2% run-to-run noise. Wall-clock
