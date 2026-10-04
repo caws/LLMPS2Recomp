@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..0babe12
+index 0000000..25310d2
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,1247 @@
+@@ -0,0 +1,1306 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -504,6 +504,29 @@ index 0000000..0babe12
 +        e.pandn_rr(2, 1);
 +        e.por_rr(0, 2);
 +        e.movups_store_d(7, kOffVf + int32_t(vfDst) * 16, 0);
++    }
++
++    // SQ: store a quadword from vf[fs] into VU memory, dest-lane masked.
++    //
++    // ★ The interpreter queues this through `queueStore` with **readyCycle = m_cycle + 1**, but an
++    // IMMEDIATE store is equivalent: `commitReadyPipelines()` runs at the TOP of the next pair's
++    // iteration, so the queued store lands before pair i+1 executes either way, and nothing else
++    // runs in pair i's own cycle that could observe the difference (a pair has exactly one lower
++    // instruction, and upper ops never touch VU memory).
++    // Residual, documented: XGKICK streams VU memory per cycle, so a store it is concurrently
++    // reading could be seen one cycle earlier. That is a race on real hardware too, and the
++    // block-level shadow-verify would surface it.
++    inline void emitSQ(Emitter &e, const CodeBuffer &buf, uint8_t viBase, uint8_t vfSrc,
++                       int32_t imm, uint8_t dest)
++    {
++        emitVuAddress(e, viBase, imm);
++        e.movups_load_d(0, 7, kOffVf + int32_t(vfSrc) * 16); // value to store
++        e.movaps_rip(2, buf.destMask(dest));
++        e.pand_rr(0, 2);
++        e.movups_load_sib(1, 6 /*rsi*/, 0 /*rax*/);          // existing memory
++        e.pandn_rr(2, 1);
++        e.por_rr(0, 2);
++        e.movups_store_sib(6 /*rsi*/, 0 /*rax*/, 0);
 +    }
 +
 +    // ---- instruction compiler + cache ------------------------------------------------------
@@ -1052,7 +1075,7 @@ index 0000000..0babe12
 +    // look-alike whose field ORDER differed (vf, acc, q, i, vi instead of vf, vi, acc, q, p, i),
 +    // so kOffVi pointed into the wrong field and the test failed with the codegen actually correct.
 +    // Testing against the real struct makes offsets agree by construction.
-+    inline bool selfTestLQ(CodeBuffer &buf)
++    inline bool selfTestLQ(CodeBuffer &buf, bool doSq)
 +    {
 +        if (!buf.ensure(8u << 20))
 +            return false;
@@ -1064,6 +1087,10 @@ index 0000000..0babe12
 +        unsigned long cases = 0, mismatches = 0;
 +        static const int32_t bases[6] = {0, 1, 7, -3, 1023, -1024};
 +        static const int32_t imms[5] = {0, 1, -1, 15, -16};
++
++        // fresh memory each pass so SQ mutations do not leak between cases
++        for (uint32_t k = 0; k < kDataSize; ++k)
++            mem[k] = uint8_t(k * 7u + (k >> 5));
 +
 +        for (int bi = 0; bi < 6; ++bi)
 +        {
@@ -1077,7 +1104,10 @@ index 0000000..0babe12
 +                    e.end = buf.base + buf.capacity;
 +                    uint8_t *const start = e.p;
 +                    // vi[3] is the base register, vf[5] the destination
-+                    emitLQ(e, buf, 3, 5, imms[ii], uint8_t(dest));
++                    if (doSq)
++                        emitSQ(e, buf, 3, 5, imms[ii], uint8_t(dest));
++                    else
++                        emitLQ(e, buf, 3, 5, imms[ii], uint8_t(dest));
 +                    e.ret();
 +                    if (e.overflow)
 +                        return false;
@@ -1087,40 +1117,69 @@ index 0000000..0babe12
 +                    static VU1State b;
 +                    a = VU1State{};
 +                    for (int c = 0; c < 4; ++c)
-+                        a.vf[5][c] = -1.0f - float(c);
++                    {
++                        const uint32_t pat = 0xA5000000u | uint32_t(c * 0x111111);
++                        std::memcpy(&a.vf[5][c], &pat, 4);
++                    }
 +                    a.vi[3] = int16_t(bases[bi]);
 +                    b = a;
 +
-+                    fn(&a, mem, kDataSize - 1u);
-+
-+                    // reference == ps2_vu1_lower.cpp case 0x00
 +                    const uint32_t addr =
 +                        (uint32_t(int32_t(b.vi[3] + imms[ii])) * 16u) & (kDataSize - 1u);
-+                    if (addr + 16u <= kDataSize)
++
++                    // snapshot the memory the reference will need, then run the emitted code
++                    uint32_t refMem[4];
++                    std::memcpy(refMem, mem + addr, 16);
++                    fn(&a, mem, kDataSize - 1u);
++
++                    if (!doSq)
 +                    {
++                        // reference == ps2_vu1_lower.cpp case 0x00 (LQ)
 +                        float tmp[4];
-+                        std::memcpy(tmp, mem + addr, 16);
++                        std::memcpy(tmp, refMem, 16);
 +                        for (int c = 0; c < 4; ++c)
 +                            if (dest & (1u << (3 - c)))
 +                                b.vf[5][c] = tmp[c];
++                        for (int c = 0; c < 4; ++c)
++                        {
++                            uint32_t x = 0, y = 0;
++                            std::memcpy(&x, &a.vf[5][c], 4);
++                            std::memcpy(&y, &b.vf[5][c], 4);
++                            ++cases;
++                            if (x != y && ++mismatches <= 8ul)
++                                std::fprintf(stderr,
++                                             "[vu1:jit] LQ MISMATCH base=%d imm=%d dest=%x lane=%d "
++                                             "jit=%08x ref=%08x (addr=%u)\n",
++                                             bases[bi], imms[ii], dest, c, x, y, addr);
++                        }
 +                    }
-+                    for (int c = 0; c < 4; ++c)
++                    else
 +                    {
-+                        uint32_t x = 0, y = 0;
-+                        std::memcpy(&x, &a.vf[5][c], 4);
-+                        std::memcpy(&y, &b.vf[5][c], 4);
-+                        ++cases;
-+                        if (x != y && ++mismatches <= 8ul)
-+                            std::fprintf(stderr,
-+                                         "[vu1:jit] LQ MISMATCH base=%d imm=%d dest=%x lane=%d "
-+                                         "jit=%08x ref=%08x (addr=%u)\n",
-+                                         bases[bi], imms[ii], dest, c, x, y, addr);
++                        // reference == ps2_vu1_lower.cpp case 0x01 (SQ), post-commit
++                        uint32_t want[4];
++                        std::memcpy(want, refMem, 16);
++                        for (int c = 0; c < 4; ++c)
++                            if (dest & (1u << (3 - c)))
++                                std::memcpy(&want[c], &b.vf[5][c], 4);
++                        uint32_t got[4];
++                        std::memcpy(got, mem + addr, 16);
++                        for (int c = 0; c < 4; ++c)
++                        {
++                            ++cases;
++                            if (got[c] != want[c] && ++mismatches <= 8ul)
++                                std::fprintf(stderr,
++                                             "[vu1:jit] SQ MISMATCH base=%d imm=%d dest=%x lane=%d "
++                                             "jit=%08x ref=%08x (addr=%u)\n",
++                                             bases[bi], imms[ii], dest, c, got[c], want[c], addr);
++                        }
++                        // restore so later cases see pristine memory
++                        std::memcpy(mem + addr, refMem, 16);
 +                    }
 +                }
 +            }
 +        }
-+        std::fprintf(stderr, "[vu1:jit] LQ selftest cases=%lu mismatches=%lu -> %s\n",
-+                     cases, mismatches, mismatches == 0 ? "PASS" : "FAIL");
++        std::fprintf(stderr, "[vu1:jit] %s selftest cases=%lu mismatches=%lu -> %s\n",
++                     doSq ? "SQ" : "LQ", cases, mismatches, mismatches == 0 ? "PASS" : "FAIL");
 +        buf.reset();
 +        return mismatches == 0;
 +    }

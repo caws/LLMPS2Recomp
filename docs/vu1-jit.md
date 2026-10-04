@@ -748,5 +748,31 @@ LQ is **not wired into execution**: there is no lower-slot path until block asse
 per-instruction lower JIT would repeat the ~0 payoff §5b measured. It is verified groundwork with a
 fixed contract.
 
-**Next:** SQ (15.1% — note it goes through `queueStore`, not immediate, per §5g), IADDIU (4.6%),
-clip readers (10.3%), then block assembly.
+**SQ landed too (cont.193): 15.1% of pairs, 1,920 cases, 0 mismatches.** And the store pipeline
+turned out **not to need modelling**: `queueStore` uses `readyCycle = m_cycle + 1` while
+`commitReadyPipelines()` runs at the **top** of the next pair's iteration, so the store lands before
+pair i+1 either way, and nothing else runs in pair i's own cycle to observe the difference (one
+lower instruction per pair; uppers never touch VU memory). SQ emits as address → masked blend
+against existing memory → store: no pipeline, no branch. *Residual:* XGKICK streams VU memory per
+cycle, so a store it is concurrently reading could be seen one cycle early — a race on hardware too.
+
+Lower-slot codegen now covers **SQ 15.1% + LQ 5.3% = 20.4%**, on top of NOP's 46.4%.
+
+### ★★ The constraint governing everything left in the lower slot: VI writes and the branch delay
+
+Every VI-writing lower op — IADDIU/ISUBIU (4.6%), the clip readers (10.3%), ILW — is **not** like SQ:
+
+- `execLower` writes `m_state.vi[it]` immediately, and `run()` then shadow-dances it into
+  `queueViWrite`.
+- Critically, the interpreter keeps a **branch-read backup** (`m_viBranchBackupValue/Reg/Valid`):
+  when an instruction marked `delaysNextBranchRead` writes a VI register, a branch in the
+  **immediately following** pair must read the **OLD** value. That is the VU's branch-delay hazard,
+  and it is real architectural behaviour.
+
+**Why this bites block assembly specifically:** branches *terminate* blocks, so a block's final pair
+is exactly the pair immediately before a branch. A JIT'd VI write in that position that bypasses the
+backup would hand the branch the **new** value and take the wrong path. **The block compiler must
+either exclude VI writes from a block's final pair, or replicate the backup** — settled here, before
+any VI-writing op is emitted, rather than discovered from a wrong-path bug later.
+
+**Next:** IADDIU + clip readers under that constraint, then block assembly.
