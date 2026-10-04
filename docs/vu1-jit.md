@@ -1128,3 +1128,13 @@ either exclude VI writes from a block's final pair, or replicate the backup** �
 any VI-writing op is emitted, rather than discovered from a wrong-path bug later.
 
 **Next:** IADDIU + clip readers under that constraint, then block assembly.
+
+## Next arc: the program compiler (cont.230)
+
+The block JIT's design floor is measured (244–375 host cycles per 4.4-pair entry plus the loop around
+it; 7% of pairs interpreted at ~700 cycles, 83% of them DIV). The example game needs ≈ 6 ns per pair
+all-in for 30 fps (5.17 M pairs per frame), i.e. a whole-program compiler in PCSX2's microVU shape:
+blocks keyed by a compile-time pipeline state and linked directly, a static stall model, a 4-instance
+lazy flag ring, Q/P as pipelined lanes, XGKICK as a deferred call. Design note and the microVU survey
+live in the fork: `tools/<game>/PS2Recomp/docs/vu1-program-compiler.md` and `docs/microvu-survey.md`.
+
