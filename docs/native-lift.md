@@ -1,6 +1,9 @@
 # The native-lift arc — from recompilation to standalone
 
-> **DESIGN ONLY.** Nothing here is built. This doc exists so the arc is decided before it is
+> **DESIGN ONLY, and GAME-AGNOSTIC.** Nothing here is built. This file is the *method*; each game's
+> numbers, ordered work, module ranking and enhancement targets live in that game's
+> `docs/native-lift-plan.md` (for the example game,
+> `rotk_decomp/docs/native-lift-plan.md`). Keep this file free of any one game's facts. This doc exists so the arc is decided before it is
 > started, because its failure modes are ordering mistakes that are expensive to unwind.
 > Companion to [`gl-renderer.md`](gl-renderer.md) and [`vu1-jit.md`](vu1-jit.md).
 
@@ -36,9 +39,10 @@ infrastructure — a renderer, audio, ffmpeg, a window/input library — like an
   with `registerFunction` / `lookupFunction` at `:344-347`.
 - **⇒ A hook at any address intercepts every caller, from anywhere.** Full replacement needs no
   new dispatch machinery. This is the single fact that makes the arc possible at all.
-- **Scale.** `tmp/generated/`: **5,608 functions / 889,469 lines**. `src/` today: **403
-  registrations** (75 of them `diagnostics/`, so ~**328 real**) across 22 domain modules /
-  **20,986 lines**. We are at roughly **5.8%** of the function count.
+- **Scale is per game and must be measured, not assumed** — generated function count and line
+  count vs the game's current real (non-diagnostic) hook count. Record it in that game's
+  `docs/native-lift-plan.md`; it is the honest denominator for every progress claim, and for a
+  mid-size PS2 title it is a five-digit function count against a three-digit hook count.
 - **Guest static data is loaded from the ELF at runtime** (`ps2_runtime.h:304` `loadELF`). Hooks
   receive `rdram` and read `.data`/`.rodata` out of it. **Lifting code does not lift data.**
 - **The emulated-console layer is ~90k lines** (GS, VU0/VU1, VIF, IPU, DMA, SIF/IOP, EE kernel,
@@ -65,7 +69,7 @@ and a table's real shape is only learnable from all the code that reads it. Some
 
 **Decision (user): retaining the ELF as a static-data source is an ACCEPTED end
 state**, to be revisited later. The disc is required for assets regardless (§1 of the portability
-discussion), so a native build that still reads `SLES_520.17` for its data sections costs the user
+discussion), so a native build that still reads the ELF for its data sections costs the user
 nothing. Plan for that; treat full data lifting as optional upside, never as the definition of done.
 
 Rung 2 is the one that is purely mechanical. Rungs 3-5 require understanding, and that is the
@@ -104,7 +108,7 @@ automated check green while the wrong level played).
 The same fact from §2 that makes lifting possible also makes it checkable: dispatch is **one
 funnel with one signature**. So:
 
-- env-gated (`LOTR_DIFF`), opt-in per address;
+- env-gated (`<GAME>_DIFF`), opt-in per address;
 - at `dispatchGuestBranch`, snapshot `ctx` + a dirty-tracked `rdram` window, run the override,
   snapshot, restore, run the generated function, diff register file + memory writes;
 - report divergence as address + first differing register/offset.
@@ -140,32 +144,15 @@ not re-execution diffing. Design it before lifting the kernel, not during.
 "Once everything is working properly" is not a gate — a commercial-game recompilation is never
 done; there is always another level, cutscene, or edge case. Gate on something testable.
 
-- **Phase 0 — now.** Reach a game that can be played through. ⚠ **Not the EE/VU1 arc** — cont.332
-  is explicit: the upload-free GL frame is already at cont.328's raster-free floor, so VU1 work now
-  buys resolution headroom, not playability. In order:
-  1. **Close the texture-upload cycle.** Hash the *decoded RGBA output* per decode against that
-     key's previous decode; fix the two instrument defects in the same commit. **Ceiling: +1.3 fps**
-     — anything larger on this axis is over-investment.
-  2. **Judge gameplay fidelity** — **vsync-aligned, never flip-aligned** (~108 guest frames of skew
-     between the arms).
-  3. **Audio defaults** (user) — settle the flags so the playthrough has sound. Only
-     three need flipping: `LOTR_AUDINIT`, `LOTR_AUDPLAY`, `PS2X_AUDIO`; most of the cont.273-316 arc
-     was already defaulted ON as it was proven. `LOTR_AUDONADD` / `LOTR_AUDSTMONADD` stay OFF
-     (disproven — cont.305/309: "a sound at registration is our invention"), and `LOTR_AUDPOS` stays
-     OFF because it over-culls (cont.295 silenced 92% of a level's sound) — a work item, not a flip.
-     Check the **registration site AND the body gate** for each (the cont.239 trap), then run
-     `check_registrations.py`.
-  4. **Local co-op** (user) — §11 step 1: honour `port`/`slot` in `readState`, enumerate
-     devices onto ports, validate the game's `CoopSel` entry flow.
-  5. ⚠ **Measure the cost of 3 and 4 BEFORE the playthrough.** Audio and a second input path both
-     move the frame budget, so take each one's cost on the same binary with the flag off. Otherwise
-     the playthrough's fps cannot be read against the cont.332 baseline — *an A/B knob with two
-     effects proves neither*.
-  6. **The playthrough — solo AND co-op, sound on.** It yields a defect *list*, not a green light:
-     playthrough → fix → replay → clean, until clean.
-
-  **Gate:** game completable start → finish, **solo and co-op**, at playable framerate under
-  deterministic replay.
+- **Phase 0 — reach a game that can be played through.** Its *content* is per game and belongs in
+  that game's `docs/native-lift-plan.md`; what is general is the shape: close out whatever
+  performance work still has a measured ceiling (and **stop** when the ceiling is small — size it
+  before investing), settle any subsystem whose flags are still experiment-gated so the playthrough
+  exercises them, **measure each newly-enabled subsystem's cost on the same binary with the flag
+  off** before the playthrough (otherwise its frame numbers cannot be read against the old
+  baseline), and only then play the game through. ⚠ A playthrough yields a defect *list*, not a
+  green light: playthrough → fix → replay → clean. **Gate:** completable start → finish, in every
+  supported mode, at playable framerate under deterministic replay.
 - **Phase 1 — the oracle.** §5. **Gate:** every existing hook either passes differential
   validation or has its divergence understood and written down.
 - **Phases 2..N — one subsystem per arc**, narrow-interface-first (§7). **Gate per arc:** that
@@ -179,10 +166,11 @@ done; there is always another level, cutscene, or edge case. Gate on something t
 Criteria: narrow interface to un-lifted code; self-contained data; already has a `src/` module;
 low hardware contact; cheaply verifiable.
 
-- **Good first targets:** `font_text/` (14 hooks, table-driven, narrow), `memcard/` (5),
-  `pad_input/` (7).
-- **Late:** `menu_flow/` (67), `igc_event/` (49), `hero/` — broad interfaces into gameplay state.
+- **First:** small, table-driven modules with a narrow interface and self-contained data.
+- **Late:** anything with a broad interface into gameplay state.
 - **Last:** anything touching VU microcode or the EE threading model.
+
+The per-game ranking belongs in that game's `docs/native-lift-plan.md`.
 
 **Do not faithfully reimplement middleware.** A large share of the 890k lines is Sony SDK and
 linked middleware, not EA game code. That code should be *deleted and replaced* with a native
@@ -266,7 +254,7 @@ The units that dissolve do so one at a time, each unlocked when its last consume
 
 ### The pattern instead — the one used ~137 times already
 
-Per subsystem: **`LOTR_LIFT_<SUBSYS>` env flag, default OFF** → **oracle first** (the cont.250
+Per subsystem: **a `<GAME>_LIFT_<SUBSYS>` env flag, default OFF** → **oracle first** (the cont.250
 resume rule) → prove equivalence → flip the default → row in `runtime.lock` and the fork's
 `docs/llmps2recomp-patches.md`, with a build tag. Short-lived `lift/<subsys>` branches (days to
 weeks, merged on gate) are fine; **the flag carries the risk, not the branch.**
@@ -373,27 +361,25 @@ directory, never mixed with anything extracted from the disc.
 a first step. **Local co-op has no determinism requirement whatsoever** — one machine, one
 simulation, two input devices. Every hard problem below belongs to the network half alone.
 
-**The game really is co-op.** The ELF carries ~52 co-op strings: `CoopSel`, `CoopStat`,
-`coopNewGameWarning`, `cooplife`, `coopmark1p` / `coopmark2p`, `coopkills`, `coopicon`,
-`coopValues1.fairValue`. This is a real mode, not an inference.
+**Check the ELF's own strings before designing anything** — a co-op mode announces itself
+(selection screens, per-player HUD markers, shared-life and score counters). Record the evidence in
+the game's plan doc.
 
 #### Step 1 — local co-op (a shipped feature, not a stepping stone)
 
-**★ The blocker is not network code — port 2 does not exist.**
-`ps2xRuntime/src/lib/ps2_pad.cpp:31` is
-`bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)` — **both
-parameters are commented out**, so every port returns the same pad. What this step needs:
+**★ The blocker is usually not network code — it is that port 2 does not exist.** `PSPadBackend::readState`
+takes `port` and `slot`, and in this runtime both are **commented out**, so every port returns the
+same pad. What this step needs:
 
-- honour `port`/`slot` in `PSPadBackend::readState`;
-- real device enumeration — map N physical gamepads onto ports (today input arrives via raylib plus
-  `PS2X_PAD_KEYSTICK` / `PS2X_PAD_SCRIPT`, none of which model a second device);
-- **validate the game's own co-op entry flow** (`CoopSel`, `coopNewGameWarning`). This has almost
-  certainly never been exercised — ⚠ **co-op is an entire untested game path, and it belongs in the
-  §6 playthrough**, not discovered later.
+- honour `port`/`slot` in the pad backend;
+- real device enumeration — map N physical gamepads onto ports (the host layer plus any
+  keyboard-split or scripted-pad paths model **one** device, not several);
+- **validate the game's own co-op entry flow.** It has almost certainly never been exercised —
+  ⚠ **co-op is an entire untested game path, and it belongs in the Phase 0 playthrough**, not
+  discovered afterwards.
 
-**Placement: DECIDED (user) — Phase 0, before the playthrough, alongside the audio
-defaults.** It is independent of the lift (input plumbing plus a menu path), and doing it first is
-what makes the playthrough cover co-op as well as solo.
+**Placement: independent of the lift** — input plumbing plus a menu path, so it can go anywhere.
+Doing it before the playthrough is what makes the playthrough cover co-op as well as solo.
 
 #### Step 2 — network co-op
 
