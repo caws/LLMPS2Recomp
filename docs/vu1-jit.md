@@ -664,14 +664,11 @@ Every census through §5e counted a **branch** in the lower slot as an uncovered
 every ~6 pairs, so treating them as gaps capped every run at the inter-branch distance *minus* the
 branch.
 
-### Revised build order
+### Revised build order — ⚠ CORRECTED in §5g
 
-1. **Branch terminators in the block compiler.** Emit the run, then exit to the interpreter with the
-   branch and its delay slot still interpreted. This is what turns 20.7% into 52.2%.
-2. **Lower-slot codegen** — SQ 15.1%, clip readers 10.3%, LQ 5.3%, IADDIU 4.6%. Needs VI registers
-   in GPRs and VU-memory addressing.
-3. **CLIP** (3.7%) — writes the clip flag register through `queueClip`, so it needs flag-pipeline
-   support rather than a plain vf/acc write. Plus OPMULA/OPMSUB.
+The first draft of this list put branch terminators first. **That was wrong** — see §5g: tier 5 is
+*cumulative*, so its 52.2% presumes the lower slot is already implemented. Lower-slot codegen comes
+first.
 
 ### Sizing, with §5d's measured block cost
 
@@ -680,3 +677,39 @@ A 2-pair block is 7.90 ns/pair, a 6-pair block 7.72, versus 120.5 interpreted. A
 not.** Reaching 17 ns/pair still requires coverage in the 85%+ range, which is what keeps the lower
 slot on the list. But 52.2% is the first figure high enough that block assembly is worth *building*
 rather than simulating.
+
+
+## 5g. ⚠ Build-order correction, and the LQ/SQ asymmetry (cont.191)
+
+§5f's ordering ("branch terminators first") **was wrong, and the error is worth naming**: the tier
+table is **cumulative**, so tier 5's 52.2% assumes SQ/LQ/IADDIU/clip-readers/ILW/ISW are already
+emitted. The figure that actually governs a *first* block compiler is **tier 0 — all-NOP lowers —
+which is only 8.9% compilable and 6.6% in runs ≥ 2.**
+
+With §5d's measured block cost that is `0.066 × 7.9 + 0.934 × 120.5 ≈ 113 ns/pair` = **1.066×**,
+which does not justify the integration cost (cycle accounting, pipeline reconciliation,
+write-visibility analysis, block cache).
+
+**Correct order: (1) lower-slot codegen, (2) block assembly with branch terminators, (3) CLIP and
+OPMULA/OPMSUB.**
+
+### LQ and SQ are not symmetric — this shapes the block design
+
+```
+addr = ((uint32_t)(int32_t)(vi[base] + imm)) * 16;   // imm = IMM11, sign-extended
+addr &= (dataSize - 1);                              // dataSize is a power of two
+if (addr + 16 <= dataSize) { ... }                   // guard survives the mask
+```
+
+| | base reg | visibility |
+|---|---|---|
+| **LQ** | `vi[is]` | **immediate** — `applyDest`, no pipeline |
+| **SQ** | `vi[it]` | **queued** — goes through `queueStore`, the store pipeline |
+
+So LQ compiles to a masked load + dest blend, while **SQ's visibility must either replicate the
+store pipeline or be proven unobservable within the block** by the same forward-window argument used
+for VF writes (§5b / cont.179b) — *including its branch-delay-slot exclusion*.
+
+Both need what the emitter has never touched: **VI registers** (`int32_t vi[16]`, so GPR handling
+plus the `+imm`, `*16`, `&(dataSize-1)` arithmetic) and **`vuData` as a second argument** — the
+emitted functions currently take only the state pointer, so the calling convention changes.
