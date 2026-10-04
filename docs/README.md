@@ -65,8 +65,10 @@ mass-rewrite the inputs.**
   possible (every call routes through `dispatchGuestBranch`, so a hook at any address intercepts
   every caller), the rung ladder, why the work is **subsystem-wise, not function-wise**, the
   differential oracle that has to exist first (the `PS2X_VU0_PROGVERIFY` method, at game scale),
-  the honest scale (5,608 functions / 889k generated lines), and the repo strategy: **no long-lived
-  branches, additive only — `ps2xRuntime` is never cut down.** **Design only — not built.**
+  the honest scale (5,608 functions / 889k generated lines), the repo strategy (**no long-lived
+  branches, additive only — `ps2xRuntime` is never cut down**), and what the arc unlocks: the
+  **remaster rung** — gateable widescreen/hi-res enhancements, and why "no PS2 emulation" is that
+  arc's starting line rather than the finish. **Design only — not built.**
 - **[workflows.md](workflows.md)** — *parallel static investigation*: the read-only
   multi-agent RE fan-out (N agents chase sub-questions → one synthesizes a buildable
   override). Use when a frontier is an **architecture question**, not a CSV/override bug.

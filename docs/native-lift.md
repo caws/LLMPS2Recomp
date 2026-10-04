@@ -22,7 +22,7 @@ only — no line is ever removed from `ps2xRuntime`.** The rest is the phase pla
 scale.
 
 **Definition of done (decided, not aspirational):** a native target that links **no PS2
-emulation**. It may still read the ELF for its static data (§3), and it links ordinary game
+emulation** — which is the *starting line* for §11's remaster arc, not the end of the road. It may still read the ELF for its static data (§3), and it links ordinary game
 infrastructure — a renderer, audio, ffmpeg, a window/input library — like any native game.
 
 ## 2. What is already verified (do not re-derive)
@@ -53,6 +53,7 @@ infrastructure — a renderer, audio, ffmpeg, a window/input library — like an
 | 3 | functions lifted off guest memory — native structs, not `rdram` offsets | the ELF's data sections |
 | 4 | subsystems replaced semantically — code calls a renderer, not the GS | runtime units, one at a time |
 | 5 | standalone | the engine (assets still come from the disc) |
+| 6 | **remaster** — gateable enhancements on the lifted code (§11) | — (this rung *adds*) |
 
 **Nothing here is deleted.** "Stops needing" means *stops linking* — see §8 and §10. `ps2xRuntime`
 stays intact and buildable throughout, because it is both the fallback and the oracle.
@@ -282,3 +283,117 @@ lock in the same change.
 Both `main` branches are 3-month-old fossils with zero unique commits. "Which branch is the truth"
 should not be ambiguous when a multi-year arc begins — either fast-forward `main` to the live
 branches or rename and accept the live branches as trunk.
+
+## 11. Enhancements — the remaster arc (rung 6)
+
+**Goal (user):** once the native build is releasable and the recompiler and runtime are
+no longer needed, take this to **remaster level** — every improvement individually gateable so a
+player chooses the original or the remaster, on an open codebase. Named targets: **HUD textures that
+work at widescreen aspect ratios**, and **hi-res HUD art** replacing today's low-res source.
+
+### Why it comes after the lift, not before
+
+Before the lift, a HUD texture is a VRAM upload decoded by the GS path: you would be intercepting
+*decoded texel blocks*, not "the HUD atlas", and an aspect change means patching the game's own GS
+coordinate math (`XYOFFSET`, the projection setup) through override hooks. After the lift, the HUD is
+native code drawing native quads with native textures — hi-res is a different asset and widescreen is
+a different layout. **The same change is an emulator hack before and an ordinary code change after.**
+
+### Separate render resolution from asset resolution
+
+They are different problems on different timelines, and conflating them wastes the earlier one:
+
+- **Render resolution is available now.** `PS2X_GS_SCALE=4` supersamples for 13.6%, and
+  [`gl-renderer.md`](gl-renderer.md) phases 5-6 are designed. cont.332's ~14 ms of headroom in a
+  40 ms quantum already pays for it.
+- **Asset resolution waits for the lift**, because replacing the art means owning the draw call.
+
+### Gating at remaster scale
+
+Same pattern as everything else: one flag per enhancement, default OFF = original behaviour. But env
+vars are not a player-facing UI — a user picking "Original" or "Remastered" needs a config file or a
+menu. **Design item: a settings layer above the env-flag mechanism**, with the flags remaining the
+ground truth underneath so the A/B discipline (and every harness script) keeps working unchanged.
+
+### ★ The consequence for the oracle: it never retires
+
+If the player can choose the original, **the original path must stay correct forever** while
+enhancements accumulate around it. The differential oracle (§5) therefore outlives the lift arc: it
+stops being a migration tool and becomes the permanent regression net that protects "Original" mode.
+Budget for it as a kept asset, not as scaffolding — which also retroactively raises how well it is
+worth building in phase 1.
+
+### What is, and is not, yours to ship
+
+The lifted game code is derived from the game's own code, and the ELF is retained anyway (§3), so the
+distribution shape is the established one for this space: publish the source, require the player to
+supply their own disc. **The enhancement assets are the exception — hi-res HUD art you author is
+yours**, and is the one part of the project that can ship as a binary without qualification.
+Structure the tree so that boundary is obvious from day one: authored enhancement assets in their own
+directory, never mixed with anything extracted from the disc.
+
+### Candidate scope (the first two are the user's; the rest are candidates only)
+
+- **HUD widescreen** — not only textures: anchor/stretch rules, safe areas, element layout
+- **HUD hi-res art** — new assets against the lifted draw path
+- Widescreen proper — FOV and projection, not just UI
+- Texture filtering / anisotropy on the GL path
+- Input — remapping, modern controllers
+- **Co-op — local AND network** (user). Both are goals. See below.
+- ⚠ **Frame rate is NOT a free enhancement.** The game's own `dt` is 0.04 s and its logic is
+  timing-coupled — the ladder fall-off bug was a vblank delivered late. Uncapping is a change to game
+  logic, not a renderer setting. High risk; out of initial scope.
+
+### Co-op — local and network
+
+**Both are goals** (user), and they are two very different projects that happen to share
+a first step. **Local co-op has no determinism requirement whatsoever** — one machine, one
+simulation, two input devices. Every hard problem below belongs to the network half alone.
+
+**The game really is co-op.** The ELF carries ~52 co-op strings: `CoopSel`, `CoopStat`,
+`coopNewGameWarning`, `cooplife`, `coopmark1p` / `coopmark2p`, `coopkills`, `coopicon`,
+`coopValues1.fairValue`. This is a real mode, not an inference.
+
+#### Step 1 — local co-op (a shipped feature, not a stepping stone)
+
+**★ The blocker is not network code — port 2 does not exist.**
+`ps2xRuntime/src/lib/ps2_pad.cpp:31` is
+`bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)` — **both
+parameters are commented out**, so every port returns the same pad. What this step needs:
+
+- honour `port`/`slot` in `PSPadBackend::readState`;
+- real device enumeration — map N physical gamepads onto ports (today input arrives via raylib plus
+  `PS2X_PAD_KEYSTICK` / `PS2X_PAD_SCRIPT`, none of which model a second device);
+- **validate the game's own co-op entry flow** (`CoopSel`, `coopNewGameWarning`). This has almost
+  certainly never been exercised — ⚠ **co-op is an entire untested game path, and it belongs in the
+  §6 playthrough**, not discovered later.
+
+**Placement: independent of the lift.** This is input plumbing and a menu path; it could be done at
+any point, and doing it before the playthrough means the playthrough covers co-op too.
+
+#### Step 2 — network co-op
+
+**Three rollback prerequisites already exist here, built as debugging tools:**
+
+| Need | What already exists |
+|---|---|
+| deterministic simulation | `PS2X_VIRTUAL_TIME` (row 93) — two runs identical over 788 events |
+| frame-indexed input | `PS2X_PAD_SCRIPT` — vblank-indexed, replay-deterministic |
+| cheap state deltas | `PS2X_WRITE_WATCH` (row 44) — per-word last-writer table |
+
+That is an unusually strong starting position for GGPO-style rollback.
+
+**But it is not small, and three things are genuinely open:**
+1. **The deterministic config is not the playable config.** `PS2X_VIRTUAL_TIME` is default OFF and
+   NEXT.md says to drop it for the live configuration. Netplay needs determinism *and* playability at
+   once — today they are different runs.
+2. **Cross-machine determinism is stronger than cross-run.** Same-binary replay determinism does not
+   imply two different hosts agree. Rendering may diverge freely; **simulation may not**.
+3. **Frame-granular save/restore does not exist yet** in any form.
+
+**⚠ OPEN DECISION — the network half may not belong at rung 6 at all.** Rollback is *easier before
+the lift than after*: pre-lift, game state is one contiguous 32 MB `rdram` blob you can `memcpy`
+(with `WRITE_WATCH` for deltas). Post-lift it is scattered native objects needing explicit
+serialise/deserialise per subsystem, where **every missed field is a desync**. So the lift makes the
+HUD work easier and network co-op *harder* — the opposite of every other item in §11. Decide it
+consciously rather than inheriting rung 6's placement. (Step 1 is unaffected either way.)
