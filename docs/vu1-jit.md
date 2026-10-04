@@ -515,6 +515,96 @@ Sizing with §5d's measured block cost (2-pair block 7.90 ns/pair vs the 120.5 i
 **Next: block assembly** — emit a run of pairs as one function with operands in registers across
 pairs, branches and ILW as terminators, honouring `delaysNextBranchRead` on the final pair.
 
+## 5j. BLOCK ASSEMBLY — built, verified, and coverage-limited (cont.195)
+
+`PS2X_VU1_BLOCK=1` (**default OFF**) replaces the interpreter's inner loop, for a run of consecutive
+pairs, with a single call into natively compiled code. It is **correct** — 24.6 billion
+shadow-verified slot comparisons, 0 mismatches — and it is **not yet a speedup**, for a reason the
+census pins down exactly.
+
+### The correctness argument that makes a block cheap
+
+The interpreter defers every write through `queueVfWrite`/`queueAccWrite`/`queueViWrite` and only
+makes it visible at `readyCycle`, so a block would seem to need the whole pipeline. It does not,
+because **a reader always stalls until its operand is ready**: `calculatePairReadyCycle` takes `max`
+over `m_vfReady[reg][lane]` for every read lane (and `m_viReady`/`m_accReady`), and `run()` then does
+`while (readyCycle > m_cycle) advanceTo(...)`, which advances a cycle at a time calling
+`commitReadyPipelines()`. **A stale read cannot happen.** So applying writes IMMEDIATELY inside a
+block yields the same values, and the pipeline is reproduced only as *timing* (cycle count + ready
+tables), computed in C++ after the call. WAW agrees too: immediate writes make the last writer win,
+which is where the interpreter's `m_vfLatestWrite == sequence` supersession check also lands.
+
+**Intra-pair ordering** is handled by exploiting opcode orthogonality rather than replicating the
+`upperVfShadowReg` dance: SQ / IADDIU / ISUBIU / clip readers are emitted BEFORE the upper (SQ must
+see the pre-pair VF value; the VI/clip ops touch neither VF nor ACC, and the upper touches neither VI
+nor clip), and LQ AFTER it (the upper must see the pre-pair value of LQ's destination). When LQ's
+destination *is* the upper's destination the interpreter suppresses the lower write entirely, so the
+emitter skips it. No scratch register, no cut, and every classified pair compiles.
+
+**Stalls are absorbed, not avoided.** The first version cut a block at any pair that would stall on
+an earlier pair of the same block — which throws away most of the reach at FMAC latency 4. Stalls are
+static once issue cycles are known, so `planBlock` schedules them: each pair carries its issue cycle
+relative to block entry, ready-table entries are expressed against that, and the block consumes
+`lastIssue + 1` cycles. (This did *not* lengthen blocks — mean stayed 3.4 — confirming block length
+is bounded by opcode coverage, not hazards.)
+
+**The cont.194 branch-delay contract is honoured**: a branch in the pair after a block must still
+read the OLD value of a VI register the block's final pair wrote, so the driver captures it before
+the call and replays `recordViWriteForBranch` after. `planBlock` only allows that when no earlier
+pair of the block wrote the same register; otherwise it drops the final pair.
+
+### ★★ The measured verdict: 6.4% coverage, ~1% — inside the noise
+
+| | |
+|---|---|
+| block coverage | **6.4% of executed pairs** |
+| mean block | 3.55 pairs |
+| shadow-verified | **24,654,237,535 comparisons, 0 mismatches** |
+| ns/pair (matched cumulative pairs, in-binary A/B) | 126.1–126.6 on vs 127.6–128.2 off |
+| honest verdict | **~1%, and the baseline itself swings 124.8–128.2 across the same sweep ⇒ not resolvable** |
+
+This is exactly what §5e predicted: **partial coverage cannot pay.** At 6.4% coverage the ceiling is
+~6%, and guard checks plus block-entry overhead eat most of that.
+
+### ★★★ The single lever, measured: pending VF writes (99.7% of rejections)
+
+Entry is attempted far more often than it succeeds — `guardBlocked=14,355,964` vs `entered=8,362,044`
+— and the per-condition census is unambiguous:
+
+| guard condition | rejections |
+|---|---|
+| **pending VF write intersects the block's touched slots** | **14,318,821 (99.7%)** |
+| pending clip-writing flag entry (block reads clip) | 32,397 |
+| FDIV pending and the block reads Q | 4,232 |
+| pending VI write | 514 |
+| pending ACC write / pending store / budget | 0 |
+
+The guard rejects a block when an incoming pending write targets a slot the block reads or writes
+(read → the interpreter would have stalled for it; write → the pending write commits later and
+clobbers the block's newer value). With FMAC latency 4 and continuous issue, ~4 VF writes are always
+in flight, so almost every block intersects one.
+
+**The fix is already argued, and it is the same stall argument:** committing an intersecting pending
+write EARLY is value-equivalent, because any pair that would read that slot before its `readyCycle`
+stalls until it commits anyway — so no pair can observe the old value. What early commit costs is
+*cycle fidelity*, and that is recomputable at entry (the block's per-pair read sets are static; the
+incoming ready cycles are the only dynamic input). The alternative is a truncatable block — a
+`dec/jz` early exit after each pair — so the driver can run the longest safe prefix instead of
+rejecting the whole block.
+
+**Next, in order:** (1) admit blocks past pending VF writes by early-commit-plus-reschedule or by
+prefix truncation; (2) **link blocks**, so execution stops returning to the interpreter between them;
+(3) keep widening opcode coverage, which is what bounds block length (mean 3.55 vs the tier-6 mean
+run of 2.71).
+
+⚠ Three harness traps this cost a cycle each to find, all in the verifier rather than the codegen:
+**never start a nested verification** (the pair after a block entry usually has a block of its own,
+and overwriting the reference mid-window compares the wrong two states — 2.67M bogus mismatches);
+**skip slots with a write pending at block ENTRY** (the block cannot see them, the interpreter commits
+them during the window); and **give blocks their own code buffer** (they are invalidated on every
+microcode upload, and emitted code otherwise accumulates until the 8 MB buffer is exhausted and every
+later block is silently rejected — which froze coverage mid-run).
+
 ## 6. Measurement discipline (non-negotiable for this arc)
 
 - **Iterate on `PS2X_VU1_PERF` — ns per issued instruction pair.** 0.2% run-to-run noise. Wall-clock

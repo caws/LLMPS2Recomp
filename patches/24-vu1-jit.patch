@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..96376c5
+index 0000000..1e08592
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,1831 @@
+@@ -0,0 +1,2329 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -994,6 +994,504 @@ index 0000000..96376c5
 +        cache.key[slot] = instr;
 +        cache.fn[slot] = reinterpret_cast<void *>(produced); // null = "known uncovered", cached too
 +        return produced;
++    }
++
++
++    // ---- BLOCK ASSEMBLY (cont.195) ----------------------------------------------------------
++    //
++    // A block is a run of consecutive pairs emitted as ONE native function, replacing the
++    // interpreter's inner loop for that run. This is where the measured 15.6x (§5d) is cashed in:
++    // one call instead of N, operands straight out of VU1State, and — the big one — **no write
++    // pipeline and no shadow dance inside the block**.
++    //
++    // ★★ WHY IMMEDIATE WRITES ARE VALUE-EQUIVALENT (the load-bearing argument).
++    // The interpreter defers every write through queueVfWrite/queueAccWrite/queueViWrite and only
++    // makes it architecturally visible at `readyCycle`. It would therefore seem a block must model
++    // the pipeline. It does not, because **a reader always stalls until its operand is ready**:
++    // `calculatePairReadyCycle` takes `max` over `m_vfReady[reg][lane]` for EVERY read lane (and
++    // `m_viReady` / `m_accReady`), and `run()` then does `while (readyCycle > m_cycle) advanceTo(...)`,
++    // which advances m_cycle one cycle at a time calling `commitReadyPipelines()`. So by the time a
++    // pair issues, every value it reads has been committed. **A stale read cannot happen**, and
++    // applying the write immediately therefore yields the same VALUE the interpreter would read.
++    // The pipeline governs *timing*, not visibility — so a block reproduces the timing separately
++    // (cycle accounting + ready tables, done in C++ after the call) and skips the machinery.
++    //   - WAW is consistent too: with immediate writes the last writer wins, and the interpreter
++    //     reaches the same place via the `m_vfLatestWrite[reg][lane] == write.sequence`
++    //     supersession check, which drops the older pending write.
++    //   - Per-lane granularity is preserved: `m_vfReady` and the supersession check are both
++    //     per lane, and so are the emitted dest-mask blends.
++    //
++    // ★★ INTRA-PAIR ORDERING. Within a pair the interpreter runs execUpper THEN execLower, with a
++    // shadow (`upperVfShadowReg`) that hides the upper's VF write from the lower. Rather than
++    // replicate the shadow, the emitter EXPLOITS the orthogonality of the covered opcodes:
++    //   * SQ / IADDIU / ISUBIU / clip readers are emitted BEFORE the upper. SQ reads VF (so it must
++    //     see the pre-pair value — emitting it first gives exactly that); the VI/clip ops touch
++    //     neither VF nor ACC, and the upper touches neither VI nor clip, so they are order-free.
++    //   * LQ is emitted AFTER the upper, because the upper must see the pre-pair value of LQ's
++    //     destination (the interpreter runs execUpper first).
++    //   * When LQ's destination IS the upper's destination the interpreter SUPPRESSES the lower
++    //     write entirely (`suppressedLowerVf`: execLower writes it, then the shadow restore
++    //     overwrites it with the upper's result and it is never queued). LQ has no other effect —
++    //     its bounds guard is a tautology (§5h) — so the emitter skips it outright.
++    // With that ordering no scratch register and no cut is needed: every classified pair compiles.
++    //
++    // ★ Writes to vf[0] / vi[0] are skipped. The interpreter performs them and then restores
++    // vf[0] = (0,0,0,1) and vi[0] = 0 at the end of every pair, and nothing reads them in between
++    // (the lower has already run), so not writing them at all is equivalent.
++    //
++    // ENTRY GUARD (evaluated in C++; see ps2_vu1_core.cpp). The block is only entered when the
++    // write pipelines are EMPTY and XGKICK is idle. That single condition buys three things:
++    //   1. no incoming pending write can commit mid-block (the block queues nothing, so the
++    //      pipelines stay empty for its whole duration);
++    //   2. no incoming stall is possible — a ready-table entry equals its write's readyCycle, and
++    //      an empty pipeline means every such write has committed, so every entry is <= m_cycle;
++    //   3. no supersession hazard — there is no older pending write for a block write to displace,
++    //      so `m_vfLatestWrite` needs no maintenance.
++    // Blocks are additionally CUT before any pair that would stall on an earlier pair of the same
++    // block, so a block never stalls internally and `m_cycle += pairs` is exact.
++
++    // Per-pair facts the block compiler needs. The interpreter's DecodedInstructionPair is private,
++    // so the caller flattens it into this POD — which also keeps the JIT decoupled from it.
++    struct PairInfo
++    {
++        uint32_t upper = 0, lower = 0;
++        uint8_t upperWriteReg = 0, upperWriteLanes = 0, upperLatency = 0;
++        uint8_t lowerWriteReg = 0, lowerWriteLanes = 0, lowerLatency = 0;
++        uint8_t accWrite = 0;      // lane mask
++        uint16_t viWriteMask = 0;
++        uint8_t viLatency = 0;
++        uint8_t suppressedLowerVf = 0;
++        // reads, used only for the compile-time stall cut
++        uint8_t vfReadReg[4] = {}, vfReadLanes[4] = {};
++        uint8_t vfReadCount = 0;
++        uint16_t viReadMask = 0;
++        uint8_t accRead = 0;
++        bool iBit = false, eBit = false;
++        bool lowerDelaysBranchRead = false;
++    };
++
++    // One ready-table update the C++ side replays after the call, in pair order (the interpreter's
++    // markPairWrites SETS rather than maxes, so replaying in order reproduces it exactly).
++    struct ReadyWrite
++    {
++        uint8_t kind;    // 0 = vf, 1 = vi, 2 = acc
++        uint8_t reg;     // vf/vi register (unused for acc)
++        uint8_t lane;    // 0..3 for vf/acc
++        uint8_t latency;
++        uint16_t issue;  // ISSUE CYCLE of the writing pair, relative to block entry (not the pair
++                         // index -- they diverge as soon as the block absorbs a stall)
++    };
++
++    static constexpr uint32_t kMaxBlockPairs = 32;
++    static constexpr uint32_t kMaxReadyWrites = kMaxBlockPairs * 9;
++
++    typedef void (*BlockFn)(void *state, void *vuData, uint32_t dataSizeMask);
++
++    struct Block
++    {
++        BlockFn fn = nullptr;
++        uint32_t startPc = 0;
++        uint32_t pairs = 0;
++        uint32_t cycles = 0;  // ★ cycles the block consumes = pairs + absorbed stall cycles
++        uint32_t readyCount = 0;
++        bool touchesVuMem = false;   // any SQ or LQ -> pending stores matter
++        uint8_t tailViBackupReg = 0; // see the branch-delay contract in planBlock()
++        // ★ cont.195b: what the block TOUCHES, so the entry guard can be precise instead of
++        // demanding globally-empty pipelines. A pending incoming write only matters if the block
++        // reads or writes the very slot it targets (read -> the interpreter would have stalled
++        // for it; write -> it would clobber the block's newer value on a later commit).
++        uint8_t vfTouched[32] = {}; // per-register lane mask, reads and writes together
++        uint16_t viTouched = 0;
++        uint8_t accTouched = 0;
++        bool readsQ = false;
++        bool readsClip = false;
++        bool writesVuMem = false;   // SQ only
++        ReadyWrite ready[kMaxReadyWrites];
++    };
++
++    // Emit one pair. Returns false only on emitter overflow.
++    inline void emitPairInto(Emitter &e, const CodeBuffer &buf, const PairInfo &pi,
++                             const UpperPlan &up, const LowerPlan &lo)
++    {
++        const uint8_t dest = uint8_t((pi.upper >> 21) & 0xFu);
++        const uint8_t ft = uint8_t((pi.upper >> 16) & 0x1Fu);
++        const uint8_t fs = uint8_t((pi.upper >> 11) & 0x1Fu);
++        const uint8_t fd = uint8_t((pi.upper >> 6) & 0x1Fu);
++        const uint8_t upperDstReg = up.writesFt ? ft : fd;
++
++        // (a) everything except LQ goes BEFORE the upper (see the ordering note above)
++        if (lo.op != LowerOp::Nop && lo.op != LowerOp::Lq)
++            emitLowerPlan(e, buf, lo);
++
++        // (b) the upper. Skipped when it would only write vf[0], which the interpreter restores
++        // at the end of the pair anyway (and under lazy flags it has no other effect).
++        if (up.op != FmacOp::Nop && (up.writesAcc || upperDstReg != 0u))
++        {
++            const int32_t offDst =
++                up.writesAcc ? kOffAcc : (kOffVf + int32_t(upperDstReg) * 16);
++            emitUpper(e, buf, up, kOffVf + int32_t(fs) * 16, kOffVf + int32_t(ft) * 16,
++                      kOffAcc, kOffQ, kOffI, offDst, dest);
++        }
++
++        // (c) LQ last, and only when the interpreter would not have suppressed it.
++        if (lo.op == LowerOp::Lq)
++        {
++            const bool suppressed =
++                (pi.suppressedLowerVf != 0u && pi.suppressedLowerVf == lo.vfReg);
++            if (!suppressed && lo.vfReg != 0u)
++                emitLowerPlan(e, buf, lo);
++        }
++    }
++
++    // Plan a block starting at pairs[0]: classify pairs until a terminator, cutting before any
++    // pair that would stall on an earlier pair of the same block (so `m_cycle += pairs` is exact).
++    // Returns the number of pairs accepted (0 = not compilable).
++    inline uint32_t planBlock(const PairInfo *pairs, uint32_t avail,
++                              UpperPlan *ups, LowerPlan *los,
++                              ReadyWrite *ready, uint32_t &readyCount,
++                              bool &touchesVuMem, uint8_t &tailViBackupReg,
++                              Block *touch, int32_t *issueOf, uint32_t &cycles)
++    {
++        cycles = 0;
++        // Pair index at which each value becomes readable. A write at pair i with latency L is
++        // readable from pair i+L; a read at pair n stalls iff that exceeds n.
++        int32_t vfReady[32][4] = {};
++        int32_t viReady[16] = {};
++        int32_t accReady[4] = {};
++        // Which VI regs this block has already written (for the tail branch-backup rule).
++        uint32_t viWrittenMask = 0u;
++        int32_t prevIssue = -1;      // issue cycle of the previous pair (block entry == cycle 0)
++
++        readyCount = 0;
++        touchesVuMem = false;
++        tailViBackupReg = 0;
++
++        uint32_t n = 0;
++        for (; n < avail && n < kMaxBlockPairs; ++n)
++        {
++            const PairInfo &pi = pairs[n];
++            if (pi.iBit || pi.eBit)
++                break;
++            UpperPlan up;
++            LowerPlan lo;
++            if (!classifyUpperPlan(pi.upper, up))
++                break;
++            if (!classifyLowerPlan(pi.lower, lo))
++                break; // branch / ILW / ISW / anything uncovered terminates the block
++
++            // --- static stall SCHEDULING (cont.195c) -----------------------------------------
++            // The first version CUT the block at any pair that would stall on an earlier pair of
++            // the same block. That threw away most of the reach: FMAC latency is 4, so a run of
++            // 6 pairs is very likely to contain one such read. The stall is entirely static once
++            // issue cycles are known, so the block ABSORBS it instead: `issue` is this pair's
++            // cycle relative to block entry, and every later pair (and every ready-table entry)
++            // is expressed against it rather than against the pair index.
++            int32_t issue = prevIssue + 1;
++            for (uint32_t k = 0; k < pi.vfReadCount && k < 4u; ++k)
++            {
++                uint32_t lanes = pi.vfReadLanes[k] & 0xFu;
++                const uint8_t reg = pi.vfReadReg[k] & 31u;
++                while (lanes != 0u)
++                {
++                    const uint32_t bit = uint32_t(__builtin_ctz(lanes));
++                    lanes &= lanes - 1u;
++                    const int32_t r = vfReady[reg][3u - bit];
++                    if (r > issue) issue = r;
++                }
++            }
++            {
++                uint32_t vr = pi.viReadMask & 0xFFFEu; // VI0 is hardwired, never pending
++                while (vr != 0u)
++                {
++                    const uint32_t reg = uint32_t(__builtin_ctz(vr));
++                    vr &= vr - 1u;
++                    if (viReady[reg] > issue) issue = viReady[reg];
++                }
++            }
++            {
++                uint32_t ar = pi.accRead & 0xFu;
++                while (ar != 0u)
++                {
++                    const uint32_t bit = uint32_t(__builtin_ctz(ar));
++                    ar &= ar - 1u;
++                    if (accReady[3u - bit] > issue) issue = accReady[3u - bit];
++                }
++            }
++            if (issue > int32_t(0xFFFF - 32))
++                break; // pathological; keep `issue` inside its uint16_t field
++
++            // --- room for the ready-table updates this pair produces --------------------------
++            if (readyCount + 9u > kMaxReadyWrites)
++                break;
++
++            ups[n] = up;
++            los[n] = lo;
++            issueOf[n] = issue;
++            prevIssue = issue;
++            if (lo.touchesVuMem)
++                touchesVuMem = true;
++
++            // --- touched-slot summary for the entry guard -----------------------------------
++            if (touch != nullptr)
++            {
++                for (uint32_t k = 0; k < pi.vfReadCount && k < 4u; ++k)
++                    touch->vfTouched[pi.vfReadReg[k] & 31u] |= (pi.vfReadLanes[k] & 0xFu);
++                if (pi.upperWriteReg != 0u)
++                    touch->vfTouched[pi.upperWriteReg & 31u] |= (pi.upperWriteLanes & 0xFu);
++                if (pi.lowerWriteReg != 0u)
++                    touch->vfTouched[pi.lowerWriteReg & 31u] |= (pi.lowerWriteLanes & 0xFu);
++                touch->viTouched |= uint16_t(pi.viReadMask | pi.viWriteMask);
++                touch->accTouched |= uint8_t(pi.accRead | pi.accWrite);
++                if (up.src == OperandSrc::ScalarQ)
++                    touch->readsQ = true;
++                if (lo.op == LowerOp::Fceq || lo.op == LowerOp::Fcand ||
++                    lo.op == LowerOp::Fcor || lo.op == LowerOp::Fcget)
++                    touch->readsClip = true;
++                if (lo.op == LowerOp::Sq)
++                    touch->writesVuMem = true;
++            }
++
++            // --- record writes, exactly as markPairWrites would ------------------------------
++            // Order matters only in that the interpreter SETS (never maxes), and the C++ side
++            // replays these in this same order, so the last write to a slot wins in both.
++            if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
++            {
++                const uint8_t lat = pi.lowerLatency;
++                uint32_t lanes = pi.lowerWriteLanes & 0xFu;
++                while (lanes != 0u)
++                {
++                    const uint32_t bit = uint32_t(__builtin_ctz(lanes));
++                    lanes &= lanes - 1u;
++                    const uint8_t lane = uint8_t(3u - bit);
++                    vfReady[pi.lowerWriteReg][lane] = issue + int32_t(lat);
++                    ready[readyCount++] =
++                        ReadyWrite{0u, pi.lowerWriteReg, lane, lat, uint16_t(issue)};
++                }
++            }
++            if (pi.upperWriteReg != 0u)
++            {
++                const uint8_t lat = pi.upperLatency;
++                uint32_t lanes = pi.upperWriteLanes & 0xFu;
++                while (lanes != 0u)
++                {
++                    const uint32_t bit = uint32_t(__builtin_ctz(lanes));
++                    lanes &= lanes - 1u;
++                    const uint8_t lane = uint8_t(3u - bit);
++                    vfReady[pi.upperWriteReg][lane] = issue + int32_t(lat);
++                    ready[readyCount++] =
++                        ReadyWrite{0u, pi.upperWriteReg, lane, lat, uint16_t(issue)};
++                }
++            }
++            {
++                uint32_t vw = pi.viWriteMask & 0xFFFEu;
++                while (vw != 0u)
++                {
++                    const uint32_t reg = uint32_t(__builtin_ctz(vw));
++                    vw &= vw - 1u;
++                    viReady[reg] = issue + int32_t(pi.viLatency);
++                    ready[readyCount++] =
++                        ReadyWrite{1u, uint8_t(reg), 0u, pi.viLatency, uint16_t(issue)};
++                    viWrittenMask |= (1u << reg);
++                }
++            }
++            {
++                uint32_t aw = pi.accWrite & 0xFu;
++                while (aw != 0u)
++                {
++                    const uint32_t bit = uint32_t(__builtin_ctz(aw));
++                    aw &= aw - 1u;
++                    const uint8_t lane = uint8_t(3u - bit);
++                    accReady[lane] = issue + 1; // kAccForwardLatency
++                    ready[readyCount++] = ReadyWrite{2u, 0u, lane, 1u, uint16_t(issue)};
++                }
++            }
++        }
++
++        // ★★ THE cont.194 BRANCH-DELAY CONTRACT, honoured here.
++        // Blocks terminate at branches, so the pair AFTER a block is very often the branch that
++        // must still read the OLD value of a VI register written by the block's final pair
++        // (`delaysNextBranchRead` — true for IADDIU/ISUBIU). The block writes VI immediately, so
++        // that old value would be gone. The C++ driver therefore captures it BEFORE the call and
++        // replays `recordViWriteForBranch` after — which is only valid if no EARLIER pair of the
++        // block wrote that same register (otherwise the value at the final pair is not the one at
++        // block entry). When it did, drop the final pair and let the interpreter run it.
++        while (n > 0u)
++        {
++            const PairInfo &last = pairs[n - 1u];
++            const uint32_t vw = last.viWriteMask & 0xFFFEu;
++            if (!last.lowerDelaysBranchRead || vw == 0u)
++                break; // nothing to preserve
++            const uint8_t reg = uint8_t(__builtin_ctz(vw));
++            // was this register written by an earlier pair of the block?
++            bool earlier = false;
++            for (uint32_t k = 0; k + 1u < n; ++k)
++                if ((pairs[k].viWriteMask & (1u << reg)) != 0u)
++                    earlier = true;
++            if (!earlier)
++            {
++                tailViBackupReg = reg;
++                break;
++            }
++            --n; // shorten and re-test the new final pair
++            // recompute the ready list for the shortened block
++            uint32_t rc = 0;
++            for (uint32_t k = 0; k < readyCount; ++k)
++                if (int32_t(ready[k].issue) <= issueOf[n - 1u])
++                    ready[rc++] = ready[k];
++            readyCount = rc;
++        }
++        if (n == 0u)
++        {
++            readyCount = 0;
++            cycles = 0;
++            return 0u;
++        }
++        // The interpreter consumes one cycle per pair plus every stall cycle it advanced through,
++        // which is exactly the last pair's issue cycle + 1.
++        cycles = uint32_t(issueOf[n - 1u] + 1);
++        return n;
++    }
++
++    // ---- block store -------------------------------------------------------------------------
++    // Direct-mapped by pair index (pc/8), which is exact: VU1 microcode is at most 16 KB, so there
++    // are at most 2048 pair slots. Wiped whenever the guest uploads new microcode — the same
++    // `generation` the decode cache already tracks.
++    inline void blockBufferReset();
++
++    struct BlockStore
++    {
++        static constexpr uint32_t kPairSlots = 0x4000u / 8u;
++        static constexpr uint32_t kMaxBlocks = kPairSlots + 1u; // one per entry PC, plus slot 0
++
++        Block blocks[kMaxBlocks];
++        int32_t byPair[kPairSlots];
++        uint64_t generation = ~0ull;
++        uint32_t blockCount = 1; // ★ index 0 is a permanent fn==nullptr "rejected" sentinel, so a
++                                 // full store still caches its rejections instead of retrying every
++                                 // pair forever (which is exactly how the first version livelocked)
++        unsigned long hits = 0, misses = 0, compiled = 0, rejected = 0;
++        unsigned long entered = 0, pairsRun = 0, guardBlocked = 0;
++        // which guard condition rejected an entry (aims the next relaxation)
++        unsigned long gbVf = 0, gbVi = 0, gbAcc = 0, gbStore = 0, gbQ = 0, gbClip = 0,
++                      gbXgkick = 0, gbBudget = 0;
++
++        void invalidate(uint64_t gen)
++        {
++            generation = gen;
++            blockBufferReset();
++            blocks[0] = Block{};
++            blockCount = 1;
++            for (uint32_t i = 0; i < kPairSlots; ++i)
++                byPair[i] = -1;
++        }
++    };
++
++    inline BlockStore &blockStore() { static BlockStore s; return s; }
++    // ★ Blocks get their OWN code buffer. They are invalidated on every microcode upload, and
++    // emitted block code would otherwise accumulate forever in the shared buffer -- which is
++    // exactly what happened: after ~7,400 blocks the 8 MB buffer was exhausted and every later
++    // block was silently rejected. A separate buffer can be reset with the store, while the
++    // per-instruction upper cache (whose function pointers are keyed by opcode and live forever)
++    // keeps the original one.
++    inline CodeBuffer &blockBuffer() { static CodeBuffer b; return b; }
++    inline void blockBufferReset() { blockBuffer().reset(); }
++
++    inline bool blockEnabled()
++    {
++        static const bool v = []
++        { const char *e = std::getenv("PS2X_VU1_BLOCK"); return e && e[0] && e[0] != '0'; }();
++        return v;
++    }
++    inline bool blockVerifyEnabled()
++    {
++        static const bool v = []
++        { const char *e = std::getenv("PS2X_VU1_BLOCKVERIFY"); return e && e[0] && e[0] != '0'; }();
++        return v;
++    }
++
++    // Compile (or fetch) the block starting at `startPc`. `pairs` must point at the decoded pairs
++    // from startPc onward, `avail` being how many are contiguously available.
++    // Returns null when nothing at this PC is compilable (that answer is cached too).
++    // Split in two so the caller only pays to flatten PairInfo on a cache MISS.
++    // `known` comes back true when this PC has already been decided (compiled or rejected).
++    inline const Block *findBlock(BlockStore &store, uint64_t generation, uint32_t startPc,
++                                  bool &known)
++    {
++        known = false;
++        if (store.generation != generation)
++            store.invalidate(generation);
++        const uint32_t slot = startPc / 8u;
++        if (slot >= BlockStore::kPairSlots)
++        {
++            known = true; // out of range: never compilable, and nothing to cache
++            return nullptr;
++        }
++        const int32_t existing = store.byPair[slot];
++        if (existing < 0)
++            return nullptr;
++        known = true;
++        ++store.hits;
++        const Block &b = store.blocks[existing];
++        return b.fn != nullptr ? &b : nullptr;
++    }
++
++    inline const Block *buildBlock(CodeBuffer &buf, BlockStore &store, uint64_t generation,
++                                   uint32_t startPc, const PairInfo *pairs, uint32_t avail)
++    {
++        if (store.generation != generation)
++            store.invalidate(generation);
++        const uint32_t slot = startPc / 8u;
++        if (slot >= BlockStore::kPairSlots)
++            return nullptr;
++        ++store.misses;
++        if (store.blockCount >= BlockStore::kMaxBlocks || !buf.ensure(8u << 20))
++        {
++            store.byPair[slot] = 0; // the sentinel: remember the rejection, never retry
++            ++store.rejected;
++            return nullptr;
++        }
++
++        Block &b = store.blocks[store.blockCount];
++        b = Block{};
++        b.startPc = startPc;
++
++        static UpperPlan ups[kMaxBlockPairs];
++        static LowerPlan los[kMaxBlockPairs];
++        uint32_t readyCount = 0;
++        bool touchesVuMem = false;
++        uint8_t tailViBackupReg = 0;
++        static int32_t issueOf[kMaxBlockPairs];
++        uint32_t cycles = 0;
++        const uint32_t n = planBlock(pairs, avail, ups, los, b.ready, readyCount,
++                                     touchesVuMem, tailViBackupReg, &b, issueOf, cycles);
++
++        // A 1-pair block cannot pay for the call, and the interpreter already handles it well.
++        if (n >= 2u && buf.room() > 1024u * (n + 1u))
++        {
++            Emitter e;
++            e.p = buf.code + buf.used;
++            e.end = buf.base + buf.capacity;
++            uint8_t *const start = e.p;
++            for (uint32_t j = 0; j < n; ++j)
++                emitPairInto(e, buf, pairs[j], ups[j], los[j]);
++            e.ret();
++            if (!e.overflow)
++            {
++                buf.used = size_t(e.p - buf.code);
++                b.fn = reinterpret_cast<BlockFn>(start);
++                b.pairs = n;
++                b.cycles = cycles;
++                b.readyCount = readyCount;
++                b.touchesVuMem = touchesVuMem;
++                b.tailViBackupReg = tailViBackupReg;
++                ++store.compiled;
++            }
++        }
++        if (b.fn == nullptr)
++            ++store.rejected;
++        store.byPair[slot] = int32_t(store.blockCount);
++        ++store.blockCount;
++        return b.fn != nullptr ? &b : nullptr;
 +    }
 +
 +    // ---- process-wide singletons + the interface the interpreter uses -----------------------
