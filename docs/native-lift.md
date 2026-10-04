@@ -272,7 +272,7 @@ At rung 4-5 there are two products, and they coexist in one source tree on one b
 
 | Target | Links | Role |
 |---|---|---|
-| `ps2EntryRunner` | everything (generated code + full `ps2xRuntime`) | today's build; the oracle's reference arm; **never stops working** |
+| the runner (`<game_dir>/<game>`) | everything (generated code + full `ps2xRuntime`) | today's build; the oracle's reference arm; **never stops working** |
 | `ps2NativeRunner` | lifted `src/` + native backends only | the standalone product |
 
 `ps2_recomp` and the generated code are kept to the very end **on purpose**: the recompiler's last

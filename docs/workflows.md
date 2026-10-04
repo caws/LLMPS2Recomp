@@ -19,7 +19,7 @@ binary). So workflow sub-agents get **static RE tools only**:
 
 - `funcs.py` (`disasm` / `bounds` / `find` / `scan`), `Grep`/`Read` over `tmp/generated/*.cpp`
   and `recomp/`, `readelf`, ad-hoc `python` ELF scans.
-- **NEVER** `scripts/03_build_game.sh`, **NEVER** `./tmp/ps2EntryRunner`, **NEVER** `gdb`.
+- **NEVER** `scripts/03_build_game.sh`, **NEVER** the built runner (`<game_dir>/<game>`), **NEVER** `gdb`.
 
 Builds and runs stay on the **main agent**, serialized, between workflow phases. State this
 constraint verbatim in the shared context block — agents otherwise reach for a build.

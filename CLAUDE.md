@@ -143,7 +143,7 @@ nohup scripts/03_build_game.sh <game_dir> --skip-regen --changed-recomp > <game_
 … until: [[ -f <game_dir>/tmp/.build_status ]]
 cat <game_dir>/tmp/.build_status   # 0 = success; nonzero = build failed, check build.log
 # VERIFY the binary is current — the embedded BUILD_TAG must match the source you just edited:
-strings <game_dir>/tmp/ps2EntryRunner | grep -oE 'bld-eur-[a-z0-9-]+'   # then also confirm tag= in run.txt after a run
+strings <game_dir>/<game> | grep -oE 'bld-eur-[a-z0-9-]+'   # then also confirm tag= in run.txt after a run
 ```
 
 - `--skip-regen` reuses the game's `tmp/generated/` (skips ps2_recomp). **Any
@@ -151,10 +151,14 @@ strings <game_dir>/tmp/ps2EntryRunner | grep -oE 'bld-eur-[a-z0-9-]+'   # then a
 - `--changed-recomp` installs only changed files so cmake recompiles fewer unity files (an
   override-only edit recompiles just one unity unit + links ≈ 110s; a full regen is many minutes).
 - ps2_recomp runs with the game dir as CWD, so the config's relative paths resolve.
-- The built runner is **moved** to `<game_dir>/tmp/ps2EntryRunner` (per-game, no cross-game
-  clash); `04` runs that binary and writes the log to `<game_dir>/tmp/run.txt`.
+- The built runner is **moved** to `<game_dir>/<game>` — named after the game dir, so each game
+  has a distinctly-named executable and `pgrep -x <game>` identifies it (`rotk_recomp/rotk_recomp`;
+  it was `ps2EntryRunner`, and before cont.346q it lived in `tmp/`). The **CMake target keeps its
+  upstream name** on purpose — renaming it in the fork would conflict with every
+  `git merge upstream/main`. `PS2X_RUNNER_NAME` overrides. `04` runs that binary and writes the
+  log to `<game_dir>/tmp/run.txt`.
 - **Bump `BUILD_TAG` in `register_overrides.cpp` before every build and confirm the embedded
-  tag** (`strings … tmp/ps2EntryRunner`) **+ `tag=` in `run.txt`** — `strings` on the binary
+  tag** (`strings <game_dir>/<game>`) **+ `tag=` in `run.txt`** — `strings` on the binary
   proves which build is on disk *without* a run, catching the stale-binary trap directly.
 
 ## The dominant bug class: truncated / missing functions

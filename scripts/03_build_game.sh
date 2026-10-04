@@ -64,6 +64,13 @@ mkdir -p "$GAME_DIR/tmp"
 rm -f "$GAME_DIR/tmp/.build_status"
 trap 'echo "$?" > "$GAME_DIR/tmp/.build_status"' EXIT
 
+# The game's runnable binary is named after the GAME DIR, not after the CMake target: each game
+# gets a distinctly-named executable, `pgrep -x <name>` identifies it, and a player sees the game's
+# name rather than "ps2EntryRunner". Nothing about a game is hardcoded here -- the name is derived.
+# The CMake target keeps its upstream name on purpose: renaming it in our fork would conflict with
+# every `git merge upstream/main`. PS2X_RUNNER_NAME overrides the derivation.
+RUNNER_NAME="${PS2X_RUNNER_NAME:-$(basename "$GAME_DIR")}"
+
 PS2RECOMP_ROOT="$ROOT_DIR/tools/$GAME/PS2Recomp"
 PS2_RECOMP_BIN="$PS2RECOMP_ROOT/out/build/ps2xRecomp/ps2_recomp"
 RUNTIME_SRC="$PS2RECOMP_ROOT/ps2xRuntime/src/runner"
@@ -271,13 +278,19 @@ fi
 
 if [ "$SKIP_BUILD" = false ]; then
     echo
-    echo "[3/3] Building ps2EntryRunner..."
+    echo "[3/3] Building $RUNNER_NAME..."
     echo "    build type: $BUILD_TYPE  (jobs: ${BUILD_JOBS:-6})"
     # Remove the game's runnable binary BEFORE building, so a failed/incomplete build can't
-    # leave a STALE ps2EntryRunner that 04_run_game.sh would silently run as if it were fresh.
-    # The new binary is mv'd into place only after a successful cmake build below; if the build
-    # fails, ps2EntryRunner is simply absent (04 errors out) rather than running old code.
-    rm -f "$GAME_DIR/ps2EntryRunner"
+    # leave a STALE one that 04_run_game.sh would silently run as if it were fresh. The new
+    # binary is mv'd into place only after a successful cmake build below; if the build fails
+    # it is simply absent (04 errors out) rather than running old code.
+    rm -f "$GAME_DIR/$RUNNER_NAME"
+    # A binary under the pre-rename name would still be runnable by an out-of-date script or an
+    # old shell line, and would be stale from this build onward. Drop it too, and say so.
+    if [[ "$RUNNER_NAME" != "ps2EntryRunner" && -f "$GAME_DIR/ps2EntryRunner" ]]; then
+        echo "    removing the legacy ps2EntryRunner (the runner is now '$RUNNER_NAME')"
+        rm -f "$GAME_DIR/ps2EntryRunner"
+    fi
     # Link with lld — the ~900MB runner relinks in seconds vs minutes on GNU ld.
     # Fallback if lld misbehaves: -fuse-ld=gold, or drop the flag entirely.
     # NOTE: debug info (-g, from RelWithDebInfo) is kept on purpose — gdb on the runner
@@ -295,8 +308,8 @@ if [ "$SKIP_BUILD" = false ]; then
     # binary — there is no stale shared runner to clash with another game being
     # decompiled. The engine build dir is left with no binary, so the next build
     # always relinks fresh (static recomp = one game per binary anyway).
-    BUILT_RUNNER="$PS2RECOMP_ROOT/out/build/ps2xRuntime/ps2EntryRunner"
-    GAME_RUNNER="$GAME_DIR/ps2EntryRunner"
+    BUILT_RUNNER="$PS2RECOMP_ROOT/out/build/ps2xRuntime/ps2EntryRunner"   # the CMake target's own name
+    GAME_RUNNER="$GAME_DIR/$RUNNER_NAME"                                  # what the game ships as
     mkdir -p "$GAME_DIR/tmp"
     mv -f "$BUILT_RUNNER" "$GAME_RUNNER"
 

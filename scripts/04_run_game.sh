@@ -23,7 +23,13 @@ GAME_DIR="${1:-}"
 [[ -d "$GAME_DIR" ]] || { echo "ERROR: game dir not found: $GAME_DIR"; exit 1; }
 GAME_DIR="$(cd "$GAME_DIR" && pwd)"
 
-RUNNER="$GAME_DIR/ps2EntryRunner"   # per-game binary, placed here by 03_build_game.sh
+# The game's runnable binary is named after the GAME DIR, not after the CMake target: each game
+# gets a distinctly-named executable, `pgrep -x <name>` identifies it, and a player sees the game's
+# name rather than "ps2EntryRunner". Nothing about a game is hardcoded here -- the name is derived.
+# The CMake target keeps its upstream name on purpose: renaming it in our fork would conflict with
+# every `git merge upstream/main`. PS2X_RUNNER_NAME overrides the derivation.
+RUNNER_NAME="${PS2X_RUNNER_NAME:-$(basename "$GAME_DIR")}"
+RUNNER="$GAME_DIR/$RUNNER_NAME"   # per-game binary, placed here by 03_build_game.sh
 # Log target: 2nd arg > PS2X_RUN_LOG env > default = console passthrough (no redirect).
 RUN_LOG="${2:-${PS2X_RUN_LOG:-}}"
 if [[ -n "$RUN_LOG" && "$RUN_LOG" != /* ]]; then RUN_LOG="$GAME_DIR/tmp/$RUN_LOG"; fi
@@ -42,7 +48,14 @@ echo "========================================="
 echo
 
 if [[ ! -x "$RUNNER" ]]; then
-    echo "ERROR: ps2EntryRunner not found: $RUNNER"
+    echo "ERROR: runner not found: $RUNNER"
+    # The binary was called ps2EntryRunner until cont.346t. If one is still lying around, say so
+    # -- otherwise "not found" next to a perfectly good 1 GB binary reads as a broken build.
+    if [[ -f "$GAME_DIR/ps2EntryRunner" ]]; then
+        echo "       Found the old ps2EntryRunner here -- the runner is now named '$RUNNER_NAME'."
+        echo "       Rename it:  mv '$GAME_DIR/ps2EntryRunner' '$RUNNER'"
+        echo "       or rebuild:"
+    fi
     echo "Run:   scripts/03_build_game.sh $GAME_DIR"
     exit 1
 fi

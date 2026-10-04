@@ -25,7 +25,7 @@ Non-negotiable constraints (from `CLAUDE.md`; repeated here because they shape e
   watch with `scripts/build_progress.sh <game_dir>`, not by re-polling. A `functions.csv` change
   needs a **full regen**; override-only changes use `--skip-regen --changed-recomp`.
 - **Always run under `timeout`**; the log goes to `<game_dir>/tmp/run.txt` (a spin emits hundreds
-  of MB/s). Run the built binary directly: `PS2_GAMEFILES=$PWD/gamefiles ./tmp/ps2EntryRunner ./<ELF>`.
+  of MB/s). Run the built binary directly: `./<game> ./gamefiles/<ELF>` (the runner is named after the game dir).
 - **No git / no commit unless explicitly asked.** Never add Co-Authored-By / Claude-Session trailers.
 - **No auto-mode** — only do what the user asked. The one exception is a *sanctioned
   checkpoint-bounded run* (§7).
