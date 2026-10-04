@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..a24527d
+index 0000000..8e78dce
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,3162 @@
+@@ -0,0 +1,3174 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -1696,6 +1696,7 @@ index 0000000..a24527d
 +        bool touchesVuMem = false;   // any SQ or LQ -> pending stores matter
 +        uint8_t tailViBackupReg = 0; // see the branch-delay contract in planBlock()
 +        bool endsWithBranch = false; // the block writes m_state.pc itself
++        uint8_t stopReason = 0;      // cont.213: why the block stopped growing (see planBlock)
 +        // ★ cont.195b: what the block TOUCHES, so the entry guard can be precise instead of
 +        // demanding globally-empty pipelines. A pending incoming write only matters if the block
 +        // reads or writes the very slot it targets (read -> the interpreter would have stalled
@@ -1944,7 +1945,7 @@ index 0000000..a24527d
 +                              bool &touchesVuMem, uint8_t &tailViBackupReg,
 +                              Block *touch, int32_t *issueOf, uint32_t &cycles,
 +                              BranchPlan *branchOut, uint8_t &branchBackupReg,
-+                              bool &endsWithBranch)
++                              bool &endsWithBranch, uint8_t &stopReasonOut)
 +    {
 +        // Pair index at which each value becomes readable, in ISSUE cycles relative to entry.
 +        int32_t vfReady[32][4] = {};
@@ -1958,8 +1959,17 @@ index 0000000..a24527d
 +        tailViBackupReg = 0;
 +        branchBackupReg = 0;
 +        endsWithBranch = false;
++        stopReasonOut = 0u;
 +        cycles = 0;
 +
++        // ★ cont.213: WHY did the block stop growing? cont.213's pair histogram found 47% of all
++        // block ENTRIES are 2-pair blocks paying the full ~269-cycle driver cost for two pairs of
++        // work, so the reason a block is short is now the most valuable thing to know.
++        // 0 = ran to the 8-pair cap, 1 = i/e/d/t bit, 2 = upper uncompilable, 3 = issue overflow,
++        // 4 = clip reader after CLIP, 5 = branch rejected, 6 = delay-slot bits,
++        // 7 = delay-slot uncompilable, 8 = cont.194 VI hazard, 9 = ready list full,
++        // 10 = normal branch terminator, 11 = trimmed by the cont.194 tail contract.
++        uint8_t stopReason = 0u;
 +        uint32_t n = 0;
 +        for (; n < avail && n < kMaxBlockPairs; ++n)
 +        {
@@ -1968,22 +1978,22 @@ index 0000000..a24527d
 +            // that -- so such a pair never enters one. (FBRST really can enable them; this was a
 +            // latent gap before cont.198.)
 +            if (pi.iBit || pi.eBit || pi.dBit || pi.tBit)
-+                break;
++                { stopReason = 1u; break; }
 +            UpperPlan up;
 +            LowerPlan lo;
 +            if (!classifyUpperPlan(pi.upper, up))
-+                break;
++                { stopReason = 2u; break; }
 +
 +            int32_t issue = prevIssue + 1;
 +            applyReadStalls(pi, issue, vfReady, viReady, accReady);
 +            if (issue > int32_t(0xFFFF - 64))
-+                break; // pathological; keep `issue` inside its uint16_t field
++                { stopReason = 3u; break; } // pathological; keep `issue` inside its uint16_t field
 +
 +            const bool lowerOk = classifyLowerPlan(pi.lower, lo);
 +            if (lowerOk && sawClip &&
 +                (lo.op == LowerOp::Fceq || lo.op == LowerOp::Fcand ||
 +                 lo.op == LowerOp::Fcor || lo.op == LowerOp::Fcget))
-+                break; // clip reader after a CLIP in the same block -- see the note above
++                { stopReason = 4u; break; } // clip reader after a CLIP in the same block -- see the note above
 +            if (up.op == FmacOp::Clip)
 +                sawClip = true;
 +            if (!lowerOk)
@@ -1993,14 +2003,14 @@ index 0000000..a24527d
 +                if (branchOut == nullptr || n + 1u >= avail || n + 1u >= kMaxBlockPairs ||
 +                    readyCount + 18u > kMaxReadyWrites ||
 +                    !classifyBranch(pi.lower, startPc + 8u * n, pcMask, bp))
-+                    break;
++                    { stopReason = 5u; break; }
 +                const PairInfo &ds = pairs[n + 1u];
 +                UpperPlan dsUp;
 +                LowerPlan dsLo;
 +                if (ds.iBit || ds.eBit || ds.dBit || ds.tBit)
-+                    break;
++                    { stopReason = 6u; break; }
 +                if (!classifyUpperPlan(ds.upper, dsUp) || !classifyLowerPlan(ds.lower, dsLo))
-+                    break; // the delay slot must be compilable, and never a branch itself
++                    { stopReason = 7u; break; } // the delay slot must be compilable, and never a branch itself
 +
 +                // ★ cont.194 hazard: if the pair immediately before the branch made a
 +                // `delaysNextBranchRead` VI write to a register this branch READS, the branch must
@@ -2041,11 +2051,11 @@ index 0000000..a24527d
 +                prevIssue = dsIssue;
 +                ++n;
 +                endsWithBranch = true;
-+                break;
++                { stopReason = 10u; break; }
 +            }
 +
 +            if (readyCount + 9u > kMaxReadyWrites)
-+                break;
++                { stopReason = 9u; break; }
 +
 +            ups[n] = up;
 +            los[n] = lo;
@@ -2077,6 +2087,7 @@ index 0000000..a24527d
 +                break;
 +            }
 +            --n;
++            stopReason = 11u; // trimmed after the fact by the cont.194 tail contract
 +            uint32_t rc = 0;
 +            for (uint32_t k = 0; k < readyCount; ++k)
 +                if (ready[k].pair < n)
@@ -2107,6 +2118,7 @@ index 0000000..a24527d
 +            return 0u;
 +        }
 +        cycles = uint32_t(issueOf[n - 1u] + 1);
++        stopReasonOut = stopReason;
 +        return n;
 +    }
 +
@@ -2251,7 +2263,7 @@ index 0000000..a24527d
 +        bool endsWithBranch = false;
 +        const uint32_t n = planBlock(pairs, avail, startPc, pcMask, ups, los, b.ready, readyCount,
 +                                     touchesVuMem, tailViBackupReg, &b, issueOf, cycles,
-+                                     &branch, branchBackupReg, endsWithBranch);
++                                     &branch, branchBackupReg, endsWithBranch, b.stopReason);
 +
 +        // A 1-pair block cannot pay for the call, and the interpreter already handles it well.
 +        if (n >= 2u && buf.room() > 1024u * (n + 1u))
