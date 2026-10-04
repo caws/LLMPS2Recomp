@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..e20af83
+index 0000000..a24527d
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,3134 @@
+@@ -0,0 +1,3162 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -1658,7 +1658,8 @@ index 0000000..e20af83
 +    {
 +        uint8_t kind;    // 0 = vf, 1 = vi, 2 = acc
 +        uint8_t reg;     // vf/vi register (unused for acc)
-+        uint8_t lane;    // 0..3 for vf/acc
++        uint8_t lanes;   // ★ cont.212: LANE MASK (bit b = lane 3-b) for vf/acc; one record per
++                         // write-group instead of one per lane. Unused for vi.
 +        uint8_t latency;
 +        uint8_t pair;    // index of the writing pair within the block; its issue cycle comes from
 +                         // the schedule (static in planBlock, re-derived at entry when incoming
@@ -1810,6 +1811,38 @@ index 0000000..e20af83
 +        }
 +    }
 +
++    // PS2X_VU1_QUADREADY (default ON; =0 emits the pre-cont.212 per-lane records) -- the kill
++    // switch for the quad coalescing below, and the A/B baseline for its measurement.
++    inline bool quadReadyEnabled()
++    {
++        static const bool v = []
++        { const char *e = std::getenv("PS2X_VU1_QUADREADY"); return !(e && e[0] == '0'); }();
++        return v;
++    }
++
++    // One vf write-group -> the block-local ready table + either ONE masked record (coalesced) or
++    // the pre-cont.212 per-lane records. Bit b of the mask is lane 3-b, matching markPairWrites.
++    inline void emitVfWrites(uint8_t reg, uint32_t lanes, uint8_t lat, int32_t issue, bool coalesce,
++                             ReadyWrite *ready, uint32_t &readyCount, int32_t vfReady[32][4],
++                             uint32_t pairIndex)
++    {
++        if (lanes == 0u)
++            return;
++        const int32_t rc = issue + int32_t(lat);
++        uint32_t m = lanes;
++        while (m != 0u)
++        {
++            const uint32_t bit = uint32_t(__builtin_ctz(m));
++            m &= m - 1u;
++            vfReady[reg][3u - bit] = rc;
++            if (!coalesce)
++                ready[readyCount++] = ReadyWrite{0u, reg, uint8_t(1u << bit), lat,
++                                                 uint8_t(pairIndex)};
++        }
++        if (coalesce)
++            ready[readyCount++] = ReadyWrite{0u, reg, uint8_t(lanes), lat, uint8_t(pairIndex)};
++    }
++
 +    // Record this pair's writes into the block-local ready tables AND the replay list, exactly as
 +    // markPairWrites would (it SETS rather than maxes, so replaying in order reproduces it).
 +    inline void recordPairWrites(const PairInfo &pi, int32_t issue,
@@ -1817,34 +1850,20 @@ index 0000000..e20af83
 +                                 int32_t vfReady[32][4], int32_t viReady[16], int32_t accReady[4],
 +                                 uint32_t pairIndex)
 +    {
++        // ★★ cont.212: ONE record per WRITE-GROUP, carrying a lane mask -- not one per lane.
++        // cont.211's segment split showed `retire` (the largest driver segment) is essentially all
++        // ready-table replay, walking 16.49 records per entry over a mean 4.04 pairs. Those records
++        // differ only in LANE and write the SAME value into CONTIGUOUS uint64 slots (`m_vfReady` is
++        // std::array<std::array<uint64_t,4>,32>, `m_accReady` is std::array<uint64_t,4>), so
++        // collapsing a group is exact: same values, same order, one loop trip instead of four.
++        // PS2X_VU1_QUADREADY=0 emits the pre-cont.212 per-lane records (A/B + kill switch).
++        const bool coalesce = quadReadyEnabled();
 +        if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
-+        {
-+            const uint8_t lat = pi.lowerLatency;
-+            uint32_t lanes = pi.lowerWriteLanes & 0xFu;
-+            while (lanes != 0u)
-+            {
-+                const uint32_t bit = uint32_t(__builtin_ctz(lanes));
-+                lanes &= lanes - 1u;
-+                const uint8_t lane = uint8_t(3u - bit);
-+                vfReady[pi.lowerWriteReg][lane] = issue + int32_t(lat);
-+                ready[readyCount++] =
-+                    ReadyWrite{0u, pi.lowerWriteReg, lane, lat, uint8_t(pairIndex)};
-+            }
-+        }
++            emitVfWrites(pi.lowerWriteReg, pi.lowerWriteLanes & 0xFu, pi.lowerLatency, issue,
++                         coalesce, ready, readyCount, vfReady, pairIndex);
 +        if (pi.upperWriteReg != 0u)
-+        {
-+            const uint8_t lat = pi.upperLatency;
-+            uint32_t lanes = pi.upperWriteLanes & 0xFu;
-+            while (lanes != 0u)
-+            {
-+                const uint32_t bit = uint32_t(__builtin_ctz(lanes));
-+                lanes &= lanes - 1u;
-+                const uint8_t lane = uint8_t(3u - bit);
-+                vfReady[pi.upperWriteReg][lane] = issue + int32_t(lat);
-+                ready[readyCount++] =
-+                    ReadyWrite{0u, pi.upperWriteReg, lane, lat, uint8_t(pairIndex)};
-+            }
-+        }
++            emitVfWrites(pi.upperWriteReg, pi.upperWriteLanes & 0xFu, pi.upperLatency, issue,
++                         coalesce, ready, readyCount, vfReady, pairIndex);
 +        uint32_t vw = pi.viWriteMask & 0xFFFEu;
 +        while (vw != 0u)
 +        {
@@ -1854,14 +1873,23 @@ index 0000000..e20af83
 +            ready[readyCount++] =
 +                ReadyWrite{1u, uint8_t(reg), 0u, pi.viLatency, uint8_t(pairIndex)};
 +        }
-+        uint32_t aw = pi.accWrite & 0xFu;
-+        while (aw != 0u)
++        // ★ ACC writes were per-lane too, and MADD/MSUB dominate this workload, so a full-quad ACC
++        // write was another four records per pair.
++        const uint32_t aw = pi.accWrite & 0xFu;
++        if (aw != 0u)
 +        {
-+            const uint32_t bit = uint32_t(__builtin_ctz(aw));
-+            aw &= aw - 1u;
-+            const uint8_t lane = uint8_t(3u - bit);
-+            accReady[lane] = issue + 1; // kAccForwardLatency
-+            ready[readyCount++] = ReadyWrite{2u, 0u, lane, 1u, uint8_t(pairIndex)};
++            uint32_t m = aw;
++            while (m != 0u)
++            {
++                const uint32_t bit = uint32_t(__builtin_ctz(m));
++                m &= m - 1u;
++                accReady[3u - bit] = issue + 1; // kAccForwardLatency
++                if (!coalesce)
++                    ready[readyCount++] =
++                        ReadyWrite{2u, 0u, uint8_t(1u << bit), 1u, uint8_t(pairIndex)};
++            }
++            if (coalesce)
++                ready[readyCount++] = ReadyWrite{2u, 0u, uint8_t(aw), 1u, uint8_t(pairIndex)};
 +        }
 +    }
 +
