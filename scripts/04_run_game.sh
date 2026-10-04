@@ -23,7 +23,7 @@ GAME_DIR="${1:-}"
 [[ -d "$GAME_DIR" ]] || { echo "ERROR: game dir not found: $GAME_DIR"; exit 1; }
 GAME_DIR="$(cd "$GAME_DIR" && pwd)"
 
-RUNNER="$GAME_DIR/tmp/ps2EntryRunner"   # per-game binary, placed here by 03_build_game.sh
+RUNNER="$GAME_DIR/ps2EntryRunner"   # per-game binary, placed here by 03_build_game.sh
 # Log target: 2nd arg > PS2X_RUN_LOG env > default = console passthrough (no redirect).
 RUN_LOG="${2:-${PS2X_RUN_LOG:-}}"
 if [[ -n "$RUN_LOG" && "$RUN_LOG" != /* ]]; then RUN_LOG="$GAME_DIR/tmp/$RUN_LOG"; fi

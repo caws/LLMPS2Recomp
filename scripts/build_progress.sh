@@ -22,7 +22,7 @@ GAME_DIR="$(cd "$GAME_DIR" 2>/dev/null && pwd)" || { echo "ERROR: game dir not f
 
 LOG="$GAME_DIR/tmp/build.log"
 GEN="$GAME_DIR/tmp/generated"
-RUNNER="$GAME_DIR/tmp/ps2EntryRunner"
+RUNNER="$GAME_DIR/ps2EntryRunner"
 
 [[ -f "$LOG" ]] || { echo "no build.log at $LOG — build not started?"; exit 0; }
 
