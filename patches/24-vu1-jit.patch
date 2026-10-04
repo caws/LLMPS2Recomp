@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..c51012a
+index 0000000..92793c5
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,3207 @@
+@@ -0,0 +1,3261 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -26,6 +26,7 @@ index 0000000..c51012a
 +// unit and no CMakeLists change.
 +// ---------------------------------------------------------------------------
 +
++#include "ps2_vu1_detail.h" // cont.215: vuNormOperandBits, to FOLD the I immediate at plan time
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstring>
@@ -212,6 +213,9 @@ index 0000000..c51012a
 +
 +        void movss_load_d(uint8_t reg, uint8_t base, int32_t disp)
 +        { u8(0xF3); u8(0x0F); u8(0x10); modrmDisp32(reg, base, disp); }
++        // mov dword ptr [base + disp32], imm32   (C7 /0) -- cont.215, the I-register store
++        void mov_mem_imm32(uint8_t base, int32_t disp, uint32_t imm)
++        { u8(0xC7); modrmDisp32(0, base, disp); u32(imm); }
 +        void cvtdq2ps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5B); modrmReg(d, s); }
 +        void cvttps2dq_rr(uint8_t d, uint8_t s) { u8(0xF3); u8(0x0F); u8(0x5B); modrmReg(d, s); }
 +        void cmpps_rri(uint8_t d, uint8_t s, uint8_t imm) { u8(0x0F); u8(0xC2); modrmReg(d, s); u8(imm); }
@@ -1073,6 +1077,14 @@ index 0000000..c51012a
 +        // must still read the OLD value of vi[viDst]; block assembly must exclude such a plan from
 +        // a block's final pair or replicate `recordViWriteForBranch`.
 +        bool delaysNextBranchRead = false;
++        // ★★ cont.215: the I BIT. When the upper instruction's bit 31 is set the lower word is NOT
++        // an instruction at all -- it is a 32-bit float immediate destined for the I register. The
++        // interpreter does `execUpper(upper); state.i = normalizeOperand(bit_cast<float>(lower))`.
++        // Since the immediate is a CONSTANT, the clamp folds at plan time and the block only needs
++        // one store. `planBlock` used to reject these pairs in the same test as the E/D/T HALT bits,
++        // which cost 19 of VU0's 39 uncompilable PCs -- but the I bit is not a halt condition.
++        bool setsI = false;
++        uint32_t iBits = 0; // already through vuNormOperandBits
 +    };
 +
 +    inline bool classifyLowerPlan(uint32_t lower, LowerPlan &plan)
@@ -1260,6 +1272,13 @@ index 0000000..c51012a
 +    // (the VI-only ops ignore rsi/edx, but sharing one signature keeps block assembly uniform).
 +    inline void emitLowerPlan(Emitter &e, const CodeBuffer &buf, const LowerPlan &plan)
 +    {
++        // cont.215: I-bit pair. The upper has already been emitted, so it read the OLD I -- which
++        // is the required order -- and this store makes the new value visible to later pairs.
++        if (plan.setsI)
++        {
++            e.mov_mem_imm32(7 /*rdi*/, kOffI, plan.iBits);
++            return;
++        }
 +        switch (plan.op)
 +        {
 +        case LowerOp::Nop:
@@ -1745,7 +1764,7 @@ index 0000000..c51012a
 +        const bool writesVfLower = (lo.op == LowerOp::Lq || lo.op == LowerOp::Move ||
 +                                    lo.op == LowerOp::Mr32 || lo.op == LowerOp::Mfir ||
 +                                    lo.op == LowerOp::Lqi || lo.op == LowerOp::Lqd);
-+        if (lo.op != LowerOp::Nop && !writesVfLower)
++        if (lo.op != LowerOp::Nop && !writesVfLower && !lo.setsI)
 +            emitLowerPlan(e, buf, lo);
 +
 +        // (b) the upper. Skipped when it would only write vf[0], which the interpreter restores
@@ -1757,6 +1776,14 @@ index 0000000..c51012a
 +            emitUpper(e, buf, up, kOffVf + int32_t(fs) * 16, kOffVf + int32_t(ft) * 16,
 +                      kOffAcc, kOffQ, kOffI, offDst, dest, resultSink);
 +        }
++
++        // ★ cont.215: the I-bit store goes AFTER the upper. The interpreter's order is
++        // `execUpper(upper); state.i = normalizeOperand(imm)`, so an upper that READS I in this
++        // same pair must still see the OLD value. (Emitting it in group (a) meant it was never
++        // emitted at all -- `lo.op` is Nop for an I-bit pair -- which is what the 1.7M-mismatch
++        // shadow-verify caught: later pairs read a stale I.)
++        if (lo.setsI)
++            emitLowerPlan(e, buf, lo);
 +
 +        // (c) the VF-writing lowers last, and only when the interpreter would not have
 +        // suppressed them (destination == the upper's destination -> the write is discarded).
@@ -1977,7 +2004,9 @@ index 0000000..c51012a
 +            // ★ D/T halt bits end the program when FBRST enables them, and a block does not model
 +            // that -- so such a pair never enters one. (FBRST really can enable them; this was a
 +            // latent gap before cont.198.)
-+            if (pi.iBit || pi.eBit || pi.dBit || pi.tBit)
++            // cont.215: `iBit` is NOT a halt bit -- E/D/T end the program, the I bit only says the
++            // lower word is a float immediate. It is handled below instead of rejected here.
++            if (pi.eBit || pi.dBit || pi.tBit)
 +                { stopReason = 1u; break; }
 +            UpperPlan up;
 +            LowerPlan lo;
@@ -1989,7 +2018,22 @@ index 0000000..c51012a
 +            if (issue > int32_t(0xFFFF - 64))
 +                { stopReason = 3u; break; } // pathological; keep `issue` inside its uint16_t field
 +
-+            const bool lowerOk = classifyLowerPlan(pi.lower, lo);
++            // cont.215: with the I bit set the lower word is DATA, so it must not be classified as
++            // an instruction (that is exactly why these pairs bailed out: classifyLowerPlan saw a
++            // float bit pattern). The plan is "no lower op, plus a store of the folded immediate".
++            bool lowerOk;
++            if (pi.iBit)
++            {
++                lo = LowerPlan{};
++                lo.setsI = true;
++                lo.iBits = uint32_t(_mm_cvtsi128_si32(
++                    vuNormOperandBits(_mm_cvtsi32_si128(int32_t(pi.lower)))));
++                lowerOk = true;
++            }
++            else
++            {
++                lowerOk = classifyLowerPlan(pi.lower, lo);
++            }
 +            if (lowerOk && sawClip &&
 +                (lo.op == LowerOp::Fceq || lo.op == LowerOp::Fcand ||
 +                 lo.op == LowerOp::Fcor || lo.op == LowerOp::Fcget))
@@ -2007,10 +2051,20 @@ index 0000000..c51012a
 +                const PairInfo &ds = pairs[n + 1u];
 +                UpperPlan dsUp;
 +                LowerPlan dsLo;
-+                if (ds.iBit || ds.eBit || ds.dBit || ds.tBit)
++                if (ds.eBit || ds.dBit || ds.tBit)
 +                    { stopReason = 6u; break; }
-+                if (!classifyUpperPlan(ds.upper, dsUp) || !classifyLowerPlan(ds.lower, dsLo))
-+                    { stopReason = 7u; break; } // the delay slot must be compilable, and never a branch itself
++                if (!classifyUpperPlan(ds.upper, dsUp))
++                    { stopReason = 7u; break; }
++                // cont.215: a delay slot may carry the I bit too -- same treatment, data not code.
++                if (ds.iBit)
++                {
++                    dsLo = LowerPlan{};
++                    dsLo.setsI = true;
++                    dsLo.iBits = uint32_t(_mm_cvtsi128_si32(
++                        vuNormOperandBits(_mm_cvtsi32_si128(int32_t(ds.lower)))));
++                }
++                else if (!classifyLowerPlan(ds.lower, dsLo))
++                    { stopReason = 7u; break; } // the delay slot must be compilable, never a branch
 +
 +                // ★ cont.194 hazard: if the pair immediately before the branch made a
 +                // `delaysNextBranchRead` VI write to a register this branch READS, the branch must

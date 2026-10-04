@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..ce675f9 100644
+index bd75bba..e10f750 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,6 +3,7 @@
@@ -22,7 +22,7 @@ index bd75bba..ce675f9 100644
  #include <ps2_log.h>
  
  namespace
-@@ -20,6 +24,477 @@ namespace
+@@ -20,6 +24,485 @@ namespace
      {
          return static_cast<uint8_t>(1u << (3u - component));
      }
@@ -237,6 +237,14 @@ index bd75bba..ce675f9 100644
 +static const bool s_vu1ReadyVerify = []
 +{ const char *e = std::getenv("PS2X_VU1_READYVERIFY"); return e && e[0] && e[0] != '0'; }();
 +static unsigned long long g_rvChecked = 0, g_rvBad = 0;
++// cont.215 diagnosis: the last few blocks each unit executed, so a reserved-instruction report can
++// say what put the PC there. BLOCKVERIFY cannot see this -- it never lets a block drive execution.
++// PS2X_VU_LASTBLK=1 (default OFF): it writes on EVERY block entry, so it is gated.
++static const bool s_vuLastBlk = []
++{ const char *e = std::getenv("PS2X_VU_LASTBLK"); return e && e[0] && e[0] != '0'; }();
++struct LastBlk { uint32_t entryPc, pairs, endsBranch, outPc, cycles; };
++static LastBlk g_lastBlk[2][4] = {};
++static unsigned g_lastBlkN[2] = {};
 +static unsigned long long g_bpWhole = 0, g_bpNoPending = 0, g_bpSupersede = 0;
 +static unsigned long long g_bpPairsHist[9] = {};
 +// cont.213: why did the block stop growing -- ALL entries, and the 2-pair entries alone (they are
@@ -500,7 +508,7 @@ index bd75bba..ce675f9 100644
  }
  
  void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
-@@ -66,21 +541,42 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+@@ -66,21 +549,42 @@ VU1Interpreter::VU1Interpreter(Unit unit)
  
  void VU1Interpreter::resetScheduler()
  {
@@ -557,7 +565,7 @@ index bd75bba..ce675f9 100644
      m_efuResourceReady = 0;
      m_workingClip = m_state.clip;
      m_viBranchBackupValue = 0;
-@@ -98,6 +594,15 @@ void VU1Interpreter::reset()
+@@ -98,6 +602,15 @@ void VU1Interpreter::reset()
      m_state.q = 1.0f;
      m_state.r = 0x3F800000u;
      m_cycle = 0;
@@ -573,7 +581,7 @@ index bd75bba..ce675f9 100644
      resetScheduler();
  }
  
-@@ -123,129 +628,110 @@ float VU1Interpreter::normalizeOperand(float value) const
+@@ -123,129 +636,110 @@ float VU1Interpreter::normalizeOperand(float value) const
      return value;
  }
  
@@ -782,7 +790,7 @@ index bd75bba..ce675f9 100644
  
      if (op < 0x3Cu)
      {
-@@ -313,7 +799,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -313,7 +807,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
                  static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
                  static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
                  result = component == 3u
@@ -791,7 +799,7 @@ index bd75bba..ce675f9 100644
                               : acc(component) - vs(left[component]) * vt(right[component]);
                  break;
              }
-@@ -324,6 +810,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -324,6 +818,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
          return true;
      }
  
@@ -799,7 +807,7 @@ index bd75bba..ce675f9 100644
      if (special <= 0x03u)
          result = vs(component) + vt(special & 3u);
      else if (special <= 0x07u)
-@@ -388,7 +875,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -388,7 +883,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
              static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
              static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
              result = component == 3u
@@ -808,7 +816,7 @@ index bd75bba..ce675f9 100644
                           : vs(left[component]) * vt(right[component]);
              break;
          }
-@@ -399,34 +886,208 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -399,34 +894,208 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
      return true;
  }
  
@@ -1036,7 +1044,7 @@ index bd75bba..ce675f9 100644
  }
  
  uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
-@@ -478,8 +1139,10 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+@@ -478,8 +1147,10 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
          }
  
          float product = left * right;
@@ -1049,7 +1057,7 @@ index bd75bba..ce675f9 100644
          // Product-sum instructions report Z/S/U/O from the add/subtract result
          // as current flags, while every product condition accumulates into the
          // corresponding sticky flag.
-@@ -494,6 +1157,13 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -494,6 +1165,13 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
      if (dest == 0u)
          return;
  
@@ -1063,7 +1071,7 @@ index bd75bba..ce675f9 100644
      uint32_t mac = 0u;
      uint32_t status = 0u;
      for (uint32_t component = 0; component < 4u; ++component)
-@@ -514,20 +1184,31 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -514,20 +1192,31 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
          status |= flags;
      }
  
@@ -1103,7 +1111,7 @@ index bd75bba..ce675f9 100644
  
      *entry = {};
      entry->valid = true;
-@@ -538,42 +1219,65 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -538,42 +1227,65 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
      entry->extraSticky = extraSticky;
      entry->writesMac = true;
      entry->writesStatus = true;
@@ -1174,7 +1182,7 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -583,16 +1287,25 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+@@ -583,16 +1295,25 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
  void VU1Interpreter::queueClip(uint32_t clip)
  {
      m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
@@ -1202,7 +1210,7 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -607,16 +1320,19 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+@@ -607,16 +1328,19 @@ void VU1Interpreter::queueFcset(uint32_t clip)
          if (entry.valid && entry.issueCycle == m_cycle)
              entry.writesClip = false;
      }
@@ -1224,7 +1232,7 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -627,6 +1343,14 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+@@ -627,6 +1351,14 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
  {
      uint32_t ignoredFlags = 0u;
      value = normalizeResult(value, ignoredFlags);
@@ -1239,7 +1247,7 @@ index bd75bba..ce675f9 100644
      m_fdiv.valid = true;
      m_fdiv.readyCycle = m_cycle + latency;
      m_fdiv.value = value;
-@@ -637,15 +1361,18 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -637,15 +1369,18 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
  {
      uint32_t ignoredFlags = 0u;
      value = normalizeResult(value, ignoredFlags);
@@ -1260,16 +1268,15 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -654,15 +1381,33 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -654,15 +1389,33 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
  
  void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
  {
 -    for (PendingStore &store : m_storePipeline)
 +    if (s_vu1NoSched)
-     {
--        if (!store.valid)
++    {
 +        if (m_activeVuData && address + 16u <= m_activeVuDataSize)
-         {
++        {
 +            uint32_t oldWords[4]{};
 +            std::memcpy(oldWords, m_activeVuData + address, sizeof(oldWords));
 +            for (uint32_t component = 0; component < 4u; ++component)
@@ -1281,11 +1288,12 @@ index bd75bba..ce675f9 100644
 +        }
 +        return;
 +    }
-+    {
+     {
+-        if (!store.valid)
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_storePipeline, pipe.store, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
-+        {
+         {
 +            PendingStore &store = m_storePipeline[static_cast<size_t>(slot)];
              store.valid = true;
              store.readyCycle = m_cycle + 1u;
@@ -1296,7 +1304,7 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -674,10 +1419,21 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -674,10 +1427,21 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
  {
      if (reg == 0u || laneMask == 0u)
          return;
@@ -1320,7 +1328,7 @@ index bd75bba..ce675f9 100644
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-@@ -685,11 +1441,10 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -685,11 +1449,10 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
              write.reg = reg;
              write.laneMask = laneMask;
              std::copy(value, value + 4, write.value.begin());
@@ -1336,18 +1344,18 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -700,10 +1455,17 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -700,10 +1463,17 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
  {
      if (reg == 0u)
          return;
 -    for (PendingViWrite &write : m_viWritePipeline)
 +    if (s_vu1NoSched)
-     {
--        if (!write.valid)
++    {
 +        m_state.vi[reg] = static_cast<int16_t>(value);
 +        return;
 +    }
-+    {
+     {
+-        if (!write.valid)
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_viWritePipeline, pipe.vi, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
@@ -1356,7 +1364,7 @@ index bd75bba..ce675f9 100644
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-@@ -711,6 +1473,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -711,6 +1481,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
              write.reg = reg;
              write.value = value;
              m_viLatestWrite[reg] = write.sequence;
@@ -1364,7 +1372,7 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -721,21 +1484,31 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -721,21 +1492,31 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
  {
      if (laneMask == 0u)
          return;
@@ -1403,7 +1411,7 @@ index bd75bba..ce675f9 100644
              return;
          }
      }
-@@ -744,11 +1517,59 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -744,11 +1525,59 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
  
  void VU1Interpreter::commitReadyPipelines()
  {
@@ -1425,15 +1433,15 @@ index bd75bba..ce675f9 100644
 +    uint64_t nextReady = kPipeIdle;
 +    PipeTrack fresh;
 +    const auto note = [&nextReady](uint64_t readyCycle)
-+    {
-+        if (readyCycle < nextReady)
-+            nextReady = readyCycle;
-+    };
-+
-+    if (s_vu1PipeVerify && tracked)
      {
 -        if (!entry.valid || entry.readyCycle > m_cycle)
 -            continue;
++        if (readyCycle < nextReady)
++            nextReady = readyCycle;
++    };
+ 
++    if (s_vu1PipeVerify && tracked)
++    {
 +        // Self-check (PS2X_VU1_PIPEVERIFY=1): the only dangerous direction is a mask that
 +        // MISSES a valid slot, which would skip a due commit. Report and repair.
 +        static unsigned long s_misses = 0;
@@ -1455,7 +1463,7 @@ index bd75bba..ce675f9 100644
 +        check("vi", m_viWritePipeline, pipe.vi);
 +        check("acc", m_accWritePipeline, pipe.acc);
 +    }
- 
++
 +    fresh.flag = retirePipe(m_flagPipeline, pipe.flag, tracked, [&](FlagPipelineEntry &entry)
 +    {
 +        if (entry.readyCycle > m_cycle)
@@ -1466,7 +1474,7 @@ index bd75bba..ce675f9 100644
          if (entry.writesMac)
              m_state.mac = entry.mac;
          if (entry.writesStatus)
-@@ -763,80 +1584,158 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -763,80 +1592,158 @@ void VU1Interpreter::commitReadyPipelines()
          if (entry.writesClip)
              m_state.clip = entry.clip;
          entry = {};
@@ -1664,7 +1672,7 @@ index bd75bba..ce675f9 100644
      }
  }
  
-@@ -851,6 +1750,44 @@ void VU1Interpreter::progressXgkick()
+@@ -851,6 +1758,44 @@ void VU1Interpreter::progressXgkick()
          m_xgkick.cycleCredit -= 2u;
          if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
          {
@@ -1709,7 +1717,7 @@ index bd75bba..ce675f9 100644
              reportReservedInstruction(false, 0xFFFFFFFBu);
              m_xgkick.active = false;
              return;
-@@ -879,10 +1816,16 @@ void VU1Interpreter::progressXgkick()
+@@ -879,10 +1824,16 @@ void VU1Interpreter::progressXgkick()
                  tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
              else if (format == 1u)
                  tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
@@ -1728,7 +1736,7 @@ index bd75bba..ce675f9 100644
                  reportReservedInstruction(false, 0xFFFFFFF8u);
                  m_xgkick.active = false;
                  return;
-@@ -890,6 +1833,12 @@ void VU1Interpreter::progressXgkick()
+@@ -890,6 +1841,12 @@ void VU1Interpreter::progressXgkick()
  
              if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
              {
@@ -1741,7 +1749,7 @@ index bd75bba..ce675f9 100644
                  reportReservedInstruction(false, 0xFFFFFFFBu);
                  m_xgkick.active = false;
                  return;
-@@ -922,15 +1871,33 @@ void VU1Interpreter::finishXgkick()
+@@ -922,15 +1879,33 @@ void VU1Interpreter::finishXgkick()
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
@@ -1775,7 +1783,7 @@ index bd75bba..ce675f9 100644
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
      m_xgkick = {};
      m_xgkick.active = true;
-@@ -959,6 +1926,11 @@ bool VU1Interpreter::pipelinesPending() const
+@@ -959,6 +1934,11 @@ bool VU1Interpreter::pipelinesPending() const
  {
      if (m_fdiv.valid || m_xgkick.active)
          return true;
@@ -1787,7 +1795,7 @@ index bd75bba..ce675f9 100644
      for (const ScalarPipelineEntry &entry : m_efu)
          if (entry.valid)
              return true;
-@@ -988,6 +1960,8 @@ void VU1Interpreter::flushPipelines()
+@@ -988,6 +1968,8 @@ void VU1Interpreter::flushPipelines()
  
  uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
  {
@@ -1796,7 +1804,7 @@ index bd75bba..ce675f9 100644
      uint64_t ready = m_cycle;
      const InstructionUsage *usages[2] = {
          &decoded.upperUsage,
-@@ -996,6 +1970,24 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -996,6 +1978,24 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
      {
          if (!usage)
              continue;
@@ -1821,7 +1829,7 @@ index bd75bba..ce675f9 100644
          for (uint32_t index = 0; index < usage->vfReadCount; ++index)
          {
              const VfAccess &access = usage->vfRead[index];
-@@ -1036,6 +2028,47 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -1036,6 +2036,47 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
  
  void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
  {
@@ -1869,7 +1877,7 @@ index bd75bba..ce675f9 100644
      const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
      if (lowerWrite.reg != 0u &&
          decoded.suppressedLowerVf != lowerWrite.reg)
-@@ -1043,11 +2076,10 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+@@ -1043,11 +2084,10 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
          const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
                                       ? decoded.lowerUsage.vfLatency
                                       : decoded.lowerUsage.latency;
@@ -1885,7 +1893,7 @@ index bd75bba..ce675f9 100644
      }
  
      const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1056,23 +2088,22 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+@@ -1056,23 +2096,22 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
          const uint32_t latency = decoded.upperUsage.vfLatency != 0u
                                       ? decoded.upperUsage.vfLatency
                                       : decoded.upperUsage.latency;
@@ -1921,7 +1929,7 @@ index bd75bba..ce675f9 100644
  }
  
  VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper) const
-@@ -1535,8 +2566,52 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+@@ -1535,8 +2574,52 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
                                               const PS2Memory *memory, uint64_t generation)
  {
      const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
@@ -1975,7 +1983,52 @@ index bd75bba..ce675f9 100644
  
      m_cachedVuCode = vuCode;
      m_cachedMemory = memory;
-@@ -1590,6 +2665,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -1581,6 +2664,44 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
+               << " pc=0x" << std::hex << m_state.pc
+               << " instruction=0x" << instruction
+               << std::dec << '\n');
++    {
++        // cont.215: name the blocks that ran just before, newest first.
++        static unsigned s_dumped = 0;
++        if (s_vuLastBlk && s_dumped < 8u)
++        {
++            ++s_dumped;
++            const unsigned u = (m_unit == Unit::VU1) ? 1u : 0u;
++            std::fprintf(stderr, "[vu%u:lastblk] pc=0x%x <-", u, m_state.pc);
++            for (unsigned b = 1; b <= 4u && b <= g_lastBlkN[u]; ++b)
++            {
++                const LastBlk &lb = g_lastBlk[u][(g_lastBlkN[u] - b) & 3u];
++                std::fprintf(stderr, " [in=0x%x pairs=%u br=%u out=0x%x cy=%u]",
++                             lb.entryPc, lb.pairs, lb.endsBranch, lb.outPc, lb.cycles);
++            }
++            std::fprintf(stderr, "\n");
++            // cont.215: is the microcode the block was planned from still the microcode that is
++            // there now? Dump the first pairs plus every generation counter in play.
++            if (m_cachedVuCode != nullptr)
++            {
++                std::fprintf(stderr, "[vu%u:code] cacheGen=%llu storeGen=n/a memGen=%llu |", u,
++                             (unsigned long long)m_cachedCodeGeneration,
++                             (unsigned long long)(m_cachedMemory
++                                 ? (m_unit == Unit::VU1
++                                        ? m_cachedMemory->getVU1CodeGeneration()
++                                        : m_cachedMemory->getVU0CodeGeneration())
++                                 : 0ull));
++                for (uint32_t w = 0; w < 20u; ++w)
++                {
++                    uint32_t word = 0;
++                    std::memcpy(&word, m_cachedVuCode + w * 4u, 4);
++                    if ((w & 1u) == 0u)
++                        std::fprintf(stderr, " %04x:", w * 4u);
++                    std::fprintf(stderr, "%08x%s", word, (w & 1u) ? "" : "/");
++                }
++                std::fprintf(stderr, "\n");
++            }
++        }
++    }
+     m_stopRequested = true;
+ }
+ 
+@@ -1590,6 +2711,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t startPC, uint32_t top, uint32_t itop,
                               uint32_t maxCycles)
  {
@@ -2036,7 +2089,7 @@ index bd75bba..ce675f9 100644
      resetScheduler();
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
-@@ -1633,13 +2762,1128 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,13 +2808,1137 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -2824,12 +2877,21 @@ index bd75bba..ce675f9 100644
 +                    if (tailReg != 0u)
 +                        recordViWriteForBranch(tailReg, tailOld);
 +
++                    const uint32_t blkEntryPc = m_state.pc;
 +                    if (!blk->endsWithBranch)
 +                    {
 +                        uint32_t nextPc = m_state.pc + 8u * blk->pairs;
 +                        if (nextPc >= codeSize)
 +                            nextPc = 0u;
 +                        m_state.pc = nextPc;
++                    }
++                    if (s_vuLastBlk)
++                    {
++                        LastBlk *ring = g_lastBlk[unitIdx];
++                        const unsigned k = g_lastBlkN[unitIdx] & 3u;
++                        ring[k] = LastBlk{blkEntryPc, blk->pairs, blk->endsWithBranch ? 1u : 0u,
++                                          m_state.pc, uint32_t(dynCycles)};
++                        ++g_lastBlkN[unitIdx];
 +                    }
 +                    // else: the block executed the branch and its delay slot and wrote pc itself.
 +
@@ -3166,7 +3228,7 @@ index bd75bba..ce675f9 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1647,6 +3891,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1647,6 +3946,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          }
  
          uint64_t readyCycle = calculatePairReadyCycle(decoded);
@@ -3188,7 +3250,7 @@ index bd75bba..ce675f9 100644
          while (readyCycle > m_cycle)
          {
              if (readyCycle >= budgetEnd)
-@@ -1656,20 +3915,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1656,20 +3970,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              }
              advanceTo(readyCycle);
              readyCycle = calculatePairReadyCycle(decoded);
@@ -3215,7 +3277,7 @@ index bd75bba..ce675f9 100644
          }
  
          const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1677,12 +3935,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1677,12 +3990,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          const bool hasUpperWrite = upperWrite.reg != 0u;
          const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
          const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
@@ -3246,7 +3308,7 @@ index bd75bba..ce675f9 100644
          if (hasUpperWrite)
              std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
          if (hasDistinctLowerWrite)
-@@ -1819,7 +4089,256 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1819,7 +4144,256 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              m_pendingHaltT = tHalt;
          }
  
@@ -3503,7 +3565,7 @@ index bd75bba..ce675f9 100644
          if (programEnded)
              break;
      }
-@@ -1835,4 +4354,294 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1835,4 +4409,294 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_state.cycles = m_cycle;
      if (useVuRounding && previousRoundingMode != -1)
          std::fesetround(previousRoundingMode);
