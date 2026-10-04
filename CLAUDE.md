@@ -61,17 +61,21 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `mods/` + `docs/
 - **All game-specific behavior goes through override hooks** in the game repo's `src/` — never
   patch generated runner files directly. `src/` has a **control plane + domain modules** shape:
   - `src/register_overrides.cpp` is the **CONTROL PLANE**. It owns the single
-    `PS2_REGISTER_GAME_OVERRIDE(...)` descriptor and **every** `runtime.registerFunction(addr, fn)`
-    call, in one ordered list. Nothing else may register a function.
+    `PS2_REGISTER_GAME_OVERRIDE(...)` descriptor and the base game's `runtime.registerFunction(addr, fn)`
+    calls, in **one ordered list**. That list has exactly **one continuation**: its last statement is an
+    unconditional `lotr::mods::registerMods(runtime)` whose body (`mods/register_mods.cpp`) registers the
+    mods — so a mod is added without touching `src/`, while still landing after every base registration.
+    Nothing else anywhere may register a function, and nothing may follow that call or guard it.
   - Hook **bodies** live in `src/<domain>/` (`dbcman/`, `menu_flow/`, `loader/`, `font_text/`, …) as
     named `hook_<addr>` functions. New code: registration line here, body in the domain module —
     see [`docs/overrides.md`](docs/overrides.md) for which module (and when a new one is warranted).
   - **`src/` is the FAITHFUL BASE GAME; a change that alters the original is a MOD** and its body
-    goes in `mods/<mod>/`, never in `src/`. The control plane is still the only registration site:
-    mod registrations sit in **one block at the END** of `applyLOTROverrides`, so last-wins lets a mod
-    take a slot without editing `src/`. Env-gated, **default OFF = original behaviour**, with the gate
+    goes in `mods/<mod>/`, never in `src/`. Adding a mod = a new `mods/<mod>/` folder + one line in
+    `mods/register_mods.cpp`; **`src/` is never edited**. Append (never insert) — two mods on one
+    address are resolved by that order. Env-gated, **default OFF = original behaviour**, with the gate
     in the hook body (an unconditional registration cannot drift into a different guard). The build
-    collects `src/` and `mods/` identically — the split is editorial. See the game repo's
+    collects `src/` and `mods/` identically — the split is editorial — and `check_registrations.py`
+    splices the tail in at its call site, so the audit still sees one ordered list. See the game repo's
     `mods/README.md` and [`docs/overrides.md`](docs/overrides.md).
   - **★ NEVER RELOCATE A REGISTRATION LINE.** Dispatch is last-wins (one slot per address) and many
     registrations sit inside a conditional, so a line's **position and guard are semantics, not

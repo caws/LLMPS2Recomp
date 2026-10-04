@@ -119,13 +119,30 @@ disc did?"* answerable:
 - **`mods/`** = anything that **changes** the original: widescreen, HUD layout, framerate, HD
   texture packs, network play.
 
-The control plane stays the single registration site — a mod does **not** get its own
-`registerFunction` call site. Instead:
+The ordered list does not become two lists — it gets **one tail**. `applyLOTROverrides` ends with a
+single unconditional statement:
 
-- Mod registrations live in **one block at the END** of `applyLOTROverrides`. Dispatch is last-wins,
-  so that position lets a mod take a slot **without editing a line inside `src/`** — the base game
-  keeps reading as one uninterrupted list, and a mod's footprint is its block entry plus its folder.
-- **Append, never insert** within that block, or mods start silently overriding each other.
+```cpp
+// src/register_overrides.cpp — the LAST line of applyLOTROverrides, no guard, nothing after it
+lotr::mods::registerMods(runtime);
+
+// mods/register_mods.cpp — the tail: every mod registers here, in install order
+void registerMods(PS2Runtime& runtime) {
+    runtime.registerFunction(0x145960u, lotr::mods::widescreen::hook_145960);
+}
+```
+
+- Dispatch is last-wins, so everything in the tail lands **after** every base registration and takes
+  its slot **without a line changing inside `src/`**. Adding a mod touches `mods/register_mods.cpp`
+  and the new mod's folder — nothing else, so contributors adding mods never collide on the control
+  plane.
+- **Append, never insert** in the tail, or mods start silently overriding each other.
+- **Nothing may follow that call, and it must never acquire a guard** — a conditional there would
+  gate every mod at once, invisibly.
+- `check_registrations.py` **splices the tail in at the call site** and audits one merged list
+  (`--list` marks each row `base` or `mods`). If the call is present but the tail file is not
+  readable it says so loudly rather than quietly auditing less: a registration the tool cannot see is
+  the exact failure this checker exists to catch.
 - **Env-gated, default OFF = original behaviour**, with the gate in the hook **body** so the
   registration stays unconditional (a registration behind `if (getenv(...))` is how a "default ON"
   flag twice became OFF — see the `BUILD_TAG`/flag discipline in [working-rules](working-rules.md)).
@@ -137,6 +154,11 @@ else** (so a later position cannot change who wins), and the body must move verb
 `check_registrations.py --list` before/after must differ by **exactly** that relocation, at the same
 guard depth, with the **same body hash**, and `--dead` must be unchanged. Anything less is the
 ordinary never-relocate rule.
+
+Note what that buys once the tail exists: moving the registration from the end of
+`applyLOTROverrides` into `registerMods()` is a **no-op for the merged list**, so the checker's own
+diff passes unchanged (`✓ same order, same guards, same bodies`) — the refactor is verified by the
+tool rather than argued for.
 
 ### Mechanics
 

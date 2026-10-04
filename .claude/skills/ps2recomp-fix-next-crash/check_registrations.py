@@ -15,6 +15,10 @@ Two things silently change behaviour while looking like "just moving code":
      disappears, and a DIFFERENT hook wins that address. Any check that masks the preprocessor is
      blind to this — so this tool audits macros explicitly.
 
+The list spans TWO files once a game has mods: applyLOTROverrides() in src/register_overrides.cpp
+calls registerMods() in mods/register_mods.cpp as its last statement, and the tail is spliced in at
+that call site so the audit still sees ONE ordered list.
+
 Usage (from the ENGINE repo):
     check_registrations.py --game <game_dir> [--ref HEAD]      # diff working tree vs a git ref
     check_registrations.py --game <game_dir> --list            # dump the registration table
@@ -26,6 +30,16 @@ import argparse, collections, glob, hashlib, os, re, subprocess, sys
 
 CONTROL = "src/register_overrides.cpp"
 APPLY = "applyLOTROverrides"
+
+# The MODS TAIL. The control plane's list continues in a second TU: applyLOTROverrides() calls
+# registerMods() as its last statement, and mods register there so that adding one touches no file
+# in src/ (docs/overrides.md). The list did not become two lists — so this tool splices the tail in
+# AT THE CALL SITE and audits one ordered list. Without that it would simply stop seeing mods:
+# a mod clobbering a base hook would vanish from the diff and from --dead, which is the exact class
+# of invisible-registration bug this checker exists to catch.
+MODS = "mods/register_mods.cpp"
+MODS_APPLY = "registerMods"
+MODS_CALL = re.compile(r'(?:lotr::)?mods::' + MODS_APPLY + r'\s*\(')
 
 
 # ---------- a C++-aware scanner: a naive paren/brace match walks straight through a format
@@ -113,12 +127,12 @@ def hook_bodies(files):
     return out
 
 
-def registrations(control, bodies):
-    """ordered [(addr, guard_depth, in_if, target, body_hash)] for applyLOTROverrides."""
+def scan_function(control, fname, bodies, origin, where):
+    """ordered [(addr, guard_depth, in_if, target, body_hash)] for one registrar function."""
     mask = code_mask(control)
-    span = func_span(control, APPLY)
+    span = func_span(control, fname)
     if not span:
-        sys.exit(f"error: {APPLY}() not found in {CONTROL}")
+        sys.exit(f"error: {fname}() not found in {origin}")
     fi, fj = span
     lines = control.split('\n')
     in_if, depth = set(), 0
@@ -155,12 +169,79 @@ def registrations(control, bodies):
         target = ref.group(1) if ref else '<lambda>'
         fn = target.split('::')[-1]
         body = bodies.get(fn)
-        if body is None:                       # still an inline lambda
+        if body is None and target == '<lambda>':      # still an inline lambda
             j = control.index('{', control.index(',', s))
             body = control[j:match_block(control, mask, j, '{', '}') + 1]
-        out.append({'addr': addr, 'depth': d, 'if': ln in in_if, 'line': ln + 1,
+        elif body is None:
+            # A NAMED target whose body is in a file we did not load -- say so. Assuming a lambda
+            # here used to crash with `ValueError: substring not found`, which reads like a bug in
+            # the control plane rather than a gap in what the tool can see.
+            print(f"!! {origin}:L{ln + 1} {addr}: body of {target}() not found in the loaded sources",
+                  file=sys.stderr)
+            body = f"<missing:{target}>"
+        out.append({'addr': addr, 'depth': d, 'if': ln in in_if, 'line': ln + 1, 'pos': s,
+                    'where': where,
                     'target': target, 'hash': hashlib.sha1(norm(body).encode()).hexdigest()[:10]})
     return out
+
+
+def mods_call_site(control):
+    """(offset, brace depth, inside #if) of the registerMods() call in applyLOTROverrides, or None.
+
+    The call's own guard applies to every mod: a conditional here would gate all of them at once,
+    so the tail's rows inherit this depth and #if state rather than reporting their own in isolation.
+    """
+    mask = code_mask(control)
+    span = func_span(control, APPLY)
+    if not span:
+        return None
+    fi, fj = span
+    lines = control.split('\n')
+    in_if, depth = set(), 0
+    for n, l in enumerate(lines):
+        if re.match(r'\s*#if', l):
+            depth += 1
+        elif re.match(r'\s*#endif', l):
+            depth = max(0, depth - 1)
+        elif depth:
+            in_if.add(n)
+    hits = [m.start() for m in MODS_CALL.finditer(control) if fi <= m.start() <= fj and mask[m.start()]]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        print(f"!! {MODS_APPLY}() is called {len(hits)} times in {APPLY}() — the tail must be installed once")
+    s = hits[0]
+    d = 0
+    for k in range(fi, s):
+        if not mask[k]:
+            continue
+        if control[k] == '{':
+            d += 1
+        elif control[k] == '}':
+            d -= 1
+    return s, d, control[:s].count('\n') in in_if
+
+
+def registrations(files, bodies):
+    """The ONE ordered list: the control plane, with the mods tail spliced in at its call site."""
+    control = files[CONTROL]
+    out = scan_function(control, APPLY, bodies, CONTROL, 'base')
+
+    call = mods_call_site(control)
+    if call is None:
+        return out                      # no mods tail in this tree (or in this git ref)
+    pos, call_depth, call_if = call
+    if MODS not in files:
+        # Loud, not silent: the list continues somewhere this tool cannot read, so every mod
+        # registration is invisible to the audit.
+        print(f"!! {APPLY}() calls {MODS_APPLY}() but {MODS} was not found — mods are NOT being checked")
+        return out
+    tail = scan_function(files[MODS], MODS_APPLY, bodies, MODS, 'mods')
+    for r in tail:
+        r['depth'] = call_depth + (r['depth'] - 1)   # a guarded call deepens every mod under it
+        r['if'] = r['if'] or call_if
+    at = sum(1 for r in out if r['pos'] < pos)
+    return out[:at] + tail + out[at:]
 
 
 def macros(files):
@@ -190,7 +271,9 @@ def load(game, ref=None):
                 files[p] = subprocess.run(["git", "-C", game, "show", f"{ref}:{p}"],
                                           capture_output=True, text=True).stdout
     else:
-        mods = sorted(glob.glob(f"{game}/mods/*/*.cpp") + glob.glob(f"{game}/mods/*/*.h"))
+        # both levels: mods/register_mods.cpp (the tail) sits at the root, the bodies in mods/<mod>/
+        mods = sorted(glob.glob(f"{game}/mods/*.cpp") + glob.glob(f"{game}/mods/*.h")
+                      + glob.glob(f"{game}/mods/*/*.cpp") + glob.glob(f"{game}/mods/*/*.h"))
         for p in [CONTROL] + sorted(glob.glob(f"{game}/src/*/*.cpp")
                                     + glob.glob(f"{game}/src/*/*.h")) + mods:
             rel = os.path.relpath(p, game) if p.startswith(game) else p
@@ -208,7 +291,8 @@ def dead_list(regs):
         for k, i in enumerate(idxs):
             if any(regs[j]['depth'] == 1 and not regs[j]['if'] for j in idxs[k + 1:]):
                 dead.append(regs[i])
-    return sorted(dead, key=lambda r: r['line'])
+    # ordered by their place in the merged list: 'line' alone would interleave two files.
+    return sorted(dead, key=lambda r: regs.index(r))
 
 
 def main():
@@ -222,24 +306,24 @@ def main():
         sys.exit("error: pass --game <game_dir> (or set PS2RECOMP_GAME)")
 
     now_files = load(a.game)
-    now = registrations(now_files[CONTROL], hook_bodies(now_files))
+    now = registrations(now_files, hook_bodies(now_files))
 
     if a.list:
-        print(f"{'#':>4} {'line':>6} {'addr':>9} {'depth':>5} {'#if':>4}  target")
+        print(f"{'#':>4} {'where':>5} {'line':>6} {'addr':>9} {'depth':>5} {'#if':>4}  target")
         for i, r in enumerate(now):
-            print(f"{i:>4} {r['line']:>6} {r['addr']:>9} {r['depth']:>5} "
+            print(f"{i:>4} {r['where']:>5} {r['line']:>6} {r['addr']:>9} {r['depth']:>5} "
                   f"{'yes' if r['if'] else '':>4}  {r['target']}")
         return
     if a.dead:
         d = dead_list(now)
         print(f"{len(d)} registration(s) can NEVER win — a later UNCONDITIONAL one always overwrites them:")
         for r in d:
-            print(f"  L{r['line']:<6} {r['addr']}  {r['target']}"
+            print(f"  {r['where']}:L{r['line']:<6} {r['addr']}  {r['target']}"
                   f"   (depth {r['depth']}{', inside #if' if r['if'] else ''})")
         return
 
     old_files = load(a.game, a.ref)
-    old = registrations(old_files[CONTROL], hook_bodies(old_files))
+    old = registrations(old_files, hook_bodies(old_files))
     ok = True
 
     # --- preprocessor: same value, and every #if can see its macro
@@ -262,7 +346,7 @@ def main():
         ok = False
     for i, (o, n) in enumerate(zip(old, now)):
         if o['addr'] != n['addr']:
-            print(f"!! #{i}: address {o['addr']} -> {n['addr']}")
+            print(f"!! #{i}: address {o['addr']} -> {n['addr']} ({n['where']}:L{n['line']})")
             ok = False
         elif o['depth'] != n['depth'] or o['if'] != n['if']:
             print(f"!! #{i} {o['addr']}: GUARD changed (depth {o['depth']}{'/#if' if o['if'] else ''}"
