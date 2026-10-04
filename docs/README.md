@@ -60,6 +60,13 @@ mass-rewrite the inputs.**
   measured floor that rules out single-sided CPU work, why the two earlier GPU attempts failed under
   a bit-exactness constraint we have now dropped, the render-target/texture-cache authority model
   (mirroring PCSX2's `GSTextureCache`), and the env-gated phase plan. **Design only — not built.**
+- **[native-lift.md](native-lift.md)** — *the native-lift arc*: the long road from recompilation to
+  a standalone build (no `ps2_recomp`, no `ps2xRuntime`). Carries the verified fact that makes it
+  possible (every call routes through `dispatchGuestBranch`, so a hook at any address intercepts
+  every caller), the rung ladder, why the work is **subsystem-wise, not function-wise**, the
+  differential oracle that has to exist first (the `PS2X_VU0_PROGVERIFY` method, at game scale),
+  the honest scale (5,608 functions / 889k generated lines), and the repo strategy: **no long-lived
+  branches, additive only — `ps2xRuntime` is never cut down.** **Design only — not built.**
 - **[workflows.md](workflows.md)** — *parallel static investigation*: the read-only
   multi-agent RE fan-out (N agents chase sub-questions → one synthesizes a buildable
   override). Use when a frontier is an **architecture question**, not a CSV/override bug.
