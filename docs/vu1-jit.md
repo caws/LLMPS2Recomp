@@ -1138,3 +1138,12 @@ blocks keyed by a compile-time pipeline state and linked directly, a static stal
 lazy flag ring, Q/P as pipelined lanes, XGKICK as a deferred call. Design note and the microVU survey
 live in the fork: `tools/<game>/PS2Recomp/docs/vu1-program-compiler.md` and `docs/microvu-survey.md`.
 
+**(cont.230, later the same day): the program compiler arrived by PORT, not by design.**
+PS2Recomp is GPLv3 like PCSX2, so PCSX2's microVU was imported verbatim (fork
+`ps2xRuntime/src/lib/vu/microvu/`, README there) behind a shim layer and a seam that converts the
+runtime's VU state, routes XGKICK to the GIF arbiter and re-validates programs on micro-memory
+writes. Verified equivalent to the interpreter by a per-program differential oracle
+(`PS2X_VU1_PROGVERIFY`); VU1 went from 33 ns per pair to ~5 ns per cycle. The block JIT stays as
+the `PS2X_VU1_MICROVU=0` fallback. The oracle also exposed a double GIF parse per XGKICK in the old
+path — a reminder that a differential oracle finds bugs on BOTH sides.
+
