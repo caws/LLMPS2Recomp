@@ -74,6 +74,12 @@ mass-rewrite the inputs.**
   override). Use when a frontier is an **architecture question**, not a CSV/override bug.
   Sub-agents are READ-ONLY; **only the main agent builds**. Reusable template at
   `.claude/workflows/re-fanout.js`.
+- **[upstream-merge.md](upstream-merge.md)** — *pulling upstream into the fork*: when a pull is
+  worth taking at all, the read-only commands that size the divergence and count conflicts before
+  touching anything, the **four-bucket compatibility audit** (what cannot break / game-repo link
+  breakage / fork breakage / behavioural), the landing sequence (scratch branch → build → **full
+  regen** → generated-tree diff → oracles → lock bump), and the drift hygiene that keeps the next
+  pull cheap. Carries the worked evaluation of upstream `75d729c` (the IOP emulator).
 - **[upstream-wiki-reference.md](upstream-wiki-reference.md)** — distilled reference of the
   **ran-j/PS2Recomp wiki**: the analyzer→recompiler→runtime pipeline, the full TOML config
   schema (incl. `[patches].instructions` and `skip`=startup-code), the game-override-hook

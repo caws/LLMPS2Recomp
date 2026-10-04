@@ -219,8 +219,13 @@ wait-free replacement, clean skip, SIF/IOP handshake fakes, answering raw-transp
 playability are one project — an upscaled target cannot live in the emulated 4 MB VRAM; the measured
 floor that rules out single-sided CPU work; why the two earlier GPU spikes failed under a
 bit-exactness constraint the user has now dropped; the PCSX2-style target/texture-cache authority
-model; the env-gated phase plan)
-and [`workflows.md`](docs/workflows.md) (parallel **read-only**
+model; the env-gated phase plan),
+[`workflows.md`](docs/workflows.md) (parallel **read-only**
 multi-agent RE fan-out for architecture-question frontiers; sub-agents never build — only the
-main agent does; template at `.claude/workflows/re-fanout.js`). Read those for the durable
+main agent does; template at `.claude/workflows/re-fanout.js`)
+and [`upstream-merge.md`](docs/upstream-merge.md) (**pulling upstream into the fork**: whether a
+pull is worth taking, the read-only divergence/conflict measurement, the four-bucket compatibility
+audit, the landing sequence — scratch branch → build → FULL regen → generated-tree diff → oracles →
+lock bump — and the evaluation of upstream `75d729c`, the IOP emulator: **verdict, do not
+pull now**). Read those for the durable
 strategy; this file + the skill are the quick reference.
