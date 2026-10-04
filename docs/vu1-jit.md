@@ -326,6 +326,38 @@ What it must eliminate, in measured priority order:
    `memcpy` shadow dance in `run()`; dest masks become blends; the decoded-pair by-value copy and
    the `switch` dispatch disappear entirely.
 
+### ★★★ The decision native codegen runs into: EXACTNESS vs VECTORISATION
+
+Our FMAC model computes each lane **twice**: once in float (`execUpper`), then again in **double**
+(`fmacExactLane`) so `fmacClampExact` can decide the clamp and the flags from the exact result.
+That is *more* precise than the reference implementation — PCSX2's `VUops.cpp vuDouble` computes VU
+arithmetic in plain **float**. Lazy flags did not remove it, because the exact value also drives the
+**clamp**, which is architecturally visible in VF/ACC (§4).
+
+For an interpreter that costs ~8% (`fmacExactLane<double>` 4% + `normalizeFmacResult` 4%). **For a
+JIT it is the difference between vectorised and not:**
+
+- **Float-only (PCSX2 model):** one quad FMAC + a clamp sequence — a handful of SSE instructions
+  covering all four lanes at once. This is the shape that reaches ~60 host cycles/pair.
+- **Exact (current model):** four *scalar* double computations plus per-lane comparisons and
+  branches, per instruction. It cannot be vectorised, and in a translated block it would dominate
+  everything else the JIT saves.
+
+So the 30 fps target and the current exactness model are in tension, and this is a **judgement call
+about what the project values**, not something measurement settles:
+
+| option | fidelity | reaches 30 fps? |
+|---|---|---|
+| **A — keep exact double** | bit-exact with today's interpreter; strictly more precise than PCSX2 | very unlikely — the exact path alone would dominate a translated block |
+| **B — PCSX2 float model in the JIT** | matches the reference emulator that ships this game at full speed; differs from our interpreter in rare double-rounding cases | this is the shape that gets there |
+| **C — B with the interpreter as an opt-in oracle** | ship B; keep the exact interpreter in-tree and shadow-verify against it, accepting known divergence classes | same as B, with the divergence measured rather than assumed |
+
+The disproven FMAC shortcut (§3) is evidence the divergence is real but narrow: it showed up only
+for **multi-rounding ops** (MADD/MSUB), one ULP at the FLT_MAX boundary. **C is the recommended
+route** — build the float path, and use the existing verify machinery to *measure* how often and how
+far it diverges on real frames instead of arguing about it. Settle this before writing the emitter,
+because it decides the entire value representation (XMM quad vs per-lane scalar).
+
 **Verification methodology — reuse what already worked.** Keep the interpreter in-tree forever as
 the bit-exact oracle and shadow-verify the JIT against it, the same way the GPU rasterizer arc was
 made trustworthy (per-primitive compare → whole-buffer compare → authority flip). Every wall in
