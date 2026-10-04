@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..cce3025
+index 0000000..0a73c9c
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,3058 @@
+@@ -0,0 +1,3093 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -55,7 +55,13 @@ index 0000000..cce3025
 +        // signed 32-bit, and mmap places the code buffer wherever it likes — typically far more
 +        // than ±2GB from the binary's data segment, which silently truncates the displacement and
 +        // jumps into nowhere. (That is exactly how the first version of this crashed.)
-+        static constexpr size_t kPoolBytes = 512;
++        static constexpr size_t kPoolBytes = 1024;
++        // ★ cont.204: 512..767 is a RESULT SCRATCH -- one quadword per FMAC in a block. When the
++        // program is not lazy-flag clean the block stores each FMAC's PRE-CLAMP result here and the
++        // C++ driver derives the MAC flags from it with the existing bit-exact helper, instead of
++        // the block emitting the flag math itself. One store per FMAC buys blocks in programs that
++        // were previously excluded wholesale -- 68.8% of all still-interpreted cycles.
++        static constexpr size_t kResultScratch = 512;
 +
 +        bool ensure(size_t bytes)
 +        {
@@ -135,6 +141,7 @@ index 0000000..cce3025
 +        const void *ftoiScale(uint8_t k) const { return base + 384 + 16 * (k & 3u); }
 +        const void *ftoiThreshold() const { return base + 448; }
 +        const void *intMax() const { return base + 464; }
++        void *resultSlot(uint32_t k) const { return base + kResultScratch + 16u * (k & 15u); }
 +
 +        void reset() { used = 0; }
 +        size_t room() const { return capacity - kPoolBytes - used; }
@@ -219,6 +226,8 @@ index 0000000..cce3025
 +        void shufps_rri(uint8_t d, uint8_t s, uint8_t imm)
 +        { u8(0x0F); u8(0xC6); modrmReg(d, s); u8(imm); }
 +        void pandn_rip(uint8_t reg, const void *c) { u8(0x66); u8(0x0F); u8(0xDF); modrmRip(reg, c); }
++        // movups [rip + c], xmm(reg)
++        void movups_store_rip(const void *c, uint8_t reg) { u8(0x0F); u8(0x11); modrmRip(reg, c); }
 +
 +        // ---- 32-bit GPR forms (eax/ecx/edx/esi/edi only -> still no REX) ----
 +        // mov r32, [base + disp32]
@@ -394,7 +403,8 @@ index 0000000..cce3025
 +    // Offsets are byte offsets from rdi. Uses xmm0..xmm7; no REX, no branches.
 +    inline void emitUpper(Emitter &e, const CodeBuffer &buf, const UpperPlan &plan,
 +                          int32_t offFs, int32_t offFt, int32_t offAcc, int32_t offQ,
-+                          int32_t offI, int32_t offDst, uint8_t dest)
++                          int32_t offI, int32_t offDst, uint8_t dest,
++                          const void *resultSink = nullptr)
 +    {
 +        if (plan.op == FmacOp::Nop)
 +            return; // upper NOP: no operands read, no destination written
@@ -502,6 +512,11 @@ index 0000000..cce3025
 +        case FmacOp::Abs: e.andps_rip(0, buf.magMask()); break;
 +        }
 +
++        // ★ The PRE-clamp result is what the MAC flags derive from (cont.180's float model), so
++        // it is stashed before the clamp -- the driver then runs the same vuNormResultQuad the
++        // interpreter uses, making the flags bit-exact by construction rather than by re-derivation.
++        if (resultSink != nullptr && plan.clampResult)
++            e.movups_store_rip(resultSink, 0);
 +        if (plan.clampResult)
 +            emitNormResultValue(e, buf, 0, 1, 2, 3, 4);
 +
@@ -1676,13 +1691,20 @@ index 0000000..cce3025
 +        // only if it would have committed before this pair anyway.
 +        uint16_t firstClipIssue = 0xFFFFu;
 +        uint16_t firstQIssue = 0xFFFFu;
++        // FMACs whose MAC flags the driver must replay (only when the block was compiled in
++        // flag-emitting mode). `slot` indexes the code buffer's result scratch.
++        struct FlagWrite { uint8_t pair; uint8_t dest; uint8_t slot; };
++        FlagWrite flagWrites[kMaxBlockPairs];
++        uint8_t flagCount = 0;
++        bool emitsFlags = false;
 +        bool writesVuMem = false;   // SQ only
 +        ReadyWrite ready[kMaxReadyWrites];
 +    };
 +
 +    // Emit one pair. Returns false only on emitter overflow.
 +    inline void emitPairInto(Emitter &e, const CodeBuffer &buf, const PairInfo &pi,
-+                             const UpperPlan &up, const LowerPlan &lo)
++                             const UpperPlan &up, const LowerPlan &lo,
++                             const void *resultSink = nullptr)
 +    {
 +        const uint8_t dest = uint8_t((pi.upper >> 21) & 0xFu);
 +        const uint8_t ft = uint8_t((pi.upper >> 16) & 0x1Fu);
@@ -1706,7 +1728,7 @@ index 0000000..cce3025
 +            const int32_t offDst =
 +                up.writesAcc ? kOffAcc : (kOffVf + int32_t(upperDstReg) * 16);
 +            emitUpper(e, buf, up, kOffVf + int32_t(fs) * 16, kOffVf + int32_t(ft) * 16,
-+                      kOffAcc, kOffQ, kOffI, offDst, dest);
++                      kOffAcc, kOffQ, kOffI, offDst, dest, resultSink);
 +        }
 +
 +        // (c) the VF-writing lowers last, and only when the interpreter would not have
@@ -2138,7 +2160,7 @@ index 0000000..cce3025
 +
 +    inline const Block *buildBlock(CodeBuffer &buf, BlockStore &store, uint64_t generation,
 +                                   uint32_t startPc, uint32_t pcMask,
-+                                   const PairInfo *pairs, uint32_t avail)
++                                   const PairInfo *pairs, uint32_t avail, bool emitFlags)
 +    {
 +        if (store.generation != generation)
 +            store.invalidate(generation);
@@ -2178,8 +2200,21 @@ index 0000000..cce3025
 +            e.p = buf.code + buf.used;
 +            e.end = buf.base + buf.capacity;
 +            uint8_t *const start = e.p;
++            b.emitsFlags = emitFlags;
++            b.flagCount = 0;
 +            for (uint32_t j = 0; j < n; ++j)
 +            {
++                // A flag-writing FMAC is exactly one with clampResult (MAX/MINI/ABS/ITOF/FTOI use
++                // applyDest, which sets no flags; NOP writes nothing).
++                const void *sink = nullptr;
++                if (emitFlags && ups[j].op != FmacOp::Nop && ups[j].clampResult &&
++                    b.flagCount < kMaxBlockPairs)
++                {
++                    const uint8_t slot = b.flagCount;
++                    sink = buf.resultSlot(slot);
++                    b.flagWrites[b.flagCount++] =
++                        Block::FlagWrite{uint8_t(j), uint8_t((pairs[j].upper >> 21) & 0xFu), slot};
++                }
 +                // Stash the pre-write VI value for the branch-delay hazard, before the pair that
 +                // overwrites it (see planBlock).
 +                // The pair that OVERWRITES the branch's operand sits two before the end
@@ -2189,11 +2224,11 @@ index 0000000..cce3025
 +                if (endsWithBranch && j + 1u == n - 1u)
 +                {
 +                    // the branch pair: upper only, then the target selection into ECX
-+                    emitPairInto(e, buf, pairs[j], ups[j], los[j]);
++                    emitPairInto(e, buf, pairs[j], ups[j], los[j], sink);
 +                    emitBranch(e, branch, pcMask, branchBackupReg, branchBackupReg != 0u);
 +                    continue;
 +                }
-+                emitPairInto(e, buf, pairs[j], ups[j], los[j]);
++                emitPairInto(e, buf, pairs[j], ups[j], los[j], sink);
 +            }
 +            if (endsWithBranch)
 +                emitBranchCommit(e); // m_state.pc = ECX, after the delay slot has run
