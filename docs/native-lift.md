@@ -140,8 +140,31 @@ not re-execution diffing. Design it before lifting the kernel, not during.
 "Once everything is working properly" is not a gate — a commercial-game recompilation is never
 done; there is always another level, cutscene, or edge case. Gate on something testable.
 
-- **Phase 0 — now.** The EE/VU1 performance arc; the renderer has left the critical path
-  (cont.331s). **Gate:** game completable start → finish at playable framerate under
+- **Phase 0 — now.** Reach a game that can be played through. ⚠ **Not the EE/VU1 arc** — cont.332
+  is explicit: the upload-free GL frame is already at cont.328's raster-free floor, so VU1 work now
+  buys resolution headroom, not playability. In order:
+  1. **Close the texture-upload cycle.** Hash the *decoded RGBA output* per decode against that
+     key's previous decode; fix the two instrument defects in the same commit. **Ceiling: +1.3 fps**
+     — anything larger on this axis is over-investment.
+  2. **Judge gameplay fidelity** — **vsync-aligned, never flip-aligned** (~108 guest frames of skew
+     between the arms).
+  3. **Audio defaults** (user) — settle the flags so the playthrough has sound. Only
+     three need flipping: `LOTR_AUDINIT`, `LOTR_AUDPLAY`, `PS2X_AUDIO`; most of the cont.273-316 arc
+     was already defaulted ON as it was proven. `LOTR_AUDONADD` / `LOTR_AUDSTMONADD` stay OFF
+     (disproven — cont.305/309: "a sound at registration is our invention"), and `LOTR_AUDPOS` stays
+     OFF because it over-culls (cont.295 silenced 92% of a level's sound) — a work item, not a flip.
+     Check the **registration site AND the body gate** for each (the cont.239 trap), then run
+     `check_registrations.py`.
+  4. **Local co-op** (user) — §11 step 1: honour `port`/`slot` in `readState`, enumerate
+     devices onto ports, validate the game's `CoopSel` entry flow.
+  5. ⚠ **Measure the cost of 3 and 4 BEFORE the playthrough.** Audio and a second input path both
+     move the frame budget, so take each one's cost on the same binary with the flag off. Otherwise
+     the playthrough's fps cannot be read against the cont.332 baseline — *an A/B knob with two
+     effects proves neither*.
+  6. **The playthrough — solo AND co-op, sound on.** It yields a defect *list*, not a green light:
+     playthrough → fix → replay → clean, until clean.
+
+  **Gate:** game completable start → finish, **solo and co-op**, at playable framerate under
   deterministic replay.
 - **Phase 1 — the oracle.** §5. **Gate:** every existing hook either passes differential
   validation or has its divergence understood and written down.
@@ -368,8 +391,9 @@ parameters are commented out**, so every port returns the same pad. What this st
   certainly never been exercised — ⚠ **co-op is an entire untested game path, and it belongs in the
   §6 playthrough**, not discovered later.
 
-**Placement: independent of the lift.** This is input plumbing and a menu path; it could be done at
-any point, and doing it before the playthrough means the playthrough covers co-op too.
+**Placement: DECIDED (user) — Phase 0, before the playthrough, alongside the audio
+defaults.** It is independent of the lift (input plumbing plus a menu path), and doing it first is
+what makes the playthrough cover co-op as well as solo.
 
 #### Step 2 — network co-op
 
