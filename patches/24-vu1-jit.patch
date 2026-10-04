@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..28db1a9
+index 0000000..540f8c4
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,2361 @@
+@@ -0,0 +1,2366 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -1478,7 +1478,7 @@ index 0000000..28db1a9
 +        ++store.misses;
 +        if (store.blockCount >= BlockStore::kMaxBlocks || !buf.ensure(8u << 20))
 +        {
-+            store.byPair[slot] = 0; // the sentinel: remember the rejection, never retry
++            store.byPair[slot] = 0; // 0 == known-uncompilable; never retried
 +            ++store.rejected;
 +            return nullptr;
 +        }
@@ -1520,10 +1520,15 @@ index 0000000..28db1a9
 +            }
 +        }
 +        if (b.fn == nullptr)
++        {
++            // Don't consume a block slot for a rejection -- just remember it as 0.
 +            ++store.rejected;
++            store.byPair[slot] = 0;
++            return nullptr;
++        }
 +        store.byPair[slot] = int32_t(store.blockCount);
 +        ++store.blockCount;
-+        return b.fn != nullptr ? &b : nullptr;
++        return &b;
 +    }
 +
 +    // ---- process-wide singletons + the interface the interpreter uses -----------------------

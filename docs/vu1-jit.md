@@ -667,6 +667,58 @@ ready replay, supersession) is third: it was cut down by driving every loop off 
 `PipeTrack` valid-slot bitmasks and by skipping the mask computation entirely for the ~88% of pairs
 with no compiled block, which is worth having but did not move the number outside the noise.
 
+## 5l. Where the block path actually spends its time (cont.197) — the emitted code is NOT the problem
+
+§5k guessed that blocks were slow because the emitter keeps no operands in registers across pairs.
+**That guess was wrong**, and one instrument settled it: `PS2X_VU1_BLOCKPROF=1` rdtsc-times each
+*segment* of the block fast path. (Timing, not ablation — ablating a block would corrupt VU1 output,
+which feeds the geometry the guest then processes, so the workload itself would diverge and the
+comparison would be meaningless.)
+
+| segment | cycles/entry (before) | cycles/entry (after §5l fix) |
+|---|---|---|
+| **lookup + guard** | **300** | **38** |
+| schedule re-derive | 72 | 78 |
+| early-apply | 27 | 27 |
+| **`fn` — the emitted block itself** | **52** | 59 |
+| retire (ready tables + supersession) | 65 | 65 |
+
+★★ **The emitted code runs at ~16–19 cycles/pair (≈5 ns/pair) — better than the 7.72 ns/pair §5d
+measured.** Codegen was never the bottleneck. Everything around it was.
+
+**The fix:** every arming condition for the fast path (`s_vu1Block`, unit, lazy-flag arming, decode
+cache, `vuData`, the `dataSize` power-of-two test) is **loop-invariant**, and so is the block store's
+generation check — the guest cannot upload microcode while its own program runs (the cont.178
+argument). Hoisting them out of the pair loop, and re-encoding `byPair` so that **0 means
+known-uncompilable** (so the per-pair test is a single array load and a compare against zero,
+with no call), took `lookupMiss` from **248,134,039 to 237,365** — a thousandfold — and the segment
+from 300 to 38 cycles.
+
+⚠ **But the end-to-end number barely moved (≈1.03× both before and after), and the reason is a
+measurement lesson**: the 300-cycle figure was **largely the profiler's own cost**. The lookup
+segment ran on all 263M pairs, and each miss paid two `rdtsc` (~20–30 cycles each), so the
+instrument inflated precisely the path it was measuring. *An rdtsc probe on a path that executes
+hundreds of millions of times measures itself.* The restructure is still right — it removes real
+per-pair instructions — but its share of the win was much smaller than the profile implied.
+
+### Current state and the real remaining costs
+
+**~1.03× at 12.5% coverage** (matched in-binary A/B: 116.17/115.72 ns/pair with blocks vs
+120.50/120.53 without, against a very stable baseline), **39,574,159,276 shadow-verified
+comparisons, 0 mismatches** including cycle fidelity.
+
+Per entry the driver now costs roughly `sched 78 + retire 65 + apply 27 + lookup 38 = 208` cycles
+around `fn`'s 59 — so **the bookkeeping still outweighs the compiled code 3.5:1**, over a mean block
+of only 3.16 pairs. In order:
+
+1. **`retire` (65)** — replaying ready-table entries and bumping `m_vfLatestWrite`, ~16 scattered
+   writes into two 1 KB arrays per entry. This is work the interpreter also does; a block should be
+   able to collapse it (one write per *slot*, not per write).
+2. **`sched` (78)** — the entry re-derivation. Only **1.4% of entries actually need a shift** (§5k),
+   so the common case should be a cheap proof that no shift is needed rather than a full pass.
+3. **Amortise all of it over more pairs** — mean block is 3.16. This is what **linking** buys, and it
+   is the only lever that changes the ratio structurally rather than shaving constants.
+
 ## 6. Measurement discipline (non-negotiable for this arc)
 
 - **Iterate on `PS2X_VU1_PERF` — ns per issued instruction pair.** 0.2% run-to-run noise. Wall-clock
