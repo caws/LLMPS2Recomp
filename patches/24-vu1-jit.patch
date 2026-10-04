@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..6ed67d5
+index 0000000..0babe12
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,1093 @@
+@@ -0,0 +1,1247 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -35,6 +35,10 @@ index 0000000..6ed67d5
 +
 +namespace vu1jit
 +{
++    // ⚠ These self-tests run from inside VU1Interpreter::run, i.e. on the GUEST thread's stack,
++    // which is small. Their large state objects are therefore `static`, not locals: a few hundred
++    // bytes each of VU1State/FakeState exhausted that stack and corrupted the frame, surfacing as
++    // a SIGBUS at the top of run() with unreadable locals — nothing to do with the emitted code.
 +
 +    // ---- executable code buffer ------------------------------------------------------------
 +    // One RWX region. Kept simple deliberately: blocks are append-only and the whole buffer is
@@ -215,6 +219,29 @@ index 0000000..6ed67d5
 +        void shufps_rri(uint8_t d, uint8_t s, uint8_t imm)
 +        { u8(0x0F); u8(0xC6); modrmReg(d, s); u8(imm); }
 +        void pandn_rip(uint8_t reg, const void *c) { u8(0x66); u8(0x0F); u8(0xDF); modrmRip(reg, c); }
++
++        // ---- 32-bit GPR forms (eax/ecx/edx/esi/edi only -> still no REX) ----
++        // mov r32, [base + disp32]
++        void mov_r32_mem(uint8_t reg, uint8_t base, int32_t disp)
++        { u8(0x8B); modrmDisp32(reg, base, disp); }
++        // add eax, imm32  (short form)
++        void add_eax_imm32(int32_t imm) { u8(0x05); u32(uint32_t(imm)); }
++        // shl r32, imm8
++        void shl_r32_imm8(uint8_t reg, uint8_t imm) { u8(0xC1); modrmReg(4, reg); u8(imm); }
++        // and r32(dst), r32(src)
++        void and_r32_r32(uint8_t dst, uint8_t src) { u8(0x23); modrmReg(dst, src); }
++
++        // [base + index*1] via SIB (mod=00, rm=100). Used for VU-memory access: base = rsi
++        // (vuData), index = rax (the computed byte address).
++        void modrmSib(uint8_t reg, uint8_t base, uint8_t index)
++        {
++            u8(uint8_t(0x00 | ((reg & 7) << 3) | 4));
++            u8(uint8_t(((index & 7) << 3) | (base & 7)));
++        }
++        void movups_load_sib(uint8_t reg, uint8_t base, uint8_t index)
++        { u8(0x0F); u8(0x10); modrmSib(reg, base, index); }
++        void movups_store_sib(uint8_t base, uint8_t index, uint8_t reg)
++        { u8(0x0F); u8(0x11); modrmSib(reg, base, index); }
 +
 +        void ret() { u8(0xC3); }
 +    };
@@ -431,6 +458,54 @@ index 0000000..6ed67d5
 +        e.movups_store_d(7, offDst, 0);
 +    }
 +
++    // Offsets into VU1State, taken from the struct itself rather than hardcoded — a layout change
++    // would otherwise silently point the emitted loads at the wrong fields.
++    static constexpr int32_t kOffVf = int32_t(offsetof(VU1State, vf));
++    static constexpr int32_t kOffAcc = int32_t(offsetof(VU1State, acc));
++    static constexpr int32_t kOffQ = int32_t(offsetof(VU1State, q));
++    static constexpr int32_t kOffI = int32_t(offsetof(VU1State, i));
++    static constexpr int32_t kOffVi = int32_t(offsetof(VU1State, vi));
++
++    // ---- lower slot: VU-memory access ------------------------------------------------------
++    // Emitted lower-slot code needs a wider calling convention than the upper slot:
++    //     void f(VU1State *rdi, uint8_t *vuData rsi, uint32_t dataSizeMask edx)
++    // rdi/rsi/rdx are all low registers, so this still needs no REX prefix.
++    //
++    // Address arithmetic, identical to ps2_vu1_lower.cpp:
++    //     addr = ((uint32_t)(int32_t)(vi[base] + imm)) * 16;  addr &= (dataSize - 1);
++    //     if (addr + 16 <= dataSize) { ... }
++    //
++    // ★ That guard is ALWAYS TRUE once the mask is applied, so the emitted code needs no branch:
++    // `dataSize` is a power of two >= 16, `x * 16` has its low four bits clear, and masking with
++    // (dataSize - 1) preserves that — so addr <= dataSize - 16, hence addr + 16 <= dataSize.
++    typedef void (*LowerFn)(void *state, void *vuData, uint32_t dataSizeMask);
++
++    // Compute the VU-memory byte address for vi[base] + imm into EAX.
++    inline void emitVuAddress(Emitter &e, uint8_t viBase, int32_t imm)
++    {
++        e.mov_r32_mem(0 /*eax*/, 7 /*rdi*/, kOffVi + int32_t(viBase) * 4);
++        if (imm != 0)
++            e.add_eax_imm32(imm);
++        e.shl_r32_imm8(0, 4);      // * 16
++        e.and_r32_r32(0, 2 /*edx*/); // & (dataSize - 1)
++    }
++
++    // LQ: load a quadword from VU memory and applyDest it into vf[ft]. Applied IMMEDIATELY by the
++    // interpreter (no pipeline), so the emitted form is a plain masked load plus a dest blend.
++    // No operand clamp: the bytes go into the register exactly as stored.
++    inline void emitLQ(Emitter &e, const CodeBuffer &buf, uint8_t viBase, uint8_t vfDst,
++                       int32_t imm, uint8_t dest)
++    {
++        emitVuAddress(e, viBase, imm);
++        e.movups_load_sib(0, 6 /*rsi*/, 0 /*rax*/);
++        e.movaps_rip(2, buf.destMask(dest));
++        e.pand_rr(0, 2);
++        e.movups_load_d(1, 7, kOffVf + int32_t(vfDst) * 16);
++        e.pandn_rr(2, 1);
++        e.por_rr(0, 2);
++        e.movups_store_d(7, kOffVf + int32_t(vfDst) * 16, 0);
++    }
++
 +    // ---- instruction compiler + cache ------------------------------------------------------
 +    // First integration slice: compile the UPPER instruction of a pair into a native function
 +    // `void f(VU1State*)` and call it in place of execUpper's body. Deliberately conservative —
@@ -446,12 +521,6 @@ index 0000000..6ed67d5
 +    // ★ Only valid when lazy flags is active for the program: the emitted code deliberately does
 +    // not derive MAC/status flags, which cont.177 proved unobservable for those programs.
 +
-+    // Offsets into VU1State, taken from the struct itself rather than hardcoded — a layout change
-+    // would otherwise silently point the emitted loads at the wrong fields.
-+    static constexpr int32_t kOffVf = int32_t(offsetof(VU1State, vf));
-+    static constexpr int32_t kOffAcc = int32_t(offsetof(VU1State, acc));
-+    static constexpr int32_t kOffQ = int32_t(offsetof(VU1State, q));
-+    static constexpr int32_t kOffI = int32_t(offsetof(VU1State, i));
 +
 +    struct Cache
 +    {
@@ -803,7 +872,8 @@ index 0000000..6ed67d5
 +            if (be.overflow)
 +                continue;
 +            UpperFn bfn = reinterpret_cast<UpperFn>(bstart);
-+            FakeState bst{};
++            static FakeState bst; // static: guest-thread stack is small
++            bst = FakeState{};
 +            for (int r = 0; r < 12; ++r)
 +                for (int c = 0; c < 4; ++c)
 +                    bst.vf[r][c] = 1.0f + 0.125f * float(r * 4 + c);
@@ -837,7 +907,8 @@ index 0000000..6ed67d5
 +        buf.used = size_t(e.p - buf.code);
 +        UpperFn fn = reinterpret_cast<UpperFn>(start);
 +
-+        FakeState st{};
++        static FakeState st;  // static: guest-thread stack is small
++        st = FakeState{};
 +        for (int r = 0; r < 12; ++r)
 +            for (int c = 0; c < 4; ++c)
 +                st.vf[r][c] = 1.0f + 0.125f * float(r * 4 + c);
@@ -973,6 +1044,87 @@ index 0000000..6ed67d5
 +        return mismatches == 0;
 +    }
 +
++    // ---- LQ self-test ----------------------------------------------------------------------
++    // Emits LQ and checks it against a C++ reference that mirrors ps2_vu1_lower.cpp exactly,
++    // over negative/positive/wrapping VI bases and every dest mask. This validates the new GPR
++    // and SIB encodings, the sign-extended immediate, the *16 / mask arithmetic, and the blend.
++    // ★ Uses the REAL VU1State, not a mirror struct. An earlier version declared its own
++    // look-alike whose field ORDER differed (vf, acc, q, i, vi instead of vf, vi, acc, q, p, i),
++    // so kOffVi pointed into the wrong field and the test failed with the codegen actually correct.
++    // Testing against the real struct makes offsets agree by construction.
++    inline bool selfTestLQ(CodeBuffer &buf)
++    {
++        if (!buf.ensure(8u << 20))
++            return false;
++        static constexpr uint32_t kDataSize = 16u * 1024u;
++        static uint8_t mem[kDataSize];
++        for (uint32_t k = 0; k < kDataSize; ++k)
++            mem[k] = uint8_t(k * 7u + (k >> 5));
++
++        unsigned long cases = 0, mismatches = 0;
++        static const int32_t bases[6] = {0, 1, 7, -3, 1023, -1024};
++        static const int32_t imms[5] = {0, 1, -1, 15, -16};
++
++        for (int bi = 0; bi < 6; ++bi)
++        {
++            for (int ii = 0; ii < 5; ++ii)
++            {
++                for (uint32_t dest = 0; dest < 16u; ++dest)
++                {
++                    buf.reset();
++                    Emitter e;
++                    e.p = buf.code;
++                    e.end = buf.base + buf.capacity;
++                    uint8_t *const start = e.p;
++                    // vi[3] is the base register, vf[5] the destination
++                    emitLQ(e, buf, 3, 5, imms[ii], uint8_t(dest));
++                    e.ret();
++                    if (e.overflow)
++                        return false;
++                    LowerFn fn = reinterpret_cast<LowerFn>(start);
++
++                    static VU1State a;    // static: guest-thread stack is small
++                    static VU1State b;
++                    a = VU1State{};
++                    for (int c = 0; c < 4; ++c)
++                        a.vf[5][c] = -1.0f - float(c);
++                    a.vi[3] = int16_t(bases[bi]);
++                    b = a;
++
++                    fn(&a, mem, kDataSize - 1u);
++
++                    // reference == ps2_vu1_lower.cpp case 0x00
++                    const uint32_t addr =
++                        (uint32_t(int32_t(b.vi[3] + imms[ii])) * 16u) & (kDataSize - 1u);
++                    if (addr + 16u <= kDataSize)
++                    {
++                        float tmp[4];
++                        std::memcpy(tmp, mem + addr, 16);
++                        for (int c = 0; c < 4; ++c)
++                            if (dest & (1u << (3 - c)))
++                                b.vf[5][c] = tmp[c];
++                    }
++                    for (int c = 0; c < 4; ++c)
++                    {
++                        uint32_t x = 0, y = 0;
++                        std::memcpy(&x, &a.vf[5][c], 4);
++                        std::memcpy(&y, &b.vf[5][c], 4);
++                        ++cases;
++                        if (x != y && ++mismatches <= 8ul)
++                            std::fprintf(stderr,
++                                         "[vu1:jit] LQ MISMATCH base=%d imm=%d dest=%x lane=%d "
++                                         "jit=%08x ref=%08x (addr=%u)\n",
++                                         bases[bi], imms[ii], dest, c, x, y, addr);
++                    }
++                }
++            }
++        }
++        std::fprintf(stderr, "[vu1:jit] LQ selftest cases=%lu mismatches=%lu -> %s\n",
++                     cases, mismatches, mismatches == 0 ? "PASS" : "FAIL");
++        buf.reset();
++        return mismatches == 0;
++    }
++
 +    // ---- FMAC pair self-test ---------------------------------------------------------------
 +    // Emits a complete FMAC pair and compares it against a C++ reference built from the SAME
 +    // helpers the interpreter uses (vuNormOperandQuad / vuNormResultQuadValue + float arithmetic),
@@ -1030,7 +1182,9 @@ index 0000000..6ed67d5
 +
 +                    for (int iter = 0; iter < 24; ++iter)
 +                    {
-+                        FakeState a{};
++                        static FakeState a;   // static: guest-thread stack is small (see header note)
++                        static FakeState b;
++                        a = FakeState{};
 +                        for (int c = 0; c < 4; ++c)
 +                        {
 +                            const uint32_t bs = pool[next() & 7u];
@@ -1042,7 +1196,7 @@ index 0000000..6ed67d5
 +                            std::memcpy(&a.acc[c], &ba, 4);
 +                            std::memcpy(&a.vf[3][c], &bd, 4);
 +                        }
-+                        FakeState b = a;
++                        b = a;
 +
 +                        fn(&a); // emitted code
 +

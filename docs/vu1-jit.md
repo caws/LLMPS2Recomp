@@ -713,3 +713,40 @@ for VF writes (§5b / cont.179b) — *including its branch-delay-slot exclusion*
 Both need what the emitter has never touched: **VI registers** (`int32_t vi[16]`, so GPR handling
 plus the `+imm`, `*16`, `&(dataSize-1)` arithmetic) and **`vuData` as a second argument** — the
 emitted functions currently take only the state pointer, so the calling convention changes.
+
+
+## 5h. Lower-slot codegen: LQ, and two harness traps (cont.192)
+
+First lower-slot instruction. It required the emitter's first **GPR** and **SIB** encodings and a
+wider calling convention — still no REX, since every register used is a low one:
+
+```
+void f(VU1State *rdi, uint8_t *vuData rsi, uint32_t dataSizeMask edx)
+```
+
+**★ The interpreter's bounds guard compiles away.** `addr = ((uint32)(int32)(vi[base]+imm))*16`
+masked with `(dataSize-1)` is always `≤ dataSize-16`: `dataSize` is a power of two ≥ 16, `x*16` has
+its low four bits clear, and masking preserves that. So `if (addr + 16 <= dataSize)` is a tautology
+after the mask and **emitted LQ contains no branch**.
+
+Verified: **1,920 cases** — 6 VI bases (incl. negative and wrapping) × 5 immediates × all 16 dest
+masks — **0 mismatches**.
+
+### Two traps, both in the harness, both worth remembering
+
+1. **Never mirror `VU1State` with a look-alike struct.** The first test declared its own
+   (`vf, acc, q, i, vi`) while the emitter uses `offsetof(VU1State, …)` (`vf, vi, acc, q, p, i`), so
+   `kOffVi` addressed the wrong field — 640 mismatches with the codegen entirely correct. Tests use
+   **the real `VU1State`** so offsets agree by construction.
+2. **★ Self-tests run on the GUEST thread's small stack** (they execute from inside
+   `VU1Interpreter::run`). Two extra `VU1State` locals exhausted it, corrupting the frame and
+   surfacing as **`SIGBUS` at the top of `run()` with unreadable locals** — which looks precisely
+   like emitted-code memory corruption and is nothing of the sort. gdb showed the smashed frame.
+   **All large self-test state must be `static`.**
+
+LQ is **not wired into execution**: there is no lower-slot path until block assembly exists, and a
+per-instruction lower JIT would repeat the ~0 payoff §5b measured. It is verified groundwork with a
+fixed contract.
+
+**Next:** SQ (15.1% — note it goes through `queueStore`, not immediate, per §5g), IADDIU (4.6%),
+clip readers (10.3%), then block assembly.
