@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
-index 6974254..478e246 100644
+index 6974254..cda49bb 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
 @@ -1,6 +1,43 @@
@@ -46,7 +46,7 @@ index 6974254..478e246 100644
  #include <cmath>
  #include <cstring>
  #include <limits>
-@@ -30,6 +67,46 @@ void VU1Interpreter::execUpper(uint32_t instr)
+@@ -30,15 +67,73 @@ void VU1Interpreter::execUpper(uint32_t instr)
      uint8_t fd = FD(instr);
      uint8_t op = instr & 0x3F;
  
@@ -90,20 +90,44 @@ index 6974254..478e246 100644
 +        specialOp == 0x21u || specialOp == 0x23u || specialOp == 0x25u ||
 +        specialOp == 0x27u || specialOp == 0x29u || specialOp == 0x2Du;
 +
++    // PS2X_VU1_SIMD (cont.181, default ON): the operand clamp is a pure function of each lane's
++    // bits (cont.180), so the whole quad is one SSE sequence instead of four scalar calls with
++    // their memcpy round-trips. Bit-identical to normalizeOperand by construction — same masks,
++    // same order of tests — and `=0` keeps the scalar loop reachable for A/B in one binary.
++    static const bool s_simd = []
++    { const char *e = std::getenv("PS2X_VU1_SIMD"); return !(e && e[0] == '0'); }();
++
      float *vd = m_state.vf[fd];
-     float normalizedVs[4];
-     float normalizedVt[4];
-@@ -38,7 +115,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
-     {
-         normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-         normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
--        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+-    float normalizedVs[4];
+-    float normalizedVt[4];
+-    float normalizedAcc[4];
+-    for (uint32_t component = 0; component < 4u; ++component)
++    alignas(16) float normalizedVs[4];
++    alignas(16) float normalizedVt[4];
++    alignas(16) float normalizedAcc[4];
++    if (s_simd)
++    {
++        vuNormOperandQuad(m_state.vf[fs], normalizedVs);
++        vuNormOperandQuad(m_state.vf[ft], normalizedVt);
 +        if (readsAcc)
-+            normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
++            vuNormOperandQuad(m_state.acc, normalizedAcc);
++    }
++    else
+     {
+-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
++            normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
++            if (readsAcc)
++                normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
++        }
      }
      const float *vs = normalizedVs;
      const float *vt = normalizedVt;
-@@ -328,6 +406,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+@@ -328,6 +423,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
              for (int c = 0; c < 4; c++)
              {
                  int32_t iv = vuFloatToInt(vs[c], 1.0f);
@@ -112,7 +136,7 @@ index 6974254..478e246 100644
                  std::memcpy(&result[c], &iv, 4);
              }
              applyDest(vtDest, result, dest);
-@@ -336,6 +416,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+@@ -336,6 +433,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
              for (int c = 0; c < 4; c++)
              {
                  int32_t iv = vuFloatToInt(vs[c], 16.0f);
@@ -121,7 +145,7 @@ index 6974254..478e246 100644
                  std::memcpy(&result[c], &iv, 4);
              }
              applyDest(vtDest, result, dest);
-@@ -344,6 +426,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+@@ -344,6 +443,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
              for (int c = 0; c < 4; c++)
              {
                  int32_t iv = vuFloatToInt(vs[c], 4096.0f);
@@ -130,7 +154,7 @@ index 6974254..478e246 100644
                  std::memcpy(&result[c], &iv, 4);
              }
              applyDest(vtDest, result, dest);
-@@ -352,6 +436,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
+@@ -352,6 +453,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
              for (int c = 0; c < 4; c++)
              {
                  int32_t iv = vuFloatToInt(vs[c], 32768.0f);
