@@ -44,6 +44,27 @@ deliberately unfaithful — they are measurement instruments, never correctness 
 > (~2.3×) — still ~5× short of 30 fps. No interpreter-level work reaches the target. The JIT is
 > not optional.**
 
+### ★ Decomposition REFRESHED at the current baseline (cont.180, 139.7 ns/pair)
+
+The table above was measured at a ~204 ns/pair baseline and is now **stale** — cont.177–180 removed
+most of the flag bucket. Re-measured on build 238:
+
+| ablation | ns/pair | saving | was (at ~204) |
+|---|---|---|---|
+| baseline (shipped) | 139.72 | — | — |
+| `PS2X_VU1_NOSCHED=1` — scheduler free | **103.13** | **26.2%** | ~33% |
+| `PS2X_VU1_NOFLAGS=1` — all flag work free | 130.15 | **6.8%** | ~27% |
+
+Two conclusions:
+1. **The flag bucket is essentially spent** — 27% → 6.8%, taken by lazy flags (§4) and the PCSX2
+   result model (§4c). There is no third bite there.
+2. **Scheduler bookkeeping is now the single biggest remaining bucket (26.2%)** — and cont.179b
+   showed a *piece* of it (per-write visibility resolution) yields ~0 on its own, because the cost
+   is the whole per-pair queue/commit/mark structure rather than any one step. It only pays when a
+   block is translated as a unit with no pipelines at all.
+3. **Even with BOTH entirely free (~95–100 ns/pair) the target is still ~5.7× away.** No remaining
+   interpreter-level work, in any combination, reaches 17.0 ns/pair.
+
 ## 2. Already landed — stage 1 (1.37×) and lazy flags (1.20×)
 
 Cumulative: **280.7 → 141.2 ns/pair = 1.99×**, all default ON with kill switches. Stage 1 is below;
