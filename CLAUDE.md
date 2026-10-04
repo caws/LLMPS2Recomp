@@ -33,12 +33,12 @@ first disc/file read, fixing crashes/stalls one frontier at a time. Readability 
 `config.toml`, `functions.csv`, the ELF, and `gamefiles/` are **provided per game** — never
 generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored: the ELF
 (copyright), `gamefiles/`, `tmp/`. The example game lives at
-`~/Documents/projects/decompilations/rotk_decomp`.
+`~/Documents/projects/decompilations/rotk_recomp`.
 
 ## Hard constraints (do not violate)
 
 - **ALWAYS run `scripts/…` from THIS engine repo, pointed AT the game dir — never from the
-  game repo.** `scripts/` exists ONLY here (`LLMPS2Recomp/`); the game repo (`rotk_decomp/`,
+  game repo.** `scripts/` exists ONLY here (`LLMPS2Recomp/`); the game repo (`rotk_recomp/`,
   etc.) has **no `scripts/`**. Invoke as `scripts/03_build_game.sh <ABSOLUTE-game-dir> …` from
   the default cwd (this engine dir). **Never `cd <game_dir>` first** and never run the scripts
   while cwd is the game repo — `cd <game_dir> && scripts/03_build_game.sh …` fails with
@@ -88,6 +88,11 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   needed or a file elsewhere looks removable, **say so and let the user decide** — do not delete
   it yourself. Inside the two allowed folders, still prefer surfacing over deleting anything you
   did not create (see the `.bak` runner binaries).
+- **★ REPO SCOPE: touch ONLY the repos the user has explicitly allowed** — currently this engine
+  repo (`LLMPS2Recomp/`) and the game repo (`rotk_recomp/`, remote `caws/rotk_recomp`). Every other
+  repo or folder (`rotk_decomp_usa/`, `PS2AIRecomp/`, the archived `caws/rotk_decomp`, sibling
+  projects, the home dir) is **off limits for any mutation**: no edits, no git commands, no remotes,
+  no deletes. If a task appears to need another repo, stop and ask (user directive).
 - **Git: local commits on validated progress are fine (operating-manual §8); ★ NEVER push, force-push, create remote branches/tags or change repo settings without the user's explicit approval for that specific action** (user directive). No destructive git unless explicitly asked.
 - No "auto mode" — only take actions the user has asked for.
 
@@ -107,7 +112,7 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   brightness (file size is NOT reliable — a small blob on black compresses as tiny as pure black).
 - `tools/<game>/PS2Recomp/` — that game's own toolchain + runtime clone (separate repo,
   read-only to us; cloned per game so builds never collide and each can be re-pulled
-  independently). The example game's clone is `tools/rotk_decomp/PS2Recomp/`.
+  independently). The example game's clone is `tools/rotk_recomp/PS2Recomp/`.
 
 Everything per-game (ELF, config, functions.csv, overrides, generated output) is derived
 from `<game_dir>` and its `recomp/config.toml`; nothing about a game is hardcoded here.

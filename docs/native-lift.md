@@ -3,7 +3,7 @@
 > **DESIGN ONLY, and GAME-AGNOSTIC.** Nothing here is built. This file is the *method*; each game's
 > numbers, ordered work, module ranking and enhancement targets live in that game's
 > `docs/native-lift-plan.md` (for the example game,
-> `rotk_decomp/docs/native-lift-plan.md`). Keep this file free of any one game's facts. This doc exists so the arc is decided before it is
+> `rotk_recomp/docs/native-lift-plan.md`). Keep this file free of any one game's facts. This doc exists so the arc is decided before it is
 > started, because its failure modes are ordering mistakes that are expensive to unwind.
 > Companion to [`gl-renderer.md`](gl-renderer.md) and [`vu1-jit.md`](vu1-jit.md).
 
@@ -282,7 +282,7 @@ job is not to run the game, it is to *be the oracle*. Retire it only once nothin
 
 | Repo | Role | Strategy |
 |---|---|---|
-| `rotk_decomp` | `src/` — lifted code | trunk + short-lived `lift/<subsys>`; flags carry risk |
+| `rotk_recomp` | `src/` — lifted code | trunk + short-lived `lift/<subsys>`; flags carry risk |
 | `PS2Recomp` (`lotr`) | seams and native backends — **additive only** | stays a long-lived branch vs `upstream/main`, merging *from* upstream and never back; no subsystem is ever removed, so `git merge upstream/main` keeps working |
 | `LLMPS2Recomp` | docs, scripts | trunk; it barely moves |
 

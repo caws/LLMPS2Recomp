@@ -129,7 +129,7 @@ over-bounds (a "function" that runs hundreds of bytes with no `jr ra` is the §o
 Behaviorally a false-positive small entry is inert (nothing dispatches to it; the bytes are
 unchanged), so a scoped mass-add is safe — the real risk is an over-bound blowing up the build,
 which `--max-size` guards. Always: append → **FULL regen** → confirm the not-found storm shrank
-and the boot advanced. (rotk_decomp: this found ~133 missing fns in 0x130000-0x222000
+and the boot advanced. (rotk_recomp: this found ~133 missing fns in 0x130000-0x222000
 in one pass — the vtable-method tail behind the post-loading pc-zero — after the run-log only
 ever revealed them one stalled frontier at a time.)
 

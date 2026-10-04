@@ -7,7 +7,7 @@ functions (especially small vtable-method stubs and no-prologue leaf functions).
 When such a function is jalr'd at runtime, ps2_recomp can't find it, the runtime
 recover-pc's, and `v0` is left holding the callee ADDRESS — which downstream code
 then uses as a return value (e.g. a size), producing absurd values and crashes.
-(That was the post-loading pc-zero stack-stomp in rotk_decomp: 12 per-type
+(That was the post-loading pc-zero stack-stomp in rotk_recomp: 12 per-type
 size functions at gp-0x67E0 were missing, so each "size" came back as fnptr+4 ~= 1.9MB.)
 
 This tool finds the gaps two ways and proposes gapfix CSV rows you can append

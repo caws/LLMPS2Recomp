@@ -101,7 +101,7 @@ def scan_row(data, segs, start, end, jonly, csv_starts=frozenset()):
     is dispatchable, so it is not swallowed — the enclosing row is merely over-bound and
     overlaps it (a different bug, fixed by shortening END alone). Skipping these matters:
     without it the split emits a DUPLICATE row for an address that already has one, which
-    is how 4 duplicate starts got into rotk_decomp's CSV before validation
+    is how 4 duplicate starts got into rotk_recomp's CSV before validation
     caught them. The enclosing row still gets shortened, which removes the overlap.
     """
     targets = set()
