@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..0a73c9c
+index 0000000..e20af83
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,3093 @@
+@@ -0,0 +1,3134 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -55,7 +55,7 @@ index 0000000..0a73c9c
 +        // signed 32-bit, and mmap places the code buffer wherever it likes — typically far more
 +        // than ±2GB from the binary's data segment, which silently truncates the displacement and
 +        // jumps into nowhere. (That is exactly how the first version of this crashed.)
-+        static constexpr size_t kPoolBytes = 1024;
++        static constexpr size_t kPoolBytes = 1536;
 +        // ★ cont.204: 512..767 is a RESULT SCRATCH -- one quadword per FMAC in a block. When the
 +        // program is not lazy-flag clean the block stores each FMAC's PRE-CLAMP result here and the
 +        // C++ driver derives the MAC flags from it with the existing bit-exact helper, instead of
@@ -141,7 +141,7 @@ index 0000000..0a73c9c
 +        const void *ftoiScale(uint8_t k) const { return base + 384 + 16 * (k & 3u); }
 +        const void *ftoiThreshold() const { return base + 448; }
 +        const void *intMax() const { return base + 464; }
-+        void *resultSlot(uint32_t k) const { return base + kResultScratch + 16u * (k & 15u); }
++        void *resultSlot(uint32_t k) const { return base + kResultScratch + 16u * (k & 31u); }
 +
 +        void reset() { used = 0; }
 +        size_t room() const { return capacity - kPoolBytes - used; }
@@ -380,7 +380,7 @@ index 0000000..0a73c9c
 +
 +    // The FMAC shapes covered. Max/Min/Abs use the interpreter's `applyDest` (no result clamp and
 +    // no flags) rather than `applyFmacDest` — a real semantic difference, so it is explicit here.
-+    enum class FmacOp { Add, Sub, Mul, Madd, Msub, Max, Min, Abs, Nop, Itof, Ftoi };
++    enum class FmacOp { Add, Sub, Mul, Madd, Msub, Max, Min, Abs, Nop, Itof, Ftoi, Clip };
 +
 +    // Where the second operand comes from. cont.186 showed the q/i-operand family is the single
 +    // biggest gap in upper coverage (MULq alone is 6.8% of executed pairs).
@@ -408,6 +408,23 @@ index 0000000..0a73c9c
 +    {
 +        if (plan.op == FmacOp::Nop)
 +            return; // upper NOP: no operands read, no destination written
++
++        // ★ CLIP writes neither vf nor acc -- only the clip register, through the flag pipeline.
++        // Its comparisons are on RAW bits (not normalized operands), so rather than emit them the
++        // block stashes vf[fs] and vf[ft] and the driver replays the interpreter's own comparison
++        // and queueClip at the right cycle. Bit-exact by construction, and one CLIP no longer ends
++        // a block (it was 9.5% of residual cycles, and it fragments the runs around it).
++        if (plan.op == FmacOp::Clip)
++        {
++            if (resultSink != nullptr)
++            {
++                e.movups_load_d(0, 7, offFs);
++                e.movups_store_rip(resultSink, 0);
++                e.movups_load_d(0, 7, offFt);
++                e.movups_store_rip(static_cast<const uint8_t *>(resultSink) + 16, 0);
++            }
++            return;
++        }
 +
 +        if (plan.op == FmacOp::Ftoi)
 +        {
@@ -1486,6 +1503,9 @@ index 0000000..0a73c9c
 +            plan.writesAcc = false;
 +            plan.itofShift = uint8_t(sel & 3u);
 +            return arith(FmacOp::Itof, OperandSrc::None, 0, false, false);
++        case 0x1F: // CLIP -- writes only the clip register (via the flag pipeline)
++            plan.writesAcc = false;
++            return arith(FmacOp::Clip, OperandSrc::None, 0, false, false);
 +        case 0x2F:
 +        case 0x30:
 +            // ★ Upper NOP. It emits NOTHING, but it must count as COVERED: it is 26.4% of executed
@@ -1697,6 +1717,11 @@ index 0000000..0a73c9c
 +        FlagWrite flagWrites[kMaxBlockPairs];
 +        uint8_t flagCount = 0;
 +        bool emitsFlags = false;
++        // CLIP pairs whose queueClip the driver must replay (slot indexes a PAIR of scratch
++        // quads: vf[fs] then vf[ft]).
++        struct ClipWrite { uint8_t pair; uint8_t slot; };
++        ClipWrite clipWrites[kMaxBlockPairs];
++        uint8_t clipCount = 0;
 +        bool writesVuMem = false;   // SQ only
 +        ReadyWrite ready[kMaxReadyWrites];
 +    };
@@ -1898,6 +1923,7 @@ index 0000000..0a73c9c
 +        int32_t viReady[16] = {};
 +        int32_t accReady[4] = {};
 +        int32_t prevIssue = -1;
++        bool sawClip = false;
 +
 +        readyCount = 0;
 +        touchesVuMem = false;
@@ -1926,6 +1952,12 @@ index 0000000..0a73c9c
 +                break; // pathological; keep `issue` inside its uint16_t field
 +
 +            const bool lowerOk = classifyLowerPlan(pi.lower, lo);
++            if (lowerOk && sawClip &&
++                (lo.op == LowerOp::Fceq || lo.op == LowerOp::Fcand ||
++                 lo.op == LowerOp::Fcor || lo.op == LowerOp::Fcget))
++                break; // clip reader after a CLIP in the same block -- see the note above
++            if (up.op == FmacOp::Clip)
++                sawClip = true;
 +            if (!lowerOk)
 +            {
 +                // ---- BRANCH TERMINATOR: execute the branch AND its delay slot ----------------
@@ -2202,15 +2234,24 @@ index 0000000..0a73c9c
 +            uint8_t *const start = e.p;
 +            b.emitsFlags = emitFlags;
 +            b.flagCount = 0;
++            b.clipCount = 0;
++            uint32_t scratchNext = 0;
 +            for (uint32_t j = 0; j < n; ++j)
 +            {
 +                // A flag-writing FMAC is exactly one with clampResult (MAX/MINI/ABS/ITOF/FTOI use
 +                // applyDest, which sets no flags; NOP writes nothing).
 +                const void *sink = nullptr;
-+                if (emitFlags && ups[j].op != FmacOp::Nop && ups[j].clampResult &&
-+                    b.flagCount < kMaxBlockPairs)
++                if (ups[j].op == FmacOp::Clip && b.clipCount < kMaxBlockPairs &&
++                    scratchNext + 2u <= 16u)
 +                {
-+                    const uint8_t slot = b.flagCount;
++                    sink = buf.resultSlot(scratchNext);
++                    b.clipWrites[b.clipCount++] = Block::ClipWrite{uint8_t(j), uint8_t(scratchNext)};
++                    scratchNext += 2u;
++                }
++                else if (emitFlags && ups[j].op != FmacOp::Nop && ups[j].clampResult &&
++                    b.flagCount < kMaxBlockPairs && scratchNext < 16u)
++                {
++                    const uint8_t slot = uint8_t(scratchNext++);
 +                    sink = buf.resultSlot(slot);
 +                    b.flagWrites[b.flagCount++] =
 +                        Block::FlagWrite{uint8_t(j), uint8_t((pairs[j].upper >> 21) & 0xFu), slot};
