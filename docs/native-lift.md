@@ -21,6 +21,10 @@ survives without. §10 is the repo and build strategy: **no long-lived branches,
 only — no line is ever removed from `ps2xRuntime`.** The rest is the phase plan and the honest
 scale.
 
+**Definition of done (decided, not aspirational):** a native target that links **no PS2
+emulation**. It may still read the ELF for its static data (§3), and it links ordinary game
+infrastructure — a renderer, audio, ffmpeg, a window/input library — like any native game.
+
 ## 2. What is already verified (do not re-derive)
 
 - **Every guest call routes through the runtime.** Generated code never calls another generated
@@ -52,6 +56,16 @@ scale.
 
 **Nothing here is deleted.** "Stops needing" means *stops linking* — see §8 and §10. `ps2xRuntime`
 stays intact and buildable throughout, because it is both the fallback and the oracle.
+
+**Rungs 3 and 4 are independent axes.** Dropping the runtime and dropping the ELF are separate
+achievements, and the ELF is the harder one: zero `rdram` requires every table, string, float
+constant and function-pointer table in `.data`/`.rodata` lifted to a *typed* native declaration,
+and a table's real shape is only learnable from all the code that reads it. Some will stay opaque.
+
+**Decision (user): retaining the ELF as a static-data source is an ACCEPTED end
+state**, to be revisited later. The disc is required for assets regardless (§1 of the portability
+discussion), so a native build that still reads `SLES_520.17` for its data sections costs the user
+nothing. Plan for that; treat full data lifting as optional upside, never as the definition of done.
 
 Rung 2 is the one that is purely mechanical. Rungs 3-5 require understanding, and that is the
 whole difficulty — see next.
@@ -107,6 +121,19 @@ it is worth having for the current arc regardless of whether the rest of this do
 being *"built FIRST per the cont.250 resume rule."* The method is proven in this tree at subsystem
 scale; the lift arc applies it at game scale.
 
+### ★ The blind spot: the oracle cannot validate the scheduler
+
+The method compares **outputs for given inputs**. Timing is not an output. The EE scheduler's
+correctness is *when* things run relative to the vblank ladder, and that is load-bearing here, not
+academic: the PAL **50 Hz** vblank is mandatory for play, and the ladder fall-off bug was precisely
+a "reached the top" event delivered late by a 60 Hz vblank
+([[reference_pal_vblank_and_scheduler_race]]).
+
+So the single subsystem that most needs proof is the one this technique cannot provide it for.
+`lib/Kernel` therefore needs a **separately designed** validation approach — recorded timing traces
+and replay divergence against `PS2X_VIRTUAL_TIME` (row 93: two runs identical over 788 events),
+not re-execution diffing. Design it before lifting the kernel, not during.
+
 ## 6. Phase plan, with gates that can actually be met
 
 "Once everything is working properly" is not a gate — a commercial-game recompilation is never
@@ -145,8 +172,28 @@ emulator-backed runner — because it is the fallback, the oracle's reference ar
 PS2 runtime that the next game will need. Deleting a subsystem would saw off the branch the arc
 stands on and would poison every future `git merge upstream/main`.
 
-Rung 4 is therefore a **link-time** question. The ~90k-line runtime is not one wall; it is ~6
-independent units that drop out of the native target as their last consumer is lifted:
+Rung 4 is therefore a **link-time** question, and the runtime splits three ways, not two
+(measured, excluding the generated runner):
+
+| Fate | Unit | Lines |
+|---|---|---|
+| **Dissolves** as consumers lift | `lib/vu` (microVU + interpreter) | 31,023 |
+| | `gs_cpu_backend` + `gs_frontend` + GS memory | ~17,700 |
+| | `ps2_memory` (MMIO, scratchpad, RDRAM model) | 3,112 |
+| | `ps2_runtime` (dispatch + the function table) | 2,859 |
+| | `ps2_vif1_interpreter` | 1,836 |
+| | IOP / SIF host | ~1,280 |
+| **Reimplemented natively** (not deleted) | `lib/Kernel` — threads, semaphores, scheduler, vblank | 24,817 |
+| **Kept by choice — not emulation** | `gs_gpu_device.cpp` (the GL renderer) | 4,533 |
+| | `ps2_audio` + `ps2_audio_vag` (host audio, ADPCM) | — |
+| | ffmpeg (FMV), raylib (window/input/audio device) | — |
+
+**The third row is the one that surprises.** Of ~22k lines that look like "GS emulation", only
+~17.7k is emulation — the other 4,533 is the GL renderer, which a native port *wants*. A standalone
+build links ordinary game infrastructure like any native game; the goal is not "links nothing", it
+is **"links no PS2 emulation."**
+
+The units that dissolve do so one at a time, each unlocked when its last consumer is lifted:
 
 - **IPU** → ffmpeg is already linked; FMV becomes a native decode.
 - **VU0/VU1** → the microprograms *are* game code. Lifting them to native vector math also removes
@@ -163,6 +210,12 @@ independent units that drop out of the native target as their last consumer is l
 - **Starting before the game is finishable** — lifting on top of behavior we do not yet understand.
 - **Lifting without the oracle** — unverifiable claims at 5,608x scale.
 - **Function-wise ordering** — §4: double work, wrong shape.
+- **Assuming the oracle covers the scheduler.** It does not (§5). Lifting `lib/Kernel` on the
+  strength of a method that cannot see timing would be the single most dangerous step in the arc.
+- **Lifting VU without a census.** Microprograms are uploaded *as data*, so lifting VU means having
+  lifted every program that can ever be uploaded — across all 44 archives, not just the levels that
+  have been exercised. This is exactly the [[reference_one_level_is_not_the_game]] trap; do the
+  offline census before committing to the VU rung.
 - **Scale denial.** 889,469 transliterated lines. Even at the much higher density of hand-written
   code this is a multi-year arc. It is tractable *only* because it is incremental, verifiable per
   subsystem, and leaves a running game after every step. Any plan that loses one of those three
