@@ -46,8 +46,8 @@ deliberately unfaithful — they are measurement instruments, never correctness 
 
 ## 2. Already landed — stage 1 (1.37×) and lazy flags (1.20×)
 
-Cumulative: **280.7 → 167.6 ns/pair = 1.67×**, all bit-exact, all default ON with kill switches.
-Stage 1 is below; lazy flags (cont.177) is §4; dispatch overhead (cont.178) is §4b.
+Cumulative: **280.7 → 155.5 ns/pair = 1.81×**, all bit-exact, all default ON with kill switches.
+Stage 1 is below; lazy flags (cont.177) is §4; dispatch + operand-prologue overhead (cont.178) is §4b.
 
 ### Stage 1 — 1.37×, bit-exact
 
@@ -219,9 +219,33 @@ Two pieces were takeable without a JIT, both pure "same result, less work":
   memset per pair; each is `memcpy`-filled before its only read, under the identical guard.
 
 Verified: identical health counters both ways, clean lazy tallies, and a fully correct level-era
-gameplay frame. **Lesson for the JIT:** with flags and dispatch trimmed, no remaining leaf is large
-— the profile is flat. Flat profiles are exactly what a JIT fixes and an interpreter cannot: the
-cost is spread across per-instruction plumbing, not concentrated in one routine worth rewriting.
+gameplay frame.
+
+**And a third, larger piece from the same profile — `execUpper`'s operand prologue (1.109×).**
+`normalizeOperand` was the biggest leaf (10%, plus `fmacNormOperand` 4%) because `execUpper`
+normalised **fourteen floats** (`vs[4]`, `vt[4]`, `acc[4]`, `q`, `i`) unconditionally *before
+looking at the opcode* — and the census says **26.4% of executed pairs have no upper op at all**.
+`PS2X_VU1_FASTUPPER` (default 2; `0` = old, `1` = NOP skip only, `2` = NOP + acc skip) returns
+early for upper NOP and normalises `acc` only for the ops that read it. Sound by construction,
+verified mechanically against every case label: the only `acc[...]` readers are
+`{0x08–0x0F, 0x21, 0x23, 0x25, 0x27, 0x29, 0x2D, 0x2E}` (main) and the same minus `0x2E` (special).
+`172.39 → 155.47 ns/pair` at matched pairs.
+
+> ⚠ **A confound worth naming, because it produced a false regression call.** A 6-frame screenshot
+> burst under the new flag showed a **black 3D scene with a correct HUD** — the dropped-geometry
+> signature — and the same-binary `=0` control rendered fine. That looked conclusive and was wrong:
+> **when a change alters speed, wall-clock-matched samples are not state-matched** (a faster build
+> sits at a different game moment). A 20-frame burst then rendered a fully detailed scene, *brighter*
+> than the control. It is the same family as the ns/pair end-of-run confound. The check that actually
+> settles such a question is **guest-work-matched**: `PS2X_VU1_JITCENSUS=1` on both configs compared
+> at equal cumulative `pairs=` — if a value were corrupted, branch outcomes and the executed-opcode
+> mix would diverge. They agreed within ±0.5pp on every bucket and on branch density (1 per 6.7 vs
+> 6.8 pairs). **Prefer a guest-work-matched signature over a screenshot whenever the change is
+> also a speedup.**
+
+**Lesson for the JIT:** with flags, dispatch and the operand prologue trimmed, no remaining leaf is
+large — the profile is flat. Flat profiles are exactly what a JIT fixes and an interpreter cannot:
+the cost is spread across per-instruction plumbing, not concentrated in one routine worth rewriting.
 
 ## 5. Step 2 — the VU1 block JIT
 
