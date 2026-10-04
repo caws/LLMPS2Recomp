@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+
+# --- ENGINE-DIR GUARD (added after hitting this three times in one session) -------------------
+# scripts/ exists ONLY in the engine repo. A compound command that starts `cd <game_dir> && ...`
+# leaves the shell in the GAME dir, where `scripts/03_build_game.sh` does not exist -- the failure
+# is `No such file or directory` from nohup, which looks like a missing script rather than a wrong
+# cwd. Re-exec from the engine dir instead of failing.
+__ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ "$PWD" != "$__ENGINE_DIR" ]; then
+    cd "$__ENGINE_DIR" || { echo "cannot cd to engine dir $__ENGINE_DIR" >&2; exit 1; }
+fi
+# ---------------------------------------------------------------------------------------------
+
 set -euo pipefail
 
 # Build a game with the PS2Recomp engine.

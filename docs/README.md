@@ -55,6 +55,11 @@ mass-rewrite the inputs.**
   steps — **lazy flags** (bit-exact ~1.37×, with the audited VU0/VU1 flag-visibility asymmetry
   that makes it safe) and the **block JIT**. Also carries the measurement discipline this arc
   needs: iterate on ns/pair, ablate to size a target, and never pick one from profile leaf share.
+- **[gl-renderer.md](gl-renderer.md)** — *the GL renderer arc*: why higher resolution and
+  playability are the same project (an upscaled target cannot live in the emulated 4 MB VRAM), the
+  measured floor that rules out single-sided CPU work, why the two earlier GPU attempts failed under
+  a bit-exactness constraint we have now dropped, the render-target/texture-cache authority model
+  (mirroring PCSX2's `GSTextureCache`), and the env-gated phase plan. **Design only — not built.**
 - **[workflows.md](workflows.md)** — *parallel static investigation*: the read-only
   multi-agent RE fan-out (N agents chase sub-questions → one synthesizes a buildable
   override). Use when a frontier is an **architecture question**, not a CSV/override bug.

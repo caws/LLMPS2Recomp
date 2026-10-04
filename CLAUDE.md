@@ -192,7 +192,12 @@ what progress is; when to spawn read-only subagents; when to stop). Then [`worki
 three CSV bug classes — truncated / missing-gap **batchfix** / over-bound **boundfix** — and
 disasm-as-ground-truth validation), [`overrides.md`](docs/overrides.md) (HLE patterns:
 wait-free replacement, clean skip, SIF/IOP handshake fakes, answering raw-transport RPCs via
-`runtime->iop().handleRPC`), [`vu1-jit.md`](docs/vu1-jit.md) (the **VU1 performance arc**: why a block JIT is required, the ablation-measured cost decomposition, the disproven FMAC shortcut, and the lazy-flags design)
+`runtime->iop().handleRPC`), [`vu1-jit.md`](docs/vu1-jit.md) (the **VU1 performance arc**: why a block JIT is required, the ablation-measured cost decomposition, the disproven FMAC shortcut, and the lazy-flags design),
+[`gl-renderer.md`](docs/gl-renderer.md) (**the GL renderer arc, DESIGN ONLY**: higher resolution and
+playability are one project — an upscaled target cannot live in the emulated 4 MB VRAM; the measured
+floor that rules out single-sided CPU work; why the two earlier GPU spikes failed under a
+bit-exactness constraint the user has now dropped; the PCSX2-style target/texture-cache authority
+model; the env-gated phase plan)
 and [`workflows.md`](docs/workflows.md) (parallel **read-only**
 multi-agent RE fan-out for architecture-question frontiers; sub-agents never build — only the
 main agent does; template at `.claude/workflows/re-fanout.js`). Read those for the durable
