@@ -217,6 +217,25 @@ done
 # rewritten when the set changes) so an unchanged manifest never triggers a cmake reconfigure.
 MANIFEST_TMP="$(mktemp)"
 printf '%s\n' "${OVERRIDE_CPP_BASENAMES[@]}" > "$MANIFEST_TMP"
+# ★★★★★ cont.346r LEGAL GUARD: the generated function table must never become committable.
+# `ps2xRuntime/src/runner/` is gitignored and regenerated every build, but ONE file inside it is
+# TRACKED upstream -- register_functions.cpp, a 438-byte stub in ran-j's history that our build
+# overwrites with ~6.6 MB / 81k lines of the GAME's function table (every guest address, derived
+# from the player's ELF). Distributing that is precisely the risk we must not take, and the only
+# thing preventing it was a `skip-worktree` bit someone set by hand -- a LOCAL index flag that does
+# not survive a fresh clone and does not stop `git add -f`.
+# Re-assert it on every build, so any clone is protected from its first build onward, and say so
+# when it had to be (re)applied rather than doing it silently.
+if [[ -d "$PS2RECOMP_ROOT/.git" ]]; then
+    _rf="ps2xRuntime/src/runner/register_functions.cpp"
+    if git -C "$PS2RECOMP_ROOT" ls-files --error-unmatch "$_rf" >/dev/null 2>&1; then
+        if ! git -C "$PS2RECOMP_ROOT" ls-files -v "$_rf" | grep -q '^S'; then
+            git -C "$PS2RECOMP_ROOT" update-index --skip-worktree "$_rf" 2>/dev/null \
+                && echo "  [guard] skip-worktree (re)applied to $_rf -- the generated table stays uncommittable"
+        fi
+    fi
+fi
+
 MANIFEST="$RUNTIME_SRC/game_overrides.manifest"
 if [[ ! -f "$MANIFEST" ]] || ! cmp -s "$MANIFEST_TMP" "$MANIFEST"; then
     mv "$MANIFEST_TMP" "$MANIFEST"
