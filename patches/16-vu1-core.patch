@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..5f6e3aa 100644
+index bd75bba..b4b9194 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,6 +3,7 @@
@@ -198,8 +198,8 @@ index bd75bba..5f6e3aa 100644
 +static unsigned long long g_blkRunHist[17] = {}, g_blkPairsInRuns = 0;
 +static unsigned g_blkRunCur = 0;
 +// cont.186: cumulative lower-opcode tiers (see the tier comment in run()).
-+static unsigned long long g_tierPairs[6] = {}, g_tierPairsGe2[6] = {}, g_tierRuns[6] = {};
-+static unsigned g_tierRunCur[6] = {};
++static unsigned long long g_tierPairs[7] = {}, g_tierPairsGe2[7] = {}, g_tierRuns[7] = {};
++static unsigned g_tierRunCur[7] = {};
 +
 +// The ONLY instructions that can observe m_state.mac / m_state.status inside a microprogram
 +// (ps2_vu1_lower.cpp, switch on opHi = (instr >> 25) & 0x7F):
@@ -1877,7 +1877,7 @@ index bd75bba..5f6e3aa 100644
      resetScheduler();
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
-@@ -1633,13 +2596,348 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,13 +2596,367 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -1903,7 +1903,10 @@ index bd75bba..5f6e3aa 100644
 +            const bool b = vu1jit::selfTestFmac(buf, &vuNormOperandQuad, &vuNormResultQuadValue);
 +            const bool c = vu1jit::selfTestLQ(buf, false); // LQ
 +            const bool d = vu1jit::selfTestLQ(buf, true);  // SQ
-+            (void)c; (void)d;
++            // cont.194: IADDIU/ISUBIU + the four clip readers, driven through
++            // classifyLowerPlan -> emitLowerPlan (the same path block assembly will use).
++            const bool f = vu1jit::selfTestLowerVi(buf);
++            (void)c; (void)d; (void)f;
 +            vu1jit::benchBlock(buf, &vuNormOperandQuad, &vuNormResultQuadValue);
 +            return a && b;
 +        }();
@@ -2140,28 +2143,44 @@ index bd75bba..5f6e3aa 100644
 +                //   0 NOP · 1 +SQ/LQ (VU memory) · 2 +IADDIU/ISUBIU (VI ALU)
 +                //   3 +clip readers (FCEQ/FCAND/FCOR/FCGET) · 4 +ILW/ISW
 +                {
-+                    unsigned tier = 255u;
-+                    if (decoded.iBit)
-+                        tier = 255u;
-+                    else if (decoded.lower == 0u || decoded.lower == 0x8000033Cu)
-+                        tier = 0u;
-+                    else
++                    // Tiers 0-5 are CUMULATIVE (each assumes the ones below it are emitted).
++                    // Tier 6 deliberately is NOT: see below.
++                    bool tierOk[7] = {};
++                    if (!decoded.iBit)
 +                    {
++                        const bool isNop =
++                            (decoded.lower == 0u || decoded.lower == 0x8000033Cu);
 +                        const uint8_t lop = static_cast<uint8_t>((decoded.lower >> 25) & 0x7Fu);
-+                        if (lop == 0x00u || lop == 0x01u) tier = 1u;
-+                        else if (lop == 0x08u || lop == 0x09u) tier = 2u;
-+                        else if (lop == 0x10u || lop == 0x12u || lop == 0x13u || lop == 0x1Cu) tier = 3u;
-+                        else if (lop == 0x04u || lop == 0x05u) tier = 4u;
-+                        // ★ Tier 5: a BRANCH is not an opcode gap — it is the block TERMINATOR.
-+                        // The census counted it as uncovered, which understates what a real block
-+                        // compiler reaches, since a block simply ends there.
-+                        else if (lop >= 0x20u && lop <= 0x2Fu) tier = 5u;
++                        const bool isMem = !isNop && (lop == 0x00u || lop == 0x01u);
++                        const bool isIalu = !isNop && (lop == 0x08u || lop == 0x09u);
++                        const bool isClip = !isNop && (lop == 0x10u || lop == 0x12u ||
++                                                       lop == 0x13u || lop == 0x1Cu);
++                        const bool isIlwIsw = !isNop && (lop == 0x04u || lop == 0x05u);
++                        // ★ A BRANCH is not an opcode gap — it is the block TERMINATOR. Counting
++                        // it as uncovered understates what a real block compiler reaches, since a
++                        // block simply ends there.
++                        const bool isBranch = !isNop && (lop >= 0x20u && lop <= 0x2Fu);
++                        tierOk[0] = isNop;
++                        tierOk[1] = tierOk[0] || isMem;
++                        tierOk[2] = tierOk[1] || isIalu;
++                        tierOk[3] = tierOk[2] || isClip;
++                        tierOk[4] = tierOk[3] || isIlwIsw;
++                        tierOk[5] = tierOk[4] || isBranch;
++                        // ★★ cont.194 — TIER 6 IS THE ONE THAT SIZES THE NEXT STEP: what block
++                        // assembly can reach with the lower slot AS EMITTED TODAY, plus branch
++                        // terminators. It is tier 3 + branch, NOT tier 5, because tier 5 also
++                        // assumes ILW/ISW and **ILW cannot use the immediate-write equivalence**:
++                        // its usage is PipelineLsu with latency 4 (decodeLowerUsage case 0x04), so
++                        // unlike every other emitted VI write (all latency 1) its value is not
++                        // visible until four cycles later. Modelling that needs a real VI write
++                        // pipeline, so ILW stays a gap and tier 5 is not yet reachable.
++                        tierOk[6] = tierOk[3] || isBranch;
 +                    }
 +                    const bool upperOk =
 +                        !decoded.eBit && vu1jit::classifyUpper(decoded.upper, cop, cbc, cacc);
-+                    for (unsigned t = 0; t < 6u; ++t)
++                    for (unsigned t = 0; t < 7u; ++t)
 +                    {
-+                        if (upperOk && tier <= t)
++                        if (upperOk && tierOk[t])
 +                        {
 +                            ++g_tierRunCur[t];
 +                        }
@@ -2227,7 +2246,7 @@ index bd75bba..5f6e3aa 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1647,6 +2945,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1647,6 +2964,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          }
  
          uint64_t readyCycle = calculatePairReadyCycle(decoded);
@@ -2249,7 +2268,7 @@ index bd75bba..5f6e3aa 100644
          while (readyCycle > m_cycle)
          {
              if (readyCycle >= budgetEnd)
-@@ -1656,20 +2969,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1656,20 +2988,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              }
              advanceTo(readyCycle);
              readyCycle = calculatePairReadyCycle(decoded);
@@ -2276,7 +2295,7 @@ index bd75bba..5f6e3aa 100644
          }
  
          const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1677,12 +2989,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1677,12 +3008,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          const bool hasUpperWrite = upperWrite.reg != 0u;
          const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
          const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
@@ -2307,7 +2326,7 @@ index bd75bba..5f6e3aa 100644
          if (hasUpperWrite)
              std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
          if (hasDistinctLowerWrite)
-@@ -1835,4 +3159,116 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1835,4 +3178,117 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_state.cycles = m_cycle;
      if (useVuRounding && previousRoundingMode != -1)
          std::fesetround(previousRoundingMode);
@@ -2384,9 +2403,10 @@ index bd75bba..5f6e3aa 100644
 +                            pairsGe2 += g_blkRunHist[k] * (k < 16u ? k : 16u);
 +                    }
 +                    {
-+                        static const char *tierName[6] = {
-+                            "NOP only", "+SQ/LQ", "+IADDIU", "+clip rd", "+ILW/ISW", "+branch"};
-+                        for (unsigned t = 0; t < 6u; ++t)
++                        static const char *tierName[7] = {
++                            "NOP only", "+SQ/LQ", "+IADDIU", "+clip rd", "+ILW/ISW", "+branch",
++                            "EMITTED+br"};
++                        for (unsigned t = 0; t < 7u; ++t)
 +                            std::fprintf(stderr,
 +                                         "[vu1:tier%u] %-9s compilable=%llu (%.1f%%) runs=%llu "
 +                                         "meanRun=%.2f inRunsGe2=%llu (%.1f%%)\n",

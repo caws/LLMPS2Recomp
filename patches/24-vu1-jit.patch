@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..25310d2
+index 0000000..96376c5
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,1306 @@
+@@ -0,0 +1,1831 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -230,6 +230,25 @@ index 0000000..25310d2
 +        void shl_r32_imm8(uint8_t reg, uint8_t imm) { u8(0xC1); modrmReg(4, reg); u8(imm); }
 +        // and r32(dst), r32(src)
 +        void and_r32_r32(uint8_t dst, uint8_t src) { u8(0x23); modrmReg(dst, src); }
++
++        // mov [base + disp32], r32
++        void mov_mem_r32(uint8_t base, int32_t disp, uint8_t reg)
++        { u8(0x89); modrmDisp32(reg, base, disp); }
++        // sub eax, imm32  (short form)
++        void sub_eax_imm32(int32_t imm) { u8(0x2D); u32(uint32_t(imm)); }
++        // and eax, imm32  (short form; sets ZF, which FCAND consumes)
++        void and_eax_imm32(uint32_t imm) { u8(0x25); u32(imm); }
++        // or eax, imm32   (short form)
++        void or_eax_imm32(uint32_t imm) { u8(0x0D); u32(imm); }
++        // cmp eax, imm32  (short form)
++        void cmp_eax_imm32(uint32_t imm) { u8(0x3D); u32(imm); }
++        // movsx r32, r16  -- the (int16_t) truncation IADDIU/ISUBIU apply before the VI store
++        void movsx_r32_r16(uint8_t d, uint8_t s) { u8(0x0F); u8(0xBF); modrmReg(d, s); }
++        // setcc r/m8 (reg field is /0). cc 0x4 = E/Z, 0x5 = NE/NZ. al/cl/dl/bl need no REX.
++        void setcc_r8(uint8_t cc, uint8_t reg)
++        { u8(0x0F); u8(uint8_t(0x90 | (cc & 0xFu))); modrmReg(0, reg); }
++        // movzx r32, r8
++        void movzx_r32_r8(uint8_t d, uint8_t s) { u8(0x0F); u8(0xB6); modrmReg(d, s); }
 +
 +        // [base + index*1] via SIB (mod=00, rm=100). Used for VU-memory access: base = rsi
 +        // (vuData), index = rax (the computed byte address).
@@ -465,6 +484,7 @@ index 0000000..25310d2
 +    static constexpr int32_t kOffQ = int32_t(offsetof(VU1State, q));
 +    static constexpr int32_t kOffI = int32_t(offsetof(VU1State, i));
 +    static constexpr int32_t kOffVi = int32_t(offsetof(VU1State, vi));
++    static constexpr int32_t kOffClip = int32_t(offsetof(VU1State, clip));
 +
 +    // ---- lower slot: VU-memory access ------------------------------------------------------
 +    // Emitted lower-slot code needs a wider calling convention than the upper slot:
@@ -527,6 +547,230 @@ index 0000000..25310d2
 +        e.pandn_rr(2, 1);
 +        e.por_rr(0, 2);
 +        e.movups_store_sib(6 /*rsi*/, 0 /*rax*/, 0);
++    }
++
++    // ---- lower slot: VI-writing ops (IADDIU/ISUBIU and the clip readers) --------------------
++    //
++    // ★★ THE CONSTRAINT THAT GOVERNS ALL OF THESE: VI WRITES AND THE BRANCH DELAY.
++    //
++    // Unlike LQ (immediate) and SQ (a latency-1 store that commit makes indistinguishable from an
++    // immediate one), every VI write goes through `queueViWrite`. Two questions had to be settled
++    // before emitting any of them, and both are settled HERE rather than discovered from a
++    // wrong-path bug later:
++    //
++    // 1. **Is an immediate VI write equivalent to the queued one?** YES for these ops, by exactly
++    //    the SQ argument. `queueViWrite` is called with `latency = 1` for IADDIU/ISUBIU and for
++    //    all four clip readers (`decodeLowerUsage` case 0x08/0x09, 0x10/0x12/0x13, 0x1C: all
++    //    `PipelineIalu`, `latency = 1u`), so `readyCycle = m_cycle + 1` and
++    //    `commitReadyPipelines()` runs at the TOP of the next pair's iteration — the write lands
++    //    before pair i+1 executes either way. Nothing in pair i's own cycle can observe the
++    //    difference: a pair has exactly ONE lower instruction, and upper ops never read VI.
++    //
++    // 2. **The branch-read backup is NOT equivalent, and must be honoured by the caller.** The
++    //    interpreter keeps `m_viBranchBackupValue/Reg/Valid`: when an instruction whose usage sets
++    //    `delaysNextBranchRead` writes a VI register, a branch in the IMMEDIATELY FOLLOWING pair
++    //    reads the OLD value (`readBranchVi`). That is the VU's architectural branch delay.
++    //    Since branches TERMINATE blocks, a block's final pair is exactly the pair a branch reads
++    //    from — so a JIT'd VI write there that bypasses the backup hands the branch the NEW value
++    //    and takes the WRONG PATH.
++    //
++    //    ⚠ It is not uniform across these ops, so it is reported per-instruction in `LowerPlan`:
++    //      * IADDIU / ISUBIU  -> delaysNextBranchRead = TRUE   (decodeLowerUsage case 0x08/0x09)
++    //      * FCEQ/FCAND/FCOR/FCGET -> FALSE                    (cases 0x10/0x12/0x13, 0x1C)
++    //    Block assembly MUST either exclude a `delaysNextBranchRead` plan from a block's final
++    //    pair, or replicate the backup at the block exit. The emitters below deliberately do NOT
++    //    write the backup: they take only `VU1State*`, and the backup lives in the interpreter
++    //    object, so making it the caller's contract keeps the emitted code free of it.
++
++    // IADDIU / ISUBIU: vi[it] = (int16_t)(vi[is] +/- imm15).
++    //   `imm` is the ZERO-extended 15-bit field, so 0..0x7FFF and never negative
++    //   (ps2_vu1_lower.cpp: `(int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800)`).
++    //   The (int16_t) truncation is architectural (VI registers are 16-bit) and is emitted as
++    //   `movsx eax, ax`, matching the int16 -> int32 sign extension of the C++ store.
++    //   it == 0 writes nothing: VI0 is hardwired zero and the interpreter guards with `if (it != 0)`.
++    // Reading vi[is] straight from the field is exactly what the interpreter does; vi[0] can never
++    // hold anything but 0 because every VI write to reg 0 is suppressed at the source.
++    inline void emitViAluImm(Emitter &e, uint8_t viDst, uint8_t viSrc, int32_t imm, bool isSub)
++    {
++        if (viDst == 0u)
++            return;
++        e.mov_r32_mem(0 /*eax*/, 7 /*rdi*/, kOffVi + int32_t(viSrc) * 4);
++        if (imm != 0)
++        {
++            if (isSub)
++                e.sub_eax_imm32(imm);
++            else
++                e.add_eax_imm32(imm);
++        }
++        e.movsx_r32_r16(0, 0);
++        e.mov_mem_r32(7, kOffVi + int32_t(viDst) * 4, 0);
++    }
++
++    enum class ClipOp { Ceq, Cand, Cor, Cget };
++
++    // The clip readers. All four read `m_state.clip` directly and write one VI register; none of
++    // them touches the FMAC flag pipeline, and cont.177's lazy-flag scan deliberately EXCLUDES
++    // clip readers (only MAC/status readers arm it), so `clip` is always live and these are safe
++    // to emit unconditionally.
++    //
++    // ★ Mirrored bit-for-bit from ps2_vu1_lower.cpp, INCLUDING where a mask is and is not applied:
++    //   FCEQ  : vi[1] = ((clip & 0xFFFFFF) == imm24)       -> operand masked
++    //   FCAND : vi[1] = ((clip & imm24) != 0)              -> imm24 is already <= 0xFFFFFF
++    //   FCOR  : vi[1] = ((clip | imm24) == 0xFFFFFF)       -> NO mask on clip; bits above 24 make
++    //                                                         the comparison fail, and replicating
++    //                                                         that is the difference between
++    //                                                         bit-exact and nearly-right
++    //   FCGET : vi[it] = clip & 0xFFF                      -> note 0xFFF, not 0xFFFFFF
++    inline void emitClipReader(Emitter &e, ClipOp op, uint32_t imm24, uint8_t viDst)
++    {
++        if (viDst == 0u)
++            return; // only reachable for FCGET with it == 0; FCEQ/FCAND/FCOR target VI1
++        e.mov_r32_mem(0 /*eax*/, 7 /*rdi*/, kOffClip);
++        switch (op)
++        {
++        case ClipOp::Ceq:
++            e.and_eax_imm32(0xFFFFFFu);
++            e.cmp_eax_imm32(imm24);
++            e.setcc_r8(0x4, 0); // sete al
++            e.movzx_r32_r8(0, 0);
++            break;
++        case ClipOp::Cand:
++            e.and_eax_imm32(imm24); // sets ZF from the result
++            e.setcc_r8(0x5, 0);     // setne al
++            e.movzx_r32_r8(0, 0);
++            break;
++        case ClipOp::Cor:
++            e.or_eax_imm32(imm24);
++            e.cmp_eax_imm32(0xFFFFFFu);
++            e.setcc_r8(0x4, 0); // sete al
++            e.movzx_r32_r8(0, 0);
++            break;
++        case ClipOp::Cget:
++            e.and_eax_imm32(0xFFFu);
++            break;
++        }
++        e.mov_mem_r32(7, kOffVi + int32_t(viDst) * 4, 0);
++    }
++
++    // ---- lower-slot plan: the contract block assembly consumes -------------------------------
++    // `classifyLowerPlan` is the lower-slot twin of `classifyUpperPlan`: it decodes one lower
++    // instruction word into an emittable plan, or returns false if the block must stop. Beyond the
++    // opcode it reports the three facts a block compiler needs and cannot recover from the emitted
++    // bytes: which VI register is written, whether the write carries the branch-delay hazard, and
++    // whether the instruction touches VU memory (which the XGKICK residual noted for SQ concerns).
++    enum class LowerOp { Nop, Lq, Sq, IaddIu, IsubIu, Fceq, Fcand, Fcor, Fcget };
++
++    struct LowerPlan
++    {
++        LowerOp op = LowerOp::Nop;
++        uint8_t viBase = 0; // LQ: vi[is]; SQ: vi[it]
++        uint8_t viSrc = 0;  // IADDIU/ISUBIU source
++        uint8_t viDst = 0;  // VI register written (0 == none written)
++        uint8_t vfReg = 0;  // LQ destination / SQ source
++        uint8_t dest = 0;   // LQ/SQ lane mask
++        int32_t imm = 0;    // LQ/SQ: IMM11 (signed); IADDIU/ISUBIU: imm15; clip: imm24
++        bool writesVi = false;
++        bool writesVf = false;
++        bool touchesVuMem = false;
++        // ★ See the constraint block above. TRUE means a branch in the IMMEDIATELY FOLLOWING pair
++        // must still read the OLD value of vi[viDst]; block assembly must exclude such a plan from
++        // a block's final pair or replicate `recordViWriteForBranch`.
++        bool delaysNextBranchRead = false;
++    };
++
++    inline bool classifyLowerPlan(uint32_t lower, LowerPlan &plan)
++    {
++        plan = LowerPlan{};
++        if (lower == 0x00000000u || lower == 0x8000033Cu) // both NOP encodings
++        {
++            plan.op = LowerOp::Nop;
++            return true;
++        }
++        const uint8_t opHi = uint8_t((lower >> 25) & 0x7Fu);
++        switch (opHi)
++        {
++        case 0x00: // LQ
++            plan.op = LowerOp::Lq;
++            plan.viBase = VIS(lower);
++            plan.vfReg = FT(lower);
++            plan.dest = DEST(lower);
++            plan.imm = IMM11(lower);
++            plan.writesVf = true;
++            plan.touchesVuMem = true;
++            return true;
++        case 0x01: // SQ
++            plan.op = LowerOp::Sq;
++            plan.viBase = VIT(lower);
++            plan.vfReg = FS(lower);
++            plan.dest = DEST(lower);
++            plan.imm = IMM11(lower);
++            plan.touchesVuMem = true;
++            return true;
++        case 0x08: // IADDIU
++        case 0x09: // ISUBIU
++            plan.op = (opHi == 0x08u) ? LowerOp::IaddIu : LowerOp::IsubIu;
++            plan.viSrc = VIS(lower);
++            plan.viDst = VIT(lower);
++            // Exactly ps2_vu1_lower.cpp's expression, evaluated at compile time. The result is
++            // zero-extended (bit 15 is never set), so it is always in 0..0x7FFF.
++            plan.imm = int32_t(uint32_t(int32_t(int16_t(uint16_t(
++                ((lower & 0x7FFu) | ((lower >> 10) & 0x7800u)) & 0xFFFFu)))));
++            plan.writesVi = plan.viDst != 0u;
++            plan.delaysNextBranchRead = true; // decodeLowerUsage case 0x08/0x09
++            return true;
++        case 0x10: // FCEQ
++        case 0x12: // FCAND
++        case 0x13: // FCOR
++            plan.op = (opHi == 0x10u) ? LowerOp::Fceq
++                                      : (opHi == 0x12u ? LowerOp::Fcand : LowerOp::Fcor);
++            plan.imm = int32_t(lower & 0xFFFFFFu);
++            plan.viDst = 1u; // these three always target VI1
++            plan.writesVi = true;
++            return true;
++        case 0x1C: // FCGET
++            plan.op = LowerOp::Fcget;
++            plan.viDst = VIT(lower);
++            plan.writesVi = plan.viDst != 0u;
++            return true;
++        default:
++            return false; // branch/jump (block terminator), ILW/ISW, the special block: not covered
++        }
++    }
++
++    // Emit a classified lower plan. Calling convention as for LQ/SQ:
++    //     void f(VU1State *rdi, uint8_t *vuData rsi, uint32_t dataSizeMask edx)
++    // (the VI-only ops ignore rsi/edx, but sharing one signature keeps block assembly uniform).
++    inline void emitLowerPlan(Emitter &e, const CodeBuffer &buf, const LowerPlan &plan)
++    {
++        switch (plan.op)
++        {
++        case LowerOp::Nop:
++            return;
++        case LowerOp::Lq:
++            emitLQ(e, buf, plan.viBase, plan.vfReg, plan.imm, plan.dest);
++            return;
++        case LowerOp::Sq:
++            emitSQ(e, buf, plan.viBase, plan.vfReg, plan.imm, plan.dest);
++            return;
++        case LowerOp::IaddIu:
++            emitViAluImm(e, plan.viDst, plan.viSrc, plan.imm, false);
++            return;
++        case LowerOp::IsubIu:
++            emitViAluImm(e, plan.viDst, plan.viSrc, plan.imm, true);
++            return;
++        case LowerOp::Fceq:
++            emitClipReader(e, ClipOp::Ceq, uint32_t(plan.imm), plan.viDst);
++            return;
++        case LowerOp::Fcand:
++            emitClipReader(e, ClipOp::Cand, uint32_t(plan.imm), plan.viDst);
++            return;
++        case LowerOp::Fcor:
++            emitClipReader(e, ClipOp::Cor, uint32_t(plan.imm), plan.viDst);
++            return;
++        case LowerOp::Fcget:
++            emitClipReader(e, ClipOp::Cget, 0u, plan.viDst);
++            return;
++        }
 +    }
 +
 +    // ---- instruction compiler + cache ------------------------------------------------------
@@ -1180,6 +1424,287 @@ index 0000000..25310d2
 +        }
 +        std::fprintf(stderr, "[vu1:jit] %s selftest cases=%lu mismatches=%lu -> %s\n",
 +                     doSq ? "SQ" : "LQ", cases, mismatches, mismatches == 0 ? "PASS" : "FAIL");
++        buf.reset();
++        return mismatches == 0;
++    }
++
++    // ---- VI-writing lower self-test (IADDIU/ISUBIU + the clip readers) ----------------------
++    // Drives the FULL path a block compiler will use — encode a real instruction word,
++    // `classifyLowerPlan` it, `emitLowerPlan` it, run it — and compares against a reference
++    // COPIED from ps2_vu1_lower.cpp rather than re-derived, so a divergence in the C++ expression
++    // (the FCOR mask, the (int16_t) truncation, the zero-extended imm15) shows up as a mismatch.
++    //
++    // ★ All large state is `static`: self-tests run on the GUEST thread's small stack (cont.192),
++    // and two extra VU1State locals were enough to smash the frame into a SIGBUS that looked like
++    // emitted-code corruption.
++    inline bool selfTestLowerVi(CodeBuffer &buf)
++    {
++        if (!buf.ensure(8u << 20))
++            return false;
++
++        unsigned long cases = 0, mismatches = 0;
++
++        auto encIaddiu = [](bool sub, uint8_t it, uint8_t is, uint32_t imm15) {
++            uint32_t instr = uint32_t(sub ? 0x09u : 0x08u) << 25;
++            instr |= (uint32_t(it) & 0xFu) << 16;
++            instr |= (uint32_t(is) & 0xFu) << 11;
++            instr |= (imm15 & 0x7FFu);
++            instr |= ((imm15 >> 11) & 0xFu) << 21;
++            return instr;
++        };
++        auto encClip = [](uint8_t opHi, uint32_t imm24, uint8_t it) {
++            uint32_t instr = uint32_t(opHi) << 25;
++            if (opHi == 0x1Cu)
++                instr |= (uint32_t(it) & 0xFu) << 16;
++            else
++                instr |= (imm24 & 0xFFFFFFu);
++            return instr;
++        };
++
++        // Run one encoded lower instruction through classify -> emit -> execute, and compare the
++        // whole VI file against `ref` (which the caller has already mutated the reference way).
++        auto check = [&](const char *what, uint32_t instr, const VU1State &in, const VU1State &ref) {
++            LowerPlan plan;
++            if (!classifyLowerPlan(instr, plan))
++            {
++                ++cases;
++                if (++mismatches <= 8ul)
++                    std::fprintf(stderr, "[vu1:jit] %s REJECTED instr=%08x\n", what, instr);
++                return;
++            }
++            buf.reset();
++            Emitter e;
++            e.p = buf.code;
++            e.end = buf.base + buf.capacity;
++            uint8_t *const start = e.p;
++            emitLowerPlan(e, buf, plan);
++            e.ret();
++            if (e.overflow)
++            {
++                ++mismatches;
++                return;
++            }
++            static VU1State got;
++            got = in;
++            reinterpret_cast<LowerFn>(start)(&got, nullptr, 0u);
++            for (int r = 0; r < 16; ++r)
++            {
++                ++cases;
++                if (got.vi[r] != ref.vi[r] && ++mismatches <= 8ul)
++                    std::fprintf(stderr,
++                                 "[vu1:jit] %s MISMATCH instr=%08x vi[%d] jit=%d ref=%d\n",
++                                 what, instr, r, got.vi[r], ref.vi[r]);
++            }
++        };
++
++        static const int32_t bases[7] = {0, 1, -1, 32767, -32768, 12345, -30000};
++        static const uint32_t imms[7] = {0u, 1u, 0x7FFu, 0x800u, 0x1234u, 0x7FFFu, 0x4000u};
++        static const uint8_t regs[4] = {0u, 1u, 5u, 15u};
++
++        // --- IADDIU / ISUBIU ---
++        for (int sub = 0; sub < 2; ++sub)
++            for (int bi = 0; bi < 7; ++bi)
++                for (int ii = 0; ii < 7; ++ii)
++                    for (int di = 0; di < 4; ++di)
++                        for (int si = 0; si < 4; ++si)
++                        {
++                            const uint8_t it = regs[di], is = regs[si];
++                            const uint32_t instr = encIaddiu(sub != 0, it, is, imms[ii]);
++                            static VU1State in, ref;
++                            in = VU1State{};
++                            for (int r = 1; r < 16; ++r)
++                                in.vi[r] = int32_t(int16_t(0x1000 + r * 0x137));
++                            in.vi[is] = (is == 0u) ? 0 : bases[bi];
++                            ref = in;
++                            {
++                                // == ps2_vu1_lower.cpp case 0x08 / 0x09, verbatim ==
++                                int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
++                                if (it != 0)
++                                    ref.vi[it] = sub ? (int16_t)(ref.vi[is] - imm)
++                                                     : (int16_t)(ref.vi[is] + imm);
++                            }
++                            check(sub ? "ISUBIU" : "IADDIU", instr, in, ref);
++                        }
++
++        // --- clip readers: FCEQ / FCAND / FCOR / FCGET ---
++        // `clips` deliberately includes values with bits ABOVE bit 23 set, which is the only way
++        // to catch a stray mask on FCOR (the interpreter compares the UNMASKED clip | imm24).
++        static const uint32_t clips[7] = {0u,          0xFFFFFFu, 0x000001u, 0x123456u,
++                                          0x00000FFFu, 0xFF000000u, 0xFFFFFFFFu};
++        static const uint32_t imm24s[6] = {0u, 1u, 0xFFFFFFu, 0x123456u, 0xFFF000u, 0x000FFFu};
++        static const uint8_t clipOps[3] = {0x10u, 0x12u, 0x13u};
++        static const char *clipNames[3] = {"FCEQ", "FCAND", "FCOR"};
++
++        for (int oi = 0; oi < 3; ++oi)
++            for (int ci = 0; ci < 7; ++ci)
++                for (int mi = 0; mi < 6; ++mi)
++                {
++                    const uint32_t instr = encClip(clipOps[oi], imm24s[mi], 0u);
++                    static VU1State in, ref;
++                    in = VU1State{};
++                    for (int r = 1; r < 16; ++r)
++                        in.vi[r] = int32_t(int16_t(0x2000 + r * 0x91));
++                    in.clip = clips[ci];
++                    ref = in;
++                    {
++                        // == ps2_vu1_lower.cpp cases 0x10 / 0x12 / 0x13, verbatim ==
++                        uint32_t imm24 = instr & 0xFFFFFF;
++                        if (clipOps[oi] == 0x10u)
++                            ref.vi[1] = ((ref.clip & 0xFFFFFF) == imm24) ? 1 : 0;
++                        else if (clipOps[oi] == 0x12u)
++                            ref.vi[1] = ((ref.clip & imm24) != 0) ? 1 : 0;
++                        else
++                            ref.vi[1] = ((ref.clip | imm24) == 0xFFFFFF) ? 1 : 0;
++                    }
++                    check(clipNames[oi], instr, in, ref);
++                }
++
++        for (int ci = 0; ci < 7; ++ci)
++            for (int di = 0; di < 4; ++di)
++            {
++                const uint8_t it = regs[di];
++                const uint32_t instr = encClip(0x1Cu, 0u, it);
++                static VU1State in, ref;
++                in = VU1State{};
++                for (int r = 1; r < 16; ++r)
++                    in.vi[r] = int32_t(int16_t(0x3000 + r * 0x55));
++                in.clip = clips[ci];
++                ref = in;
++                {
++                    // == ps2_vu1_lower.cpp case 0x1C, verbatim ==
++                    if (it != 0)
++                        ref.vi[it] = static_cast<int32_t>(ref.clip & 0x0FFFu);
++                }
++                check("FCGET", instr, in, ref);
++            }
++
++        // --- decode contract ---------------------------------------------------------------
++        // ★ `emitLQ`/`emitSQ` are exhaustively verified by selfTestLQ, but that test calls them
++        // DIRECTLY, so it cannot see a mistake in which instruction FIELD feeds which argument.
++        // Block assembly reaches them only through classifyLowerPlan, so the decode itself is
++        // asserted here against the interpreter's own field accessors (ps2_vu1_detail.h) — the
++        // same helpers ps2_vu1_lower.cpp uses. (Found by mutation testing: swapping SQ's base from
++        // VIT to VIS survived every other check in this file.)
++        {
++            auto encLqSq = [](bool sq, uint8_t vf, uint8_t vi, uint8_t dest, uint32_t imm11) {
++                uint32_t instr = uint32_t(sq ? 0x01u : 0x00u) << 25;
++                instr |= (uint32_t(dest) & 0xFu) << 21;
++                instr |= (uint32_t(vf) & 0x1Fu) << 16; // LQ: ft (dest vf) / SQ: it (base vi)
++                instr |= (uint32_t(vi) & 0x1Fu) << 11; // LQ: is (base vi) / SQ: fs (source vf)
++                instr |= (imm11 & 0x7FFu);
++                return instr;
++            };
++            auto expect = [&](const char *what, bool ok, uint32_t instr) {
++                ++cases;
++                if (!ok && ++mismatches <= 8ul)
++                    std::fprintf(stderr, "[vu1:jit] decode contract FAILED: %s (instr=%08x)\n",
++                                 what, instr);
++            };
++            for (uint32_t a = 1; a < 0x1Fu; a += 3u)
++                for (uint32_t b = 1; b < 0x1Fu; b += 5u)
++                    for (uint32_t d = 0; d < 16u; d += 5u)
++                        for (uint32_t m = 0; m < 0x800u; m += 331u)
++                        {
++                            LowerPlan p;
++                            uint32_t instr = encLqSq(false, uint8_t(a), uint8_t(b), uint8_t(d), m);
++                            expect("LQ classify", classifyLowerPlan(instr, p), instr);
++                            expect("LQ op", p.op == LowerOp::Lq, instr);
++                            expect("LQ vf==FT", p.vfReg == FT(instr), instr);
++                            expect("LQ base==VIS", p.viBase == VIS(instr), instr);
++                            expect("LQ dest", p.dest == DEST(instr), instr);
++                            expect("LQ imm==IMM11", p.imm == int32_t(IMM11(instr)), instr);
++                            expect("LQ writes vf, not vi", p.writesVf && !p.writesVi, instr);
++                            expect("LQ no branch delay", !p.delaysNextBranchRead, instr);
++
++                            instr = encLqSq(true, uint8_t(a), uint8_t(b), uint8_t(d), m);
++                            expect("SQ classify", classifyLowerPlan(instr, p), instr);
++                            expect("SQ op", p.op == LowerOp::Sq, instr);
++                            expect("SQ vf==FS", p.vfReg == FS(instr), instr);
++                            expect("SQ base==VIT", p.viBase == VIT(instr), instr);
++                            expect("SQ dest", p.dest == DEST(instr), instr);
++                            expect("SQ imm==IMM11", p.imm == int32_t(IMM11(instr)), instr);
++                            expect("SQ writes neither vf nor vi", !p.writesVf && !p.writesVi, instr);
++                            expect("SQ touches VU memory", p.touchesVuMem, instr);
++                        }
++
++            // IADDIU/ISUBIU and the clip readers: the same field contract.
++            for (uint32_t it = 0; it < 16u; ++it)
++                for (uint32_t is = 0; is < 16u; is += 3u)
++                    for (uint32_t v = 0; v < 0x8000u; v += 1237u)
++                    {
++                        const uint32_t instr = encIaddiu(false, uint8_t(it), uint8_t(is), v);
++                        LowerPlan p;
++                        expect("IADDIU classify", classifyLowerPlan(instr, p), instr);
++                        expect("IADDIU dst==VIT", p.viDst == VIT(instr), instr);
++                        expect("IADDIU src==VIS", p.viSrc == VIS(instr), instr);
++                        // the imm15 is ZERO-extended: never negative, always < 0x8000
++                        expect("IADDIU imm zero-extended", p.imm >= 0 && p.imm < 0x8000, instr);
++                        expect("IADDIU writesVi iff it!=0", p.writesVi == (it != 0u), instr);
++                        expect("IADDIU no VU memory", !p.touchesVuMem, instr);
++                    }
++            for (uint32_t m = 0; m < 0x1000000u; m += 0x111111u)
++            {
++                LowerPlan p;
++                for (uint8_t op : {uint8_t(0x10u), uint8_t(0x12u), uint8_t(0x13u)})
++                {
++                    const uint32_t instr = encClip(op, m, 0u);
++                    expect("clip classify", classifyLowerPlan(instr, p), instr);
++                    expect("clip imm24", uint32_t(p.imm) == (instr & 0xFFFFFFu), instr);
++                    expect("clip writes VI1", p.viDst == 1u && p.writesVi, instr);
++                }
++            }
++            // Everything a block must STOP at still classifies as uncovered.
++            for (uint32_t opHi = 0x20u; opHi <= 0x2Fu; ++opHi)
++            {
++                LowerPlan p;
++                const uint32_t instr = (opHi << 25) | 0x123u;
++                expect("branch rejected", !classifyLowerPlan(instr, p), instr);
++            }
++            for (uint8_t opHi : {uint8_t(0x04u), uint8_t(0x05u), uint8_t(0x11u), uint8_t(0x14u),
++                                 uint8_t(0x40u)})
++            {
++                LowerPlan p;
++                const uint32_t instr = (uint32_t(opHi) << 25) | 0x123u;
++                expect("uncovered rejected", !classifyLowerPlan(instr, p), instr);
++            }
++            // ...but both NOP encodings are covered, and write nothing.
++            for (uint32_t nop : {0x00000000u, 0x8000033Cu})
++            {
++                LowerPlan p;
++                expect("NOP classify", classifyLowerPlan(nop, p), nop);
++                expect("NOP is Nop", p.op == LowerOp::Nop, nop);
++                expect("NOP writes nothing",
++                       !p.writesVi && !p.writesVf && !p.touchesVuMem && !p.delaysNextBranchRead, nop);
++            }
++        }
++
++        // The branch-delay contract is a CLASSIFICATION fact, so assert it here too: getting it
++        // backwards is silent at run time until a block takes the wrong path.
++        {
++            LowerPlan p;
++            struct { uint32_t instr; bool delays; const char *name; } expect[] = {
++                {encIaddiu(false, 3, 4, 7), true, "IADDIU"},
++                {encIaddiu(true, 3, 4, 7), true, "ISUBIU"},
++                {encClip(0x10u, 5u, 0u), false, "FCEQ"},
++                {encClip(0x12u, 5u, 0u), false, "FCAND"},
++                {encClip(0x13u, 5u, 0u), false, "FCOR"},
++                {encClip(0x1Cu, 0u, 3u), false, "FCGET"},
++            };
++            for (const auto &x : expect)
++            {
++                ++cases;
++                if (!classifyLowerPlan(x.instr, p) || p.delaysNextBranchRead != x.delays)
++                {
++                    if (++mismatches <= 8ul)
++                        std::fprintf(stderr,
++                                     "[vu1:jit] %s branch-delay flag WRONG (got %d want %d)\n",
++                                     x.name, int(p.delaysNextBranchRead), int(x.delays));
++                }
++            }
++        }
++
++        std::fprintf(stderr, "[vu1:jit] lowerVI selftest cases=%lu mismatches=%lu -> %s\n",
++                     cases, mismatches, mismatches == 0 ? "PASS" : "FAIL");
 +        buf.reset();
 +        return mismatches == 0;
 +    }

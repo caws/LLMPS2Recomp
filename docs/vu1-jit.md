@@ -437,6 +437,84 @@ that arc was found by a verify mode, not by reasoning; the same will be true her
 standing PCSX2 rule in [resources.md](resources.md) — then verify against our own generated
 code + disasm + gdb.
 
+## 5i. The lower slot is DONE, and tier 6 sizes block assembly (cont.194)
+
+IADDIU/ISUBIU (4.6%) and the four clip readers (10.3%) are emitted and verified, which **finishes
+the lower slot** for everything block assembly can use. Lower-slot codegen now covers
+**NOP 46.4% + SQ 15.1% + LQ 5.3% + clip readers 10.3% + IADDIU/ISUBIU 4.6%**.
+
+### The VI-write question, settled
+
+§5h recorded the constraint; here is the resolution, in two independent parts.
+
+**(a) An immediate VI write IS equivalent to the queued one — for these ops.** Every VI write goes
+through `queueViWrite(reg, value, latency)`, and for all six emitted ops `decodeLowerUsage` gives
+`PipelineIalu, latency = 1` (cases `0x08/0x09`, `0x10/0x12/0x13`, `0x1C`), so
+`readyCycle = m_cycle + 1`. The run loop calls `advanceOneCycle()` at the **bottom** of each pair's
+iteration (`ps2_vu1_core.cpp:3149`), and that does `++m_cycle; commitReadyPipelines();` — so the
+write commits before pair i+1 begins, and nothing between the queue and that commit reads VI (a pair
+has exactly one lower instruction, and upper ops never read VI). This is the same argument SQ used,
+and it is *tighter* than §5h stated: the commit happens at the end of pair i, not the top of i+1.
+
+**(b) The branch-read backup is NOT equivalent, and is now a reported per-instruction fact.**
+`LowerPlan::delaysNextBranchRead` carries it, and it is **not uniform**:
+
+| op | `delaysNextBranchRead` |
+|---|---|
+| IADDIU / ISUBIU | **true** |
+| FCEQ / FCAND / FCOR / FCGET | false |
+
+The emitters deliberately do **not** write the backup — it lives in the interpreter object, not in
+`VU1State`, and the emitted functions take only the state pointer. **Honouring it is the block
+compiler's contract**: exclude a `delaysNextBranchRead` plan from a block's final pair, or replicate
+`recordViWriteForBranch` at the block exit.
+
+### ★★ ILW cannot use that equivalence — and tier 5 was therefore not reachable
+
+`ILW` (0x04) is the **first lower op whose VI write is not latency-1**: its usage is `PipelineLsu`
+with **`latency = 4`**, so its value is invisible for four cycles and an immediate write is wrong.
+Modelling it needs a real VI write pipeline inside a block. That makes the old tier 5 figure
+misleading, because tier 5 is cumulative and silently assumed ILW/ISW.
+
+So the census grew a **tier 6 — the emitted-today lower set plus branch terminators** (tier 3 +
+branch, deliberately *not* cumulative with tier 4). Measured over 800M pairs of real play:
+
+| tier | compilable | mean run | pairs in runs ≥2 |
+|---|---|---|---|
+| 3 (+clip readers) — no branch terminators | 43.4% | 1.41 | 17.0% |
+| 4 (+ILW/ISW) | 44.7% | 1.46 | 18.5% |
+| 5 (+branch, **assumes ILW/ISW**) | 61.1% | 2.82 | 51.9% |
+| **6 — EMITTED TODAY + branch (reachable now)** | **59.8%** | **2.71** | **50.3%** |
+
+**⇒ ILW/ISW is worth 1.3 points of compilable and 1.6 of runs≥2. Do NOT build a latency-4 VI write
+pipeline before block assembly** — go straight to blocks and treat ILW as a terminator like a branch.
+
+Sizing with §5d's measured block cost (2-pair block 7.90 ns/pair vs the 120.5 interpreter):
+`0.503 × 7.9 + 0.497 × 120.5 ≈ 64 ns/pair ≈ 1.9×` **if transitions were free — they are not.**
+17 ns/pair still needs ~85% coverage, which only arrives once blocks LINK.
+
+### How it was verified — and the step that mattered
+
+- **70,161 cases, 0 mismatches**, driven through the real `classifyLowerPlan` → `emitLowerPlan` path
+  (not the emitters directly), against a reference **copied** from `ps2_vu1_lower.cpp`.
+- **★ MUTATION TESTING, and it earned its keep.** A test that passes on the first try has proven
+  nothing until it is shown capable of failing. Ten deliberate defects were injected — dropped
+  `movsx` truncation, an extra mask on FCOR, `sete` for `setne`, `0xFFFFFF` for FCGET's `0xFFF`, a
+  sign-extended imm15, ISUBIU emitted as add, a dropped `it != 0` guard, and both directions of the
+  branch-delay flag. Nine died immediately; **the tenth survived** — swapping SQ's base register
+  from `VIT` to `VIS`. That exposed a real gap: `selfTestLQ` calls `emitLQ`/`emitSQ` **directly**, so
+  nothing tested which instruction FIELD feeds which argument. A decode-contract block now asserts
+  every plan field against the interpreter's own accessors (`ps2_vu1_detail.h`), and all ten die.
+- **Disassembly cross-check.** The hand-rolled encodings were dumped and run through `objdump`, since
+  emitted bytes that happen to work for the tested registers can still be wrong in general. Offsets
+  confirmed against the struct: `vi[1]` = `rdi+0x204`, `vi[4]` = `+0x210`, `clip` = `+0x268`.
+- **Live, in-game, on the guest thread**: all five self-tests PASS (no `SIGBUS` — the `static`
+  discipline from §5h held), and the JIT shadow-verify reached **540,981,434 executions, 0
+  mismatches**, its highest yet.
+
+**Next: block assembly** — emit a run of pairs as one function with operands in registers across
+pairs, branches and ILW as terminators, honouring `delaysNextBranchRead` on the final pair.
+
 ## 6. Measurement discipline (non-negotiable for this arc)
 
 - **Iterate on `PS2X_VU1_PERF` — ns per issued instruction pair.** 0.2% run-to-run noise. Wall-clock
