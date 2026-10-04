@@ -605,6 +605,68 @@ them during the window); and **give blocks their own code buffer** (they are inv
 microcode upload, and emitted code otherwise accumulates until the 8 MB buffer is exhausted and every
 later block is silently rejected — which froze coverage mid-run).
 
+## 5k. Admitting blocks past pending VF writes (cont.196) — and the ceiling's hidden assumption
+
+§5j measured the one lever: 99.7% of block-entry rejections were a pending VF write intersecting the
+block's touched slots. That guard is now gone, and the result is **exactly double the coverage and
+about double the (still small) gain** — plus the discovery of why the gain is small.
+
+### How a pending VF write is handled instead of rejected
+
+Three pieces, all following from the same stall argument that made immediate writes safe in §5j:
+
+1. **Apply it early.** Any pair that would read that slot before the write's `readyCycle` stalls
+   until it commits, so the old value is *unobservable* — applying it at block entry cannot change
+   any value the block reads. Uses the interpreter's own supersession rule
+   (`m_vfLatestWrite[reg][lane] == write.sequence`), so only the live write to a lane is applied.
+2. **Re-derive the schedule.** What early application costs is *cycle fidelity*: the reader really
+   would have stalled. Each pair's reads are static (stored per pair in `Block::sched`) and the
+   incoming ready cycles are the only dynamic input, so one forward pass shifts the static schedule:
+   `want = issueStatic[j] + shift`, raised by each read's incoming ready cycle, and `shift` carried
+   forward. `shift` is monotonic and the static schedule already encodes the block's internal
+   dependencies, so shifting preserves them and one pass suffices.
+3. **Bump `m_vfLatestWrite` afterwards** for every slot the block wrote, so a write still sitting in
+   the pipeline cannot commit later and clobber the block's newer value.
+
+Only **1.4% of block entries actually needed a schedule shift** (`resched` 125,821 of 12,548,156) —
+so the overwhelming majority of the rejected intersections had been *writes*, not reads.
+
+| | cont.195 (strict) | cont.196 |
+|---|---|---|
+| guard rejections | 14,355,964 | **407,520** (VF: 14,318,821 → **0**) |
+| coverage | 6.4% | **12.8%** |
+| shadow-verified | 24.7 G comparisons | **34.3 G comparisons, 0 mismatches** |
+| in-binary A/B, matched pairs | ~1.2% | **~2% (1.005–1.051×)** |
+
+★ The verifier now also checks **cycle fidelity** — the register comparison cannot catch a
+scheduling error, and the schedule is the risky part. `PS2X_VU1_BLOCKSTRICT=1` restores the old
+guard for same-binary A/B.
+
+### ⚠ A measurement trap that nearly produced two false conclusions
+
+Absolute ns/pair **is not comparable across measurement sessions**. Over the hours this arc took, the
+machine drifted: the *same* config read ~128 ns/pair early on and ~145–152 later. Two intermediate
+readings ("132, a regression!" then "142, worse still!") were pure drift — the matched in-binary
+baselines were 145.6 and 148–152 respectively, i.e. blocks were *ahead* both times. **Only
+BLOCK=1-vs-BLOCK=0 in the SAME binary at MATCHED cumulative `pairs=` means anything**, and even that
+needs several sample points (the baseline alone swings 147.3–152.7 across one sweep).
+
+### ★★★ Why 12.8% coverage buys only 2%: the ceiling assumed register allocation
+
+§5d measured a compiled 6-pair block at **7.72 ns/pair** and concluded 30 fps is reachable. That
+benchmark kept operands **in XMM registers across pairs**. The emitter as built does not: every
+instruction loads its operands from `VU1State` and stores its result back, because `emitUpper` is
+addressed entirely off `rdi` + displacement. So a real block is nowhere near 7.72 ns/pair, and at
+12.8% coverage the arithmetic works out to roughly the ~2% observed rather than the ~9% a 7.72
+ns/pair block would give.
+
+**⇒ The next lever is not more coverage — it is cross-pair REGISTER ALLOCATION inside a block**,
+which is what §5d actually measured. Then block linking, so execution stops returning to the
+interpreter between blocks (mean block is only 3.47 pairs). Per-entry bookkeeping (guard, reschedule,
+ready replay, supersession) is third: it was cut down by driving every loop off the cont.175
+`PipeTrack` valid-slot bitmasks and by skipping the mask computation entirely for the ~88% of pairs
+with no compiled block, which is worth having but did not move the number outside the noise.
+
 ## 6. Measurement discipline (non-negotiable for this arc)
 
 - **Iterate on `PS2X_VU1_PERF` — ns per issued instruction pair.** 0.2% run-to-run noise. Wall-clock

@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..1e08592
+index 0000000..3f0083d
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,2329 @@
+@@ -0,0 +1,2365 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -1078,8 +1078,20 @@ index 0000000..1e08592
 +        uint8_t reg;     // vf/vi register (unused for acc)
 +        uint8_t lane;    // 0..3 for vf/acc
 +        uint8_t latency;
-+        uint16_t issue;  // ISSUE CYCLE of the writing pair, relative to block entry (not the pair
-+                         // index -- they diverge as soon as the block absorbs a stall)
++        uint8_t pair;    // index of the writing pair within the block; its issue cycle comes from
++                         // the schedule (static in planBlock, re-derived at entry when incoming
++                         // pending writes push it -- see cont.196)
++    };
++
++    // Per-pair reads + static issue cycle, kept so the driver can RE-DERIVE the schedule at entry
++    // when an incoming pending write delays one of the block's reads (cont.196).
++    struct PairSched
++    {
++        uint8_t vfReadReg[4] = {}, vfReadLanes[4] = {};
++        uint8_t vfReadCount = 0;
++        uint8_t accRead = 0;
++        uint16_t viRead = 0;
++        uint16_t issue = 0; // static issue cycle relative to block entry
 +    };
 +
 +    static constexpr uint32_t kMaxBlockPairs = 32;
@@ -1101,6 +1113,9 @@ index 0000000..1e08592
 +        // reads or writes the very slot it targets (read -> the interpreter would have stalled
 +        // for it; write -> it would clobber the block's newer value on a later commit).
 +        uint8_t vfTouched[32] = {}; // per-register lane mask, reads and writes together
++        uint8_t vfWritten[32] = {}; // writes only -- these need m_vfLatestWrite bumped after the
++                                    // block so a still-pending older write cannot clobber them
++        PairSched sched[kMaxBlockPairs];
 +        uint16_t viTouched = 0;
 +        uint8_t accTouched = 0;
 +        bool readsQ = false;
@@ -1228,6 +1243,20 @@ index 0000000..1e08592
 +            los[n] = lo;
 +            issueOf[n] = issue;
 +            prevIssue = issue;
++            if (touch != nullptr)
++            {
++                PairSched &ps = touch->sched[n];
++                ps = PairSched{};
++                ps.vfReadCount = pi.vfReadCount < 4u ? pi.vfReadCount : 4u;
++                for (uint32_t k = 0; k < ps.vfReadCount; ++k)
++                {
++                    ps.vfReadReg[k] = pi.vfReadReg[k] & 31u;
++                    ps.vfReadLanes[k] = pi.vfReadLanes[k] & 0xFu;
++                }
++                ps.viRead = uint16_t(pi.viReadMask & 0xFFFEu);
++                ps.accRead = uint8_t(pi.accRead & 0xFu);
++                ps.issue = uint16_t(issue);
++            }
 +            if (lo.touchesVuMem)
 +                touchesVuMem = true;
 +
@@ -1237,9 +1266,15 @@ index 0000000..1e08592
 +                for (uint32_t k = 0; k < pi.vfReadCount && k < 4u; ++k)
 +                    touch->vfTouched[pi.vfReadReg[k] & 31u] |= (pi.vfReadLanes[k] & 0xFu);
 +                if (pi.upperWriteReg != 0u)
++                {
 +                    touch->vfTouched[pi.upperWriteReg & 31u] |= (pi.upperWriteLanes & 0xFu);
-+                if (pi.lowerWriteReg != 0u)
++                    touch->vfWritten[pi.upperWriteReg & 31u] |= (pi.upperWriteLanes & 0xFu);
++                }
++                if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
++                {
 +                    touch->vfTouched[pi.lowerWriteReg & 31u] |= (pi.lowerWriteLanes & 0xFu);
++                    touch->vfWritten[pi.lowerWriteReg & 31u] |= (pi.lowerWriteLanes & 0xFu);
++                }
 +                touch->viTouched |= uint16_t(pi.viReadMask | pi.viWriteMask);
 +                touch->accTouched |= uint8_t(pi.accRead | pi.accWrite);
 +                if (up.src == OperandSrc::ScalarQ)
@@ -1265,7 +1300,7 @@ index 0000000..1e08592
 +                    const uint8_t lane = uint8_t(3u - bit);
 +                    vfReady[pi.lowerWriteReg][lane] = issue + int32_t(lat);
 +                    ready[readyCount++] =
-+                        ReadyWrite{0u, pi.lowerWriteReg, lane, lat, uint16_t(issue)};
++                        ReadyWrite{0u, pi.lowerWriteReg, lane, lat, uint8_t(n)};
 +                }
 +            }
 +            if (pi.upperWriteReg != 0u)
@@ -1279,7 +1314,7 @@ index 0000000..1e08592
 +                    const uint8_t lane = uint8_t(3u - bit);
 +                    vfReady[pi.upperWriteReg][lane] = issue + int32_t(lat);
 +                    ready[readyCount++] =
-+                        ReadyWrite{0u, pi.upperWriteReg, lane, lat, uint16_t(issue)};
++                        ReadyWrite{0u, pi.upperWriteReg, lane, lat, uint8_t(n)};
 +                }
 +            }
 +            {
@@ -1290,7 +1325,7 @@ index 0000000..1e08592
 +                    vw &= vw - 1u;
 +                    viReady[reg] = issue + int32_t(pi.viLatency);
 +                    ready[readyCount++] =
-+                        ReadyWrite{1u, uint8_t(reg), 0u, pi.viLatency, uint16_t(issue)};
++                        ReadyWrite{1u, uint8_t(reg), 0u, pi.viLatency, uint8_t(n)};
 +                    viWrittenMask |= (1u << reg);
 +                }
 +            }
@@ -1302,7 +1337,7 @@ index 0000000..1e08592
 +                    aw &= aw - 1u;
 +                    const uint8_t lane = uint8_t(3u - bit);
 +                    accReady[lane] = issue + 1; // kAccForwardLatency
-+                    ready[readyCount++] = ReadyWrite{2u, 0u, lane, 1u, uint16_t(issue)};
++                    ready[readyCount++] = ReadyWrite{2u, 0u, lane, 1u, uint8_t(n)};
 +                }
 +            }
 +        }
@@ -1336,7 +1371,7 @@ index 0000000..1e08592
 +            // recompute the ready list for the shortened block
 +            uint32_t rc = 0;
 +            for (uint32_t k = 0; k < readyCount; ++k)
-+                if (int32_t(ready[k].issue) <= issueOf[n - 1u])
++                if (ready[k].pair < n)
 +                    ready[rc++] = ready[k];
 +            readyCount = rc;
 +        }
@@ -1372,6 +1407,7 @@ index 0000000..1e08592
 +        unsigned long hits = 0, misses = 0, compiled = 0, rejected = 0;
 +        unsigned long entered = 0, pairsRun = 0, guardBlocked = 0;
 +        // which guard condition rejected an entry (aims the next relaxation)
++        unsigned long rescheduled = 0;
 +        unsigned long gbVf = 0, gbVi = 0, gbAcc = 0, gbStore = 0, gbQ = 0, gbClip = 0,
 +                      gbXgkick = 0, gbBudget = 0;
 +
