@@ -54,6 +54,11 @@ mkdir -p "$GAME_DIR/tmp"
 # Game-side overrides (e.g. DBCMAN HLE serving) read gamefiles/ from this env var, so the
 # path is never hardcoded and survives a game-folder rename.
 export PS2_GAMEFILES="$GAME_DIR/gamefiles"
+# cont.346p: the ELF lives INSIDE gamefiles/, and memory cards default to the ELF's own directory
+# -- so mc0/ and mc1/ live in gamefiles/ too. EVERYTHING for the game is one folder the player can
+# drop their disc into (user). No pin here: the runtime default already does this.
+# PS2X_MC_ROOT names a directory CONTAINING mc0/ and mc1/; set it only to switch cards (the
+# two-card test harness does).
 if [[ -n "$RUN_LOG" ]]; then
     mkdir -p "$(dirname "$RUN_LOG")"
     # ALWAYS remove the old log first, so the log that exists afterward is GUARANTEED to be
