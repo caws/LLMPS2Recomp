@@ -1,11 +1,12 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..6c45f35 100644
+index 9c39ae2..7dee161 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-@@ -10,9 +10,20 @@
+@@ -10,9 +10,21 @@
  #include <algorithm>
  #include <cmath>
  #include <cstdio>
++#include <climits>
 +#include <cstdlib>
 +#include <cmath>
  #include <cstring>
@@ -23,7 +24,7 @@ index 9c39ae2..6c45f35 100644
  
  using namespace GSInternal;
  
-@@ -468,12 +479,342 @@ namespace
+@@ -468,12 +480,354 @@ namespace
      }
  }
  
@@ -169,7 +170,11 @@ index 9c39ae2..6c45f35 100644
 +static unsigned long long g_perfCpuNs = 0, g_perfCpuPrims = 0;
 +static std::atomic<unsigned long long> g_perfPresents{0};
 +static std::chrono::steady_clock::time_point g_perfStart = std::chrono::steady_clock::now();
-+static void gs2PrintRasterThroughput()
++static // cont.207: how often the band pool actually engaged. A fan-out rate near zero means the
++// heuristic is rejecting everything; a high rate with no speedup means the handoff dominates.
++std::atomic<unsigned long long> g_gs2BandFan{0};
++std::atomic<unsigned long long> g_gs2BandDirect{0};
++void gs2PrintRasterThroughput()
 +{
 +    const double sec = std::chrono::duration<double>(
 +        std::chrono::steady_clock::now() - g_perfStart).count();
@@ -180,6 +185,10 @@ index 9c39ae2..6c45f35 100644
 +                 g_perfPresents.load(),
 +                 sec > 0.0 ? double(g_perfPresents.load()) / sec : 0.0,
 +                 s_gsNoRaster ? "ABLATED" : "on");
++    const unsigned long long fan = g_gs2BandFan.load(), dir = g_gs2BandDirect.load();
++    if (fan + dir != 0ull)
++        std::fprintf(stderr, "[gsgpu:bands] fanOut=%llu direct=%llu (%.1f%% fanned)\n",
++                     fan, dir, 100.0 * double(fan) / double(fan + dir));
 +}
 +// Mipmapping (PS2X_GS_MIPMAP, default ON; =0 restores level-0-only sampling). The frontend
 +// stores MIPTBP1/2 + TEX1 but the sampler always read level 0 — distant minified surfaces
@@ -353,6 +362,7 @@ index 9c39ae2..6c45f35 100644
 +        m_queueCv.notify_all();
 +        m_worker.join();
 +    }
++    stopBandPool();
 +}
 +
  GSCpuBackend::GSCpuBackend()
@@ -362,11 +372,14 @@ index 9c39ae2..6c45f35 100644
      std::call_once(lookupTablesOnce, []()
                     { InitLookupTables(); });
 +    if (s_gsThread)
++    {
 +        m_worker = std::thread(&GSCpuBackend::workerLoop, this);
++        startBandPool();
++    }
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +872,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +885,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -383,7 +396,7 @@ index 9c39ae2..6c45f35 100644
              break;
          }
      }
-@@ -541,14 +888,22 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,14 +901,22 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -406,7 +419,7 @@ index 9c39ae2..6c45f35 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      ResetUnlocked();
  }
-@@ -561,10 +916,21 @@ void GSCpuBackend::ResetUnlocked()
+@@ -561,10 +929,21 @@ void GSCpuBackend::ResetUnlocked()
      m_transferState.direction = 3u;
      m_localToHostBuffer.clear();
      m_localToHostReadPos = 0u;
@@ -428,7 +441,7 @@ index 9c39ae2..6c45f35 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +939,136 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,72 +952,2434 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -449,10 +462,12 @@ index 9c39ae2..6c45f35 100644
 -    // backends use this boundary to invalidate texture views.
 +    // CPU texture reads are coherent with local memory, and the worker queue is strict
 +    // FIFO (an upload queued before a draw executes before it), so no drain is needed.
-+}
-+
+ }
+ 
+-void GSCpuBackend::Sync(GSSyncReason)
 +void GSCpuBackend::Sync(GSSyncReason reason)
-+{
+ {
+-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
 +    // Presentation must NOT drain (cont.163): with the EE producing draws continuously,
 +    // a full drain can starve the MAIN thread for long stretches — and the main thread is
 +    // the only one pumping X events, so input (and the present cadence itself) dies
@@ -490,12 +505,10 @@ index 9c39ae2..6c45f35 100644
 +                                      .count()),
 +            std::memory_order_release);
 +    }
- }
- 
--void GSCpuBackend::Sync(GSSyncReason)
++}
++
 +void GSCpuBackend::OnDisplayFlip(uint64_t preFlipDispfb1, uint64_t preFlipDispfb2)
- {
--    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
++{
 +    // The guest just flipped the display. The buffer the PRE-flip registers point to holds the
 +    // last fully completed frame (its UI text was drawn onto it right after ITS flip -- proven
 +    // cont.165: 128 glyph draws land in every inter-flip window, always AFTER the flip). Capture
@@ -570,15 +583,15 @@ index 9c39ae2..6c45f35 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -600,45 +1080,2113 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
-     return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
- }
  
--void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
--{
--    std::lock_guard<std::mutex> lock(m_mutex);
--    WriteVramUnlocked(psm, base, bw, x, y, value);
--}
+-uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    if (!m_vram)
++        return 0u;
++    return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
++}
++
 +void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 +{
 +    // Ordered wrt queued work: drain, then write (single guest producer, so nothing can
@@ -2300,13 +2313,7 @@ index 9c39ae2..6c45f35 100644
 +            ++c.tileHist[gs2Log2Bucket(tiles)];
 +            ++c.tile16Hist[gs2Log2Bucket(tiles16)];
 +        }
- 
--void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
--{
--    if (!m_vram)
--        return;
--    m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
--}
++
 +        if ((c.prims & 1023u) != 0u)
 +            return;
 +        const uint64_t now = gs2NowMs();
@@ -2315,15 +2322,9 @@ index 9c39ae2..6c45f35 100644
 +        c.lastDumpMs = now;
 +        gs2PrintBatchCensus();
 +    }
- 
--void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
--{
--    std::lock_guard<std::mutex> lock(m_mutex);
--    if (!m_vram || m_vramSize == 0u)
++
 +    uint64_t stateCensusKey(const GSPrimitiveBatch &batch)
-     {
--        out.clear();
--        return;
++    {
 +        const GSDrawState &st = batch.state;
 +        const GSContext &ctx = st.context;
 +        uint64_t k = 0;
@@ -2363,19 +2364,8 @@ index 9c39ae2..6c45f35 100644
 +        k |= static_cast<uint64_t>((st.scanmsk & 3u) != 0u ? 1u : 0u) << 62;
 +        k |= static_cast<uint64_t>(g_gs2EraOpen ? 1u : 0u) << 63;
 +        return k;
-     }
--    out.resize(m_vramSize);
--    std::memcpy(out.data(), m_vram, m_vramSize);
--}
- 
--GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
--{
--    std::lock_guard<std::mutex> lock(m_mutex);
--    GSTransferSnapshot result = m_transferState;
--    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
--                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
--                                         : 0u;
--    return result;
++    }
++
 +    void stateCensusDump()
 +    {
 +        std::vector<std::pair<uint64_t, uint64_t>> rows(g_stateCensus.begin(), g_stateCensus.end());
@@ -2470,6 +2460,211 @@ index 9c39ae2..6c45f35 100644
 +                     g_gs2Xfer.lastNtDbp, g_gs2Xfer.lastNtDpsm, g_gs2Xfer.lastNtRrw, g_gs2Xfer.lastNtRrh,
 +                     g_gs2Xfer.lastDbp, g_gs2Xfer.lastDbw, g_gs2Xfer.lastDpsm,
 +                     g_gs2Xfer.lastRrw, g_gs2Xfer.lastRrh);
++    }
++}
++
++// ---- cont.207: banded parallel rasterization -------------------------------------------
++// The cont.206 profile found ONE rasterizer thread at 99% with the EE blocked on it 71% of the
++// time, on a 4-core box using ~1.4 cores. Raster ablation measured 3.50x available in heavy
++// scenes, so most of that is reachable simply by splitting the work across cores.
++//
++// The split is by SCANLINE BAND: thread k owns rows where (row / kBandRows) % N == k, so
++//   * no two threads ever write the same pixel -> no VRAM lock, and
++//   * every pixel is still written by primitives in submission order within its band,
++// which is what makes this order-preserving rather than merely parallel. Transfers, uploads and
++// presents stay on the coordinator, so they are natural barriers.
++//
++// PS2X_GS_RASTER_THREADS=N (default 1 = exactly the previous single-threaded path).
++static const unsigned s_gsRasterThreads = []
++{
++    const char *e = std::getenv("PS2X_GS_RASTER_THREADS");
++    unsigned n = (e && e[0]) ? static_cast<unsigned>(std::atoi(e)) : 1u;
++    if (n < 1u) n = 1u;
++    if (n > 8u) n = 8u;
++    return n;
++}();
++// ★ The fan-out threshold must be on PIXELS, not rows. A condvar handoff costs a few microseconds;
++// a tall but thin primitive has almost no work in it, so splitting it is pure loss. (Measured: an
++// 8-ROW threshold made the whole run SLOWER than single-threaded.)
++static const int s_gsBandMinPix = []
++{
++    const char *e = std::getenv("PS2X_GS_BAND_MINPIX");
++    return (e && e[0]) ? std::atoi(e) : 16384;
++}();
++
++namespace
++{
++    // Conservative scanline extent of a batch, used only to decide whether to fan out.
++    int gs2BandMinY(const GSPrimitiveBatch &batch)
++    {
++        const int ofy = batch.state.context.xyoffset.ofy >> 4;
++        float m = batch.vertices[0].y;
++        for (uint32_t i = 1; i < batch.vertexCount && i < 3u; ++i)
++            if (batch.vertices[i].y < m) m = batch.vertices[i].y;
++        return static_cast<int>(std::floor(m)) - ofy;
++    }
++    // Bounding-box width, for the pixel-count fan-out heuristic.
++    int gs2BandWidth(const GSPrimitiveBatch &batch)
++    {
++        float lo = batch.vertices[0].x, hi = batch.vertices[0].x;
++        for (uint32_t i = 1; i < batch.vertexCount && i < 3u; ++i)
++        {
++            if (batch.vertices[i].x < lo) lo = batch.vertices[i].x;
++            if (batch.vertices[i].x > hi) hi = batch.vertices[i].x;
++        }
++        const int w = static_cast<int>(std::ceil(hi)) - static_cast<int>(std::floor(lo)) + 1;
++        return w > 0 ? w : 1;
++    }
++    int gs2BandMaxY(const GSPrimitiveBatch &batch)
++    {
++        const int ofy = batch.state.context.xyoffset.ofy >> 4;
++        float m = batch.vertices[0].y;
++        for (uint32_t i = 1; i < batch.vertexCount && i < 3u; ++i)
++            if (batch.vertices[i].y > m) m = batch.vertices[i].y;
++        return static_cast<int>(std::ceil(m)) - ofy;
++    }
++}
++
++void GSCpuBackend::RasterBand(const GSPrimitiveBatch &batch, int bandY0, int bandY1)
++{
++    switch (batch.state.prim.type)
++    {
++    case GS_PRIM_SPRITE:
++        DrawSprite(batch, bandY0, bandY1);
++        break;
++    case GS_PRIM_TRIANGLE:
++    case GS_PRIM_TRISTRIP:
++    case GS_PRIM_TRIFAN:
++        DrawTriangle(batch, bandY0, bandY1);
++        break;
++    case GS_PRIM_LINE:
++    case GS_PRIM_LINESTRIP:
++        DrawLine(batch, bandY0, bandY1);
++        break;
++    default:
++        break;
++    }
++}
++
++void GSCpuBackend::bandWorkerLoop(unsigned index)
+ {
+-    if (!m_vram)
+-        return 0u;
+-    return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
++    uint64_t seen = 0;
++    for (;;)
++    {
++        const GSPrimitiveBatch *batch = nullptr;
++        int y0 = 0, y1 = 0;
++        {
++            std::unique_lock<std::mutex> lk(m_bandMutex);
++            m_bandStartCv.wait(lk, [&] { return m_bandStop || m_bandSeq != seen; });
++            if (m_bandStop)
++                return;
++            seen = m_bandSeq;
++            batch = m_bandBatch;
++            y0 = m_bandMinY;
++            y1 = m_bandMaxY;
++        }
++        if (batch != nullptr)
++        {
++            // Contiguous split: helper `index` (1..N-1) takes its slice of [y0, y1].
++            const int rows = y1 - y0 + 1;
++            const int per = (rows + static_cast<int>(m_bandCount) - 1) / static_cast<int>(m_bandCount);
++            const int b0 = y0 + static_cast<int>(index) * per;
++            const int b1 = (b0 + per - 1) < y1 ? (b0 + per - 1) : y1;
++            if (b0 <= b1)
++                RasterBand(*batch, b0, b1);
++        }
++        {
++            std::lock_guard<std::mutex> lk(m_bandMutex);
++            if (--m_bandPending == 0u)
++                m_bandDoneCv.notify_one();
++        }
++    }
+ }
+ 
+-void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++void GSCpuBackend::startBandPool()
+ {
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    WriteVramUnlocked(psm, base, bw, x, y, value);
++    m_bandCount = s_gsRasterThreads;
++    if (m_bandCount <= 1u)
++        return;
++    m_bandStop = false;
++    for (unsigned i = 1; i < m_bandCount; ++i)
++        m_bandThreads.emplace_back(&GSCpuBackend::bandWorkerLoop, this, i);
+ }
+ 
+-void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++void GSCpuBackend::stopBandPool()
+ {
+-    if (!m_vram)
++    if (m_bandThreads.empty())
+         return;
+-    m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
++    {
++        std::lock_guard<std::mutex> lk(m_bandMutex);
++        m_bandStop = true;
++    }
++    m_bandStartCv.notify_all();
++    for (auto &t : m_bandThreads)
++        if (t.joinable())
++            t.join();
++    m_bandThreads.clear();
+ }
+ 
+-void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
++void GSCpuBackend::RasterFanOut(const GSPrimitiveBatch &batch, int minY, int maxY)
+ {
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    if (!m_vram || m_vramSize == 0u)
++    const int rows = maxY - minY + 1;
++    // ★ Never fan out for the diagnostic paths: the per-pixel FONTTRACE counters and the CENSUS2
++    // cyan probes are plain non-atomic statics, and the raster-verify bisect swaps m_vram around
++    // the call. All are default OFF, so this costs nothing in a normal run.
++    const long long approxPix = static_cast<long long>(rows) * gs2BandWidth(batch);
++    if (m_bandThreads.empty() || m_rawDraw || g_gs2FontTrace || s_gsCensus2 ||
++        approxPix < s_gsBandMinPix || rows < static_cast<int>(m_bandCount))
+     {
+-        out.clear();
++        ++m_bandDirect;
++        g_gs2BandDirect.fetch_add(1, std::memory_order_relaxed);
++        RasterBand(batch, INT_MIN, INT_MAX);
+         return;
+     }
+-    out.resize(m_vramSize);
+-    std::memcpy(out.data(), m_vram, m_vramSize);
+-}
+-
+-GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+-{
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    GSTransferSnapshot result = m_transferState;
+-    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
+-                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
+-                                         : 0u;
+-    return result;
++    ++m_bandFanOuts;
++    g_gs2BandFan.fetch_add(1, std::memory_order_relaxed);
++    {
++        std::lock_guard<std::mutex> lk(m_bandMutex);
++        m_bandBatch = &batch;
++        m_bandMinY = minY;
++        m_bandMaxY = maxY;
++        m_bandPending = m_bandCount - 1u;
++        ++m_bandSeq;
++    }
++    m_bandStartCv.notify_all();
++    // The caller is band 0.
++    const int per = (rows + static_cast<int>(m_bandCount) - 1) / static_cast<int>(m_bandCount);
++    const int b1 = (minY + per - 1) < maxY ? (minY + per - 1) : maxY;
++    RasterBand(batch, minY, b1);
++    {
++        std::unique_lock<std::mutex> lk(m_bandMutex);
++        m_bandDoneCv.wait(lk, [&] { return m_bandPending == 0u; });
++        m_bandBatch = nullptr;
 +    }
  }
  
@@ -2712,7 +2907,7 @@ index 9c39ae2..6c45f35 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,6 +3293,130 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,32 +3486,181 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -2843,7 +3038,21 @@ index 9c39ae2..6c45f35 100644
      switch (state.prim.type)
      {
      case GS_PRIM_SPRITE:
-@@ -762,15 +3434,41 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+-        DrawSprite(batch);
+-        break;
+     case GS_PRIM_TRIANGLE:
+     case GS_PRIM_TRISTRIP:
+     case GS_PRIM_TRIFAN:
+-        DrawTriangle(batch);
+-        break;
+     case GS_PRIM_LINE:
+     case GS_PRIM_LINESTRIP:
+-        DrawLine(batch);
++        // ★ cont.207: one entry point for every scanline-based primitive, so the band fan-out
++        // decision lives in exactly one place. `m_draw` was resolved above, before any helper
++        // thread can run, and helpers only read it.
++        RasterFanOut(batch, gs2BandMinY(batch), gs2BandMaxY(batch));
+         break;
      case GS_PRIM_POINT:
      {
          const GSVertex &v = batch.vertices[0];
@@ -2888,7 +3097,7 @@ index 9c39ae2..6c45f35 100644
  }
  
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
-@@ -792,11 +3490,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +3682,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -2903,7 +3112,7 @@ index 9c39ae2..6c45f35 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -817,7 +3514,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -817,7 +3706,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      u32 fbrgba = 0;
      if (frmw)
      {
@@ -2912,7 +3121,7 @@ index 9c39ae2..6c45f35 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +3544,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +3736,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -2926,7 +3135,7 @@ index 9c39ae2..6c45f35 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +3627,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +3819,31 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -2960,7 +3169,7 @@ index 9c39ae2..6c45f35 100644
      }
  }
  
-@@ -947,15 +3663,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +3855,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -3009,7 +3218,7 @@ index 9c39ae2..6c45f35 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,26 +3714,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,26 +3906,44 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -3063,7 +3272,7 @@ index 9c39ae2..6c45f35 100644
      }
      else
      {
-@@ -1002,7 +3765,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +3957,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -3072,7 +3281,7 @@ index 9c39ae2..6c45f35 100644
  
          switch (tex.psm)
          {
-@@ -1024,7 +3787,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1024,7 +3979,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
              return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
          }
  
@@ -3087,16 +3296,66 @@ index 9c39ae2..6c45f35 100644
      };
  
      if (!state.linearFilter)
-@@ -1225,6 +3994,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1073,7 +4034,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+            (static_cast<uint32_t>(a) << 24);
+ }
+ 
+-void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
++void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, int bandY0, int bandY1)
+ {
+     const GSDrawState &state = batch.state;
+     const GSVertex &v0 = batch.vertices[0];
+@@ -1110,6 +4071,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+     const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
+     const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
+     const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
++    // ★ Band clip (cont.207): this thread owns only scanlines [bandY0, bandY1], so its pixel
++    // writes are disjoint from every other band's -- no lock, and order is preserved per band.
++    const int bandDrawY0 = drawY0 > bandY0 ? drawY0 : bandY0;
++    const int bandDrawY1 = drawY1 < bandY1 ? drawY1 : bandY1;
+ 
+     const uint64_t alphaReg = ctx.alpha;
+     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
+@@ -1148,7 +4113,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         if (spriteH < 1.0f)
+             spriteH = 1.0f;
+ 
+-        for (int y = drawY0; y <= drawY1; ++y)
++        for (int y = bandDrawY0; y <= bandDrawY1; ++y)
+         {
+             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+             float texVf = v0f + (v1f - v0f) * ty;
+@@ -1183,13 +4148,13 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+     }
+     else
+     {
+-        for (int y = drawY0; y <= drawY1; ++y)
++        for (int y = bandDrawY0; y <= bandDrawY1; ++y)
+             for (int x = drawX0; x <= drawX1; ++x)
+                 WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
+     }
+ }
+ 
+-void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
++void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, int bandY0, int bandY1)
+ {
+     const GSDrawState &state = batch.state;
+     const GSVertex &v0 = batch.vertices[0];
+@@ -1225,6 +4190,13 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
 +    const uint32_t triMip = gs2TriangleMip(batch, denom);
 +
++    // ★ Band clip: this thread owns only [bandY0, bandY1], so its pixel writes are disjoint
++    // from every other band's and no lock is needed.
++    if (bandY0 > minY) minY = bandY0;
++    if (bandY1 < maxY) maxY = bandY1;
++
      for (int y = minY; y <= maxY; ++y)
      {
          float py = static_cast<float>(y) + 0.5f;
-@@ -1281,7 +4052,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1281,7 +4253,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -3105,7 +3364,7 @@ index 9c39ae2..6c45f35 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +4070,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,6 +4271,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -3138,7 +3397,26 @@ index 9c39ae2..6c45f35 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1376,7 +4173,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1307,7 +4305,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     }
+ }
+ 
+-void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
++void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch, int bandY0, int bandY1)
+ {
+     const GSDrawState &state = batch.state;
+     const GSVertex &v0 = batch.vertices[0];
+@@ -1354,7 +4352,8 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ 
+         double z = (v0.z + (v1.z - v0.z) * t);
+         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
+-        WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
++        if (y0 >= bandY0 && y0 <= bandY1) // ★ band clip (cont.207)
++            WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
+ 
+         if (x0 == x1 && y0 == y1)
+             break;
+@@ -1376,7 +4375,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -3159,7 +3437,7 @@ index 9c39ae2..6c45f35 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +4195,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +4397,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -3181,7 +3459,7 @@ index 9c39ae2..6c45f35 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,9 +4218,30 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,9 +4420,30 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -3212,7 +3490,7 @@ index 9c39ae2..6c45f35 100644
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
          return;
  
-@@ -1406,6 +4252,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +4454,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -3364,7 +3642,7 @@ index 9c39ae2..6c45f35 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1496,12 +4487,48 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1496,12 +4689,48 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
              return;
          }
      }
@@ -3413,7 +3691,7 @@ index 9c39ae2..6c45f35 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1536,6 +4563,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1536,6 +4765,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  
      m_transferState.copiedPixels = total;
      m_transferState.direction = 3u;
@@ -3436,7 +3714,7 @@ index 9c39ae2..6c45f35 100644
  }
  
  void GSCpuBackend::PerformLocalToHostTransfer()
-@@ -1610,6 +4653,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +4855,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -3444,7 +3722,7 @@ index 9c39ae2..6c45f35 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,9 +4666,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,9 +4868,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -3460,7 +3738,7 @@ index 9c39ae2..6c45f35 100644
  
      const uint32_t x0 = context.scissor.x0;
      const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
-@@ -1656,6 +4706,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1656,6 +4908,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -3471,7 +3749,7 @@ index 9c39ae2..6c45f35 100644
          return true;
      }
  
-@@ -1674,11 +4728,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1674,11 +4930,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -3553,7 +3831,7 @@ index 9c39ae2..6c45f35 100644
  bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         uint32_t width,
                                         uint32_t height,
-@@ -1688,6 +4812,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1688,6 +5014,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         bool frameBaseIsPages,
                                         uint32_t sourceOriginX,
                                         uint32_t sourceOriginY) const
@@ -3600,7 +3878,7 @@ index 9c39ae2..6c45f35 100644
  {
      if (!m_vram || m_vramSize == 0u)
          return false;
-@@ -1759,16 +4923,66 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +5125,66 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -3671,7 +3949,7 @@ index 9c39ae2..6c45f35 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +5026,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +5228,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;

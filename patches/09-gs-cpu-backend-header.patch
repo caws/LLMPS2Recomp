@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..338b8a9 100644
+index 71e8032..36fdf2c 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 @@ -3,14 +3,24 @@
@@ -41,7 +41,7 @@ index 71e8032..338b8a9 100644
      PresentationFrame Present(const GSPresentationRequest &request) override;
  
      bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
-@@ -36,18 +53,169 @@ private:
+@@ -36,18 +53,182 @@ private:
      void ResetUnlocked();
      uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
      void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -195,9 +195,25 @@ index 71e8032..338b8a9 100644
 +    void SnapshotVramNoDrain(std::vector<uint8_t> &out) const;
  
      void DrawPrimitive(const GSPrimitiveBatch &batch);
-     void DrawSprite(const GSPrimitiveBatch &batch);
-     void DrawTriangle(const GSPrimitiveBatch &batch);
-     void DrawLine(const GSPrimitiveBatch &batch);
+-    void DrawSprite(const GSPrimitiveBatch &batch);
+-    void DrawTriangle(const GSPrimitiveBatch &batch);
+-    void DrawLine(const GSPrimitiveBatch &batch);
++    // ★ cont.207 BANDED RASTERIZATION. Each rasterizer thread owns a disjoint band of SCANLINES
++    // (`bandY0..bandY1`, inclusive), so no two threads ever write the same pixel and primitive
++    // order is preserved within a band -- no VRAM lock, no ordering change. The coordinator
++    // resolves `m_draw` ONCE before fanning out, so helpers only ever READ it.
++    // A band of [INT_MIN, INT_MAX] is the whole screen, i.e. the single-threaded path.
++    void DrawSprite(const GSPrimitiveBatch &batch, int bandY0, int bandY1);
++    void DrawTriangle(const GSPrimitiveBatch &batch, int bandY0, int bandY1);
++    void DrawLine(const GSPrimitiveBatch &batch, int bandY0, int bandY1);
++    // Rasterize `batch` restricted to one band; the shared entry the pool's threads call.
++    void RasterBand(const GSPrimitiveBatch &batch, int bandY0, int bandY1);
++    // Fan `batch` across the band pool and join. Falls back to a direct full-screen call when
++    // the pool is off or the primitive is too short to be worth the handoff.
++    void RasterFanOut(const GSPrimitiveBatch &batch, int minY, int maxY);
++    void startBandPool();
++    void stopBandPool();
++    void bandWorkerLoop(unsigned index);
      void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
 -    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
 +    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v, uint32_t mip = 0);
@@ -212,7 +228,7 @@ index 71e8032..338b8a9 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +225,36 @@ private:
+@@ -57,9 +238,36 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -251,7 +267,7 @@ index 71e8032..338b8a9 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +262,52 @@ private:
+@@ -67,9 +275,69 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
@@ -292,6 +308,23 @@ index 71e8032..338b8a9 100644
 +    bool m_workerBusy = false;
 +    bool m_workerStop = false;
 +    std::thread m_worker;
++
++    // ---- cont.207: banded rasterizer pool -------------------------------------------------
++    // PS2X_GS_RASTER_THREADS=N (default 1 = the previous single-threaded behaviour, so this is
++    // opt-in and A/B-able in one binary). The pool holds N-1 helpers; the calling worker thread
++    // rasterizes band 0 itself, so N=4 means 3 helpers + the caller.
++    std::vector<std::thread> m_bandThreads;
++    std::mutex m_bandMutex;
++    std::condition_variable m_bandStartCv;
++    std::condition_variable m_bandDoneCv;
++    const GSPrimitiveBatch *m_bandBatch = nullptr;
++    int m_bandMinY = 0;
++    int m_bandMaxY = 0;
++    unsigned m_bandCount = 1;          // total participants (helpers + caller)
++    uint64_t m_bandSeq = 0;            // bumped per fan-out; helpers wait for a new value
++    unsigned m_bandPending = 0;        // helpers still working on the current fan-out
++    bool m_bandStop = false;
++    unsigned long long m_bandFanOuts = 0, m_bandDirect = 0;
 +    // GPU present decode (cont.166 phase 0, PS2X_GS_GPU_PRESENT / PS2X_GS_GPU_VERIFY):
 +    // non-owning; Present() points its thread_local snapshot backend at the process-wide
 +    // device before PresentFromLocalMemory, with m_gpuSourceId keying the device's VRAM
