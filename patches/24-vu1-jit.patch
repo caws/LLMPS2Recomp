@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..0c353ec
+index 0000000..f61edf6
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,706 @@
+@@ -0,0 +1,848 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -30,6 +30,7 @@ index 0000000..0c353ec
 +#include <cstdio>
 +#include <cstring>
 +#include <cstddef>
++#include <chrono>
 +#include <sys/mman.h>
 +
 +namespace vu1jit
@@ -509,6 +510,153 @@ index 0000000..0c353ec
 +                     s.checked, s.mismatches);
 +    }
 +
++    struct FakeState // mirrors just the fields the emitted code touches, at known offsets
++    {
++        alignas(16) float vf[32][4];
++        alignas(16) float acc[4];
++    };
++
++    // ---- block assembly + the cost microbenchmark ------------------------------------------
++    // cont.185: the whole remaining JIT investment turns on ONE unknown — what does a COMPILED
++    // pair cost, versus the ~420 host cycles (120.5 ns) an interpreted one costs? Chaining pairs
++    // into a single function removes exactly what the per-instruction JIT could not: the per-pair
++    // call, the decode fetch, the scheduler, the pipeline queue/commit and the shadow dance. This
++    // measures that directly instead of estimating it.
++    //
++    // The block mimics a real T&L inner loop — the MULAbc + MADDAbc chain a 4x4 matrix transform
++    // compiles to, which is what the cont.178 census shows dominates (special 0x1b MULAbc 6.9%,
++    // 0x09/0x0a MADDAbc 11.4%).
++
++    // Emit `count` FMAC pairs back to back with no call between them.
++    inline void emitBlockChain(Emitter &e, const CodeBuffer &buf, int count)
++    {
++        for (int i = 0; i < count; ++i)
++        {
++            const int phase = i & 3;
++            // phase 0 starts the accumulation (MULA), phases 1..3 accumulate (MADDA).
++            const FmacOp op = (phase == 0) ? FmacOp::Mul : FmacOp::Madd;
++            emitFmacPair(e, buf, op, phase,
++                         kOffVf + int32_t(1 + phase) * 16, // vs = one row of the source vector
++                         kOffVf + int32_t(8) * 16,         // vt = the matrix row, broadcast
++                         kOffAcc, kOffAcc, 0xF);
++        }
++    }
++
++    inline void benchBlock(CodeBuffer &buf,
++                           void (*normOperandQuad)(const float *, float *),
++                           void (*normResultValue)(float *, uint8_t))
++    {
++        if (!buf.ensure(8u << 20))
++            return;
++        // ★ Sweep the block LENGTH. The cont.178 census says the mean basic block is only ~6 pairs,
++        // so the per-block entry/exit cost is amortised over very few instructions — measuring only
++        // a long block would flatter the JIT badly. This shows the amortisation curve directly.
++        static const int kLens[] = {1, 2, 4, 6, 8, 16, 64, 256};
++        for (int li = 0; li < int(sizeof(kLens) / sizeof(kLens[0])); ++li)
++        {
++            const int n = kLens[li];
++            const int iters = 4000000 / n;
++            buf.reset();
++            Emitter be;
++            be.p = buf.code;
++            be.end = buf.base + buf.capacity;
++            uint8_t *const bstart = be.p;
++            emitBlockChain(be, buf, n);
++            be.ret();
++            if (be.overflow)
++                continue;
++            UpperFn bfn = reinterpret_cast<UpperFn>(bstart);
++            FakeState bst{};
++            for (int r = 0; r < 12; ++r)
++                for (int c = 0; c < 4; ++c)
++                    bst.vf[r][c] = 1.0f + 0.125f * float(r * 4 + c);
++            for (int i = 0; i < 2000; ++i)
++                bfn(&bst);
++            const auto b0 = std::chrono::steady_clock::now();
++            for (int i = 0; i < iters; ++i)
++                bfn(&bst);
++            const auto b1 = std::chrono::steady_clock::now();
++            const double ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(b1 - b0).count());
++            const double perPair = ns / (double(n) * double(iters));
++            std::fprintf(stderr, "[vu1:jitbench] block=%3d pairs -> %6.2f ns/pair  (%.1fx vs 120.5)\n",
++                         n, perPair, 120.5 / perPair);
++        }
++
++        static constexpr int kPairs = 256;
++        static constexpr int kIters = 20000;
++
++        buf.reset();
++        Emitter e;
++        e.p = buf.code;
++        e.end = buf.base + buf.capacity;
++        uint8_t *const start = e.p;
++        emitBlockChain(e, buf, kPairs);
++        e.ret();
++        if (e.overflow)
++        {
++            std::fprintf(stderr, "[vu1:jitbench] overflow\n");
++            return;
++        }
++        buf.used = size_t(e.p - buf.code);
++        UpperFn fn = reinterpret_cast<UpperFn>(start);
++
++        FakeState st{};
++        for (int r = 0; r < 12; ++r)
++            for (int c = 0; c < 4; ++c)
++                st.vf[r][c] = 1.0f + 0.125f * float(r * 4 + c);
++
++        // warm up (page in the code, settle the frequency)
++        for (int i = 0; i < 200; ++i)
++            fn(&st);
++
++        const auto t0 = std::chrono::steady_clock::now();
++        for (int i = 0; i < kIters; ++i)
++            fn(&st);
++        const auto t1 = std::chrono::steady_clock::now();
++
++        // Reference: the same chain done with the C++ SSE helpers the interpreter uses, i.e. the
++        // arithmetic WITHOUT any interpreter loop around it. The gap between this and the
++        // interpreter's 120.5 ns/pair is pure per-pair plumbing.
++        alignas(16) float acc[4] = {0, 0, 0, 0};
++        const auto t2 = std::chrono::steady_clock::now();
++        for (int i = 0; i < kIters; ++i)
++        {
++            for (int p = 0; p < kPairs; ++p)
++            {
++                const int phase = p & 3;
++                alignas(16) float vs[4], vt[4], accn[4], res[4];
++                normOperandQuad(st.vf[1 + phase], vs);
++                normOperandQuad(st.vf[8], vt);
++                const float b = vt[phase];
++                vt[0] = vt[1] = vt[2] = vt[3] = b;
++                if (phase == 0)
++                {
++                    for (int c = 0; c < 4; ++c)
++                        res[c] = vs[c] * vt[c];
++                }
++                else
++                {
++                    normOperandQuad(acc, accn);
++                    for (int c = 0; c < 4; ++c)
++                        res[c] = accn[c] + vs[c] * vt[c];
++                }
++                normResultValue(res, 0xF);
++                for (int c = 0; c < 4; ++c)
++                    acc[c] = res[c];
++            }
++        }
++        const auto t3 = std::chrono::steady_clock::now();
++
++        const double jitNs = double(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++        const double refNs = double(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count());
++        const double pairs = double(kPairs) * double(kIters);
++        std::fprintf(stderr,
++                     "[vu1:jitbench] compiled block: %.2f ns/pair | C++ SSE (no loop): %.2f ns/pair"
++                     " | interpreter is ~120.5 ns/pair -> block is %.1fx\n",
++                     jitNs / pairs, refNs / pairs, 120.5 / (jitNs / pairs));
++        buf.reset();
++    }
++
 +    // ---- self-test -------------------------------------------------------------------------
 +    // Emits `void f(const float* rdi, float* rsi)` applying the operand clamp, then compares it
 +    // against the C++ quad helper over an exhaustive bit sweep. This validates BOTH the
@@ -595,12 +743,6 @@ index 0000000..0c353ec
 +    // arithmetic, the broadcast, the result clamp and the dest blend before any of it is wired
 +    // into the run loop.
 +    typedef void (*PairFn)(void *state);
-+
-+    struct FakeState // mirrors just the fields the emitted code touches, at known offsets
-+    {
-+        alignas(16) float vf[32][4];
-+        alignas(16) float acc[4];
-+    };
 +
 +    inline bool selfTestFmac(CodeBuffer &buf,
 +                             void (*normOperandQuad)(const float *, float *),

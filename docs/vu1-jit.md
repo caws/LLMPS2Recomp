@@ -558,3 +558,40 @@ shadow dance and **both instruction slots** — rather than to speed any one of 
 
 Each stage has a ready-made verification path: the three-layer harness in §5b (emitter self-test,
 FMAC self-test, live shadow-verify) already exists and generalises to every new opcode.
+
+
+## 5d. ★★★ The JIT ceiling, measured (cont.185) — 30 fps is reachable
+
+Everything left turned on one unknown: what does a **compiled** pair cost against the ~420 host
+cycles (120.5 ns) an interpreted one costs? §5b could not answer it — at instruction granularity
+the per-pair call hid the answer. The emitter now chains pairs into a single function
+(`emitBlockChain`) and the cost is measured directly, **swept over block length**, because the mean
+basic block is only ~6 pairs (§5) and benchmarking only a long block would flatter the result.
+
+The block mimics the T&L inner loop the census shows dominating — a MULAbc + MADDAbc chain, i.e. a
+4x4 matrix transform.
+
+| block length | ns/pair | vs interpreter |
+|---|---|---|
+| 1 | 11.17 | 10.7x |
+| 2 | 7.90 | 15.2x |
+| **6 — the real mean block** | **7.72** | **15.6x** |
+| 16 | 8.26 | 14.5x |
+| 256 | 8.99 | 13.3x |
+
+1. **The target is reachable.** 30 fps needs **17.0 ns/pair**; a compiled 6-pair block runs at
+   **7.72**, leaving headroom for the lower-slot work this benchmark omits. First hard evidence
+   that 30 fps is not merely hoped for.
+2. **Per-block call overhead is a non-issue** — the curve is flat from 2 pairs up, so the short
+   blocks this game actually has lose nothing. The worry that ~6-pair blocks would sink the design
+   is disproved.
+3. **Long blocks are slightly worse.** At ~150 bytes/pair, 256 pairs is ~38 KB and overflows the
+   32 KB L1i. Do **not** chase maximal block length — another argument for linking short cached
+   blocks rather than unrolling.
+
+Codegen quality is adequate: at 256 pairs the JIT (9.29 ns/pair) is level with hand-written C++ SSE
+using the same helpers (9.60), so the emitter is not leaving performance on the table.
+
+> ⚠ **Not included in 7.72**, and it must not be read as a projection of the finished system: the
+> lower slot (loads/stores/branches — §5c showed that is the coverage blocker), block entry/exit
+> state sync, write-visibility at block boundaries, and branch dispatch.
