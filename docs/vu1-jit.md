@@ -282,12 +282,44 @@ Design consequences, in order of impact:
    been included, essentially no program would have qualified and lazy flags would have measured
    nothing. The JIT must treat clip as a *live* value while mac/status stay skippable.
 
+### ★★ The scheduler measurement that reshapes the design (cont.179)
+
+`PS2X_VU1_JITCENSUS=1` now also reports a **scheduler census**. Over 440M pairs of real play:
+
+```
+[vu1:schedcensus] readyCalls=441,349,149 (1.003 per pair)
+                  stalledPairs=1,287,242 (0.3%)  stallCycles=3,115,407 (2.42 per stalled pair)
+```
+
+**Only 0.3% of pairs ever stall.** That is not a surprise in hindsight — VU1 has no VF interlocks,
+so the game's microcode is *compiler-scheduled* to avoid hazards; the stall model almost never
+fires. It has three consequences the JIT design must absorb:
+
+1. **The `NOSCHED` 33% is NOT stalls — it is bookkeeping.** What costs is `markPairWrites` writing
+   the ready tables, `queueVfWrite`/`queueAccWrite` filling pipeline slots, and
+   `commitReadyPipelines` retiring them (profile: queueVfWrite 4% + commit 4% + retire lambda 6% +
+   markPairWrites 2% + calculatePairReadyCycle 2% ≈ 18%). Optimising the *stall computation* is
+   therefore near-worthless — a hoist of the provably-invariant reduction inside the stall loop
+   (the ready tables are written only by `markPairWrites`/`reset()`, never by `advanceTo`) would
+   save 0.003 calls per pair. **Measured before it was built; not built.**
+2. **The pipeline exists for WRITE VISIBILITY, not for stalls, and that part is architecturally
+   load-bearing.** A queued VF write becomes visible only after its latency, so a read inside that
+   window legitimately returns the old value (this is what `run()`'s save/restore "shadow dance"
+   implements). The JIT cannot simply drop it.
+3. **⇒ The JIT's answer is COMPILE-TIME REGISTER RENAMING, not a faster runtime pipeline.** Within
+   a block, which read sees which prior write is a *static* property once the issue cycles are
+   known — and with stalls at 0.3% the issue schedule is essentially "one pair per cycle" with a
+   rare, statically-computable correction. So a translated block should carry no pipeline arrays at
+   all: each read is wired directly to the correct producer at translate time, and only block
+   entry/exit reconciles with the interpreter's dynamic state. That eliminates buckets 1 and 2
+   together, which is where the 33% actually lives.
+
 What it must eliminate, in measured priority order:
 
-1. **The cycle-accurate scheduler (~33%)** — resolve hazards and stall counts **statically at
-   translate time**. Within a block the register-ready cycles are a static schedule; only block
-   entry/exit needs dynamic state. This is the single biggest bucket and it is exactly what a JIT
-   is good at.
+1. **The cycle-accurate scheduler's BOOKKEEPING (~33%, per the `NOSCHED` ablation)** — not by
+   computing stalls faster, but by **compile-time register renaming** so translated blocks carry no
+   ready tables and no write pipelines (see the census above). Only block entry/exit needs dynamic
+   state.
 2. **Flag derivation (~27%)** — fold in step 1's per-program analysis, and go further: a JIT can do
    it *per block*, and can compute flags only for the last writer before a reader.
 3. **Per-instruction overhead** — keep operands in XMM registers instead of the save/restore
