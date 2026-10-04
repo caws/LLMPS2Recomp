@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..8e78dce
+index 0000000..c51012a
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,3174 @@
+@@ -0,0 +1,3207 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -2126,10 +2126,11 @@ index 0000000..8e78dce
 +    // Direct-mapped by pair index (pc/8), which is exact: VU1 microcode is at most 16 KB, so there
 +    // are at most 2048 pair slots. Wiped whenever the guest uploads new microcode — the same
 +    // `generation` the decode cache already tracks.
-+    inline void blockBufferReset();
++    inline void blockBufferReset(unsigned unit);
 +
 +    struct BlockStore
 +    {
++        unsigned unit = 1u; // cont.214: which unit's code buffer this store owns
 +        static constexpr uint32_t kPairSlots = 0x4000u / 8u;
 +        static constexpr uint32_t kMaxBlocks = kPairSlots + 1u; // one per entry PC, plus slot 0
 +
@@ -2173,7 +2174,7 @@ index 0000000..8e78dce
 +        {
 +            ++invalidations;
 +            generation = gen;
-+            blockBufferReset();
++            blockBufferReset(unit);
 +            blocks[0] = Block{};
 +            blockCount = 1;
 +            for (uint32_t i = 0; i < kPairSlots; ++i)
@@ -2181,15 +2182,25 @@ index 0000000..8e78dce
 +        }
 +    };
 +
-+    inline BlockStore &blockStore() { static BlockStore s; return s; }
++    // ★★ cont.214: PER-UNIT. VU0 and VU1 interleave constantly (5.3M VCALLMS per run against
++    // VU1's own work), and both the store's `blockByPair` map and the generation key are keyed by
++    // PC -- one shared store would invalidate itself on every switch and thrash. One store and one
++    // code buffer per unit; index 1 = VU1 (the default, so every existing call site is unchanged).
++    inline BlockStore &blockStore(unsigned unit = 1u)
++    {
++        static BlockStore s[2];
++        static const bool once = [] { s[0].unit = 0u; s[1].unit = 1u; return true; }();
++        (void)once;
++        return s[unit & 1u];
++    }
 +    // ★ Blocks get their OWN code buffer. They are invalidated on every microcode upload, and
 +    // emitted block code would otherwise accumulate forever in the shared buffer -- which is
 +    // exactly what happened: after ~7,400 blocks the 8 MB buffer was exhausted and every later
 +    // block was silently rejected. A separate buffer can be reset with the store, while the
 +    // per-instruction upper cache (whose function pointers are keyed by opcode and live forever)
 +    // keeps the original one.
-+    inline CodeBuffer &blockBuffer() { static CodeBuffer b; return b; }
-+    inline void blockBufferReset() { blockBuffer().reset(); }
++    inline CodeBuffer &blockBuffer(unsigned unit = 1u) { static CodeBuffer b[2]; return b[unit & 1u]; }
++    inline void blockBufferReset(unsigned unit) { blockBuffer(unit).reset(); }
 +
 +    inline bool blockEnabled()
 +    {
@@ -2265,6 +2276,28 @@ index 0000000..8e78dce
 +                                     touchesVuMem, tailViBackupReg, &b, issueOf, cycles,
 +                                     &branch, branchBackupReg, endsWithBranch, b.stopReason);
 +
++        // ★ cont.214: when a VU0 PC cannot make a block, say WHY. VU0 has only two programs and a
++        // few dozen candidate PCs, so the whole rejection set fits in the log -- which is what
++        // decides whether VU0 coverage can reach the ~85% where blocks start to pay.
++        if (n < 2u && store.unit == 0u && std::getenv("PS2X_VU0_REJECTLOG") != nullptr)
++        {
++            static uint32_t seen[256];
++            static uint32_t seenN = 0;
++            bool known = false;
++            for (uint32_t i = 0; i < seenN; ++i)
++                if (seen[i] == startPc) { known = true; break; }
++            if (!known && seenN < 256u)
++            {
++                seen[seenN++] = startPc;
++                const uint32_t up = avail ? pairs[0].upper : 0u;
++                const uint32_t lo = avail ? pairs[0].lower : 0u;
++                std::fprintf(stderr,
++                             "[vu0:reject] pc=0x%04x n=%u stop=%u upper=0x%08x(op=0x%02x)"
++                             " lower=0x%08x(op=0x%02x/sp=0x%02x) iBit=%u\n",
++                             startPc, n, b.stopReason, up, (up >> 2) & 0x3Fu, lo,
++                             (lo >> 25) & 0x7Fu, lo & 0x3Fu, avail ? pairs[0].iBit : 0u);
++            }
++        }
 +        // A 1-pair block cannot pay for the call, and the interpreter already handles it well.
 +        if (n >= 2u && buf.room() > 1024u * (n + 1u))
 +        {
