@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
-index 71e8032..ec1f5d7 100644
+index 71e8032..0013ccc 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 @@ -3,14 +3,24 @@
@@ -238,7 +238,7 @@ index 71e8032..ec1f5d7 100644
      bool CopyFrameToHostRgba(const GSFrameReg &frame,
                               uint32_t width,
                               uint32_t height,
-@@ -57,9 +248,36 @@ private:
+@@ -57,9 +248,40 @@ private:
                               bool frameBaseIsPages,
                               uint32_t sourceOriginX,
                               uint32_t sourceOriginY) const;
@@ -270,6 +270,10 @@ index 71e8032..ec1f5d7 100644
 +        ReadVramFunc zRead = nullptr;
 +        WriteVramFunc zWrite = nullptr;
 +        ReadVramFunc texRead = nullptr;
++        // ★★ cont.225: true when this draw targets the overwhelmingly common pair -- CT32 frame +
++        // Z24 depth. WritePixel then calls PixelStorageTraits<> DIRECTLY, so Address/ReadAt/WriteAt
++        // inline and each pixel's address is computed once per buffer instead of once per access.
++        bool fastCt32Z24 = false;
 +        uint32_t fbp = 0;
 +        uint32_t fbw = 1;
 +        uint32_t zbp = 0;
@@ -277,7 +281,7 @@ index 71e8032..ec1f5d7 100644
  
      static constexpr size_t kPsmHandlerCount = 1u << 6u;
      mutable std::mutex m_mutex;
-@@ -67,9 +285,80 @@ private:
+@@ -67,9 +289,80 @@ private:
      uint32_t m_vramSize = 0;
      std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
      std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
