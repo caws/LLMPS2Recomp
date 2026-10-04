@@ -595,3 +595,55 @@ using the same helpers (9.60), so the emitter is not leaving performance on the 
 > ⚠ **Not included in 7.72**, and it must not be read as a projection of the finished system: the
 > lower slot (loads/stores/branches — §5c showed that is the coverage blocker), block entry/exit
 > state sync, write-visibility at block boundaries, and branch dispatch.
+
+
+## 5e. Coverage build-out (cont.186-188) — 40.8% → 59.2% upper, 21.5% → 44.5% block-compilable
+
+§5c said the lower slot was the blocker. Tiering the lower opcodes and measuring what each would
+unlock (**before** emitting any) showed it was not the whole story:
+
+| tier | lower ops added | compilable (cont.186) | after upper build-out (cont.188) |
+|---|---|---|---|
+| 0 | NOP only | 4.2% | 8.7% |
+| 1 | +SQ/LQ | 16.0% | 28.5% |
+| 2 | +IADDIU | 18.3% | 33.0% |
+| 3 | +clip readers | 21.2% | 43.0% |
+| 4 | +ILW/ISW | 21.5% | **44.5%** |
+
+**Implementing every listed lower opcode reached only 21.5% while the upper slot was at 40.8%** —
+the *upper* slot was the binding constraint. Three extensions fixed that, each verified against the
+interpreter on live data before being believed:
+
+1. **q/i-operand family, MAX/MINI, ABS** — the emitter became plan-driven (`UpperPlan` /
+   `OperandSrc`), so the second operand can be a vt lane, the vt quad, or a broadcast of `q`/`i`.
+2. **Upper NOP counted as covered** — it emits nothing, but it is **26.4% of executed pairs**;
+   treating it as an opcode gap was breaking nearly every run. This one change took block-compilable
+   pairs from 26.5% to 43.5%.
+3. **ITOF0/4/12/15** — `cvtdq2ps` + an exact 1/2^n multiply.
+
+**Semantic traps found and handled (each would have silently corrupted state):**
+- `MAX`/`MINI`/`ABS`/`ITOF` use `applyDest`, **not** `applyFmacDest` — no result clamp, no flags.
+- `ABS` and `ITOF` write **`vf[ft]`**, not `vf[fd]`.
+- **`ITOF` reads `vf[fs]` as RAW INT32 BITS**, so it must bypass the operand clamp entirely.
+- The main and `special` switches **diverge at 0x10–0x17**: MAXbc/MINIbc vs ITOF/FTOI.
+- State offsets now come from `offsetof(VU1State, …)` rather than hardcoded numbers.
+
+**Cumulative verification: >250M shadow-verified executions against the interpreter, 0 mismatches.**
+That harness is what makes adding opcodes safe — each new one is checked on real guest data the
+moment it executes.
+
+### What is left, in order
+
+1. **FTOI (3.3%)** — *not* a one-instruction translation: the interpreter saturates via
+   `vuFloatToInt` (double math, clamping to `INT32_MIN`/`INT32_MAX`), while `cvttps2dq` yields
+   `0x80000000` for out-of-range in **both** directions. Positive overflow needs an explicit
+   compare-and-blend to `0x7FFFFFFF`.
+2. **CLIP (3.7%)** and OPMULA/OPMSUB.
+3. **★ Branches as block TERMINATORS rather than opcode gaps** (15.5% of lowers). The census still
+   counts a branch lower as uncovered, which *understates* what a real block compiler reaches — a
+   block should end at a branch, not refuse to include it.
+4. **Lower-slot codegen** (SQ 15.1%, clip readers 10.3%, LQ 5.3%, IADDIU 4.6%) — needs VI registers
+   in GPRs and VU-memory addressing.
+5. **Block assembly** proper: emit a run as one function, keep operands in registers across pairs,
+   and replace the interpreter loop (pc/cycle advance, pipeline) for the run's duration. §5d's
+   **7.72 ns/pair at 6-pair blocks (15.6×)** is what this unlocks.

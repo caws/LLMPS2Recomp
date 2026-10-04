@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..f61edf6
+index 0000000..7ca16ab
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,848 @@
+@@ -0,0 +1,1026 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -86,6 +86,17 @@ index 0000000..f61edf6
 +            put(16, 0x80000000u);
 +            put(32, 0x7F7FFFFFu);
 +            put(48, 0x7FFFFFFFu);
++            // ITOF scale factors 1/2^n for n = 0, 4, 12, 15, at 320/336/352/368.
++            // Exact powers of two, so multiplying by 1/2^n is identical to the interpreter's
++            // division by 2^n for every finite input.
++            {
++                const float sc[4] = {1.0f, 1.0f / 16.0f, 1.0f / 4096.0f, 1.0f / 32768.0f};
++                for (uint32_t k = 0; k < 4u; ++k)
++                {
++                    float quad[4] = {sc[k], sc[k], sc[k], sc[k]};
++                    std::memcpy(base + 320 + 16 * k, quad, sizeof(quad));
++                }
++            }
 +            for (uint32_t d = 0; d < 16u; ++d)
 +            {
 +                // lane c (0..3) enabled iff d & (1 << (3 - c)) — matches laneForComponent()
@@ -100,6 +111,7 @@ index 0000000..f61edf6
 +        const void *maxMag() const { return base + 32; }
 +        const void *magMask() const { return base + 48; }
 +        const void *destMask(uint8_t d) const { return base + 64 + 16 * (d & 15u); }
++        const void *itofScale(uint8_t k) const { return base + 320 + 16 * (k & 3u); }
 +
 +        void reset() { used = 0; }
 +        size_t room() const { return capacity - kPoolBytes - used; }
@@ -168,6 +180,13 @@ index 0000000..f61edf6
 +        void movups_store_d(uint8_t base, int32_t disp, uint8_t reg)
 +        { u8(0x0F); u8(0x11); modrmDisp32(reg, base, disp); }
 +
++        void movss_load_d(uint8_t reg, uint8_t base, int32_t disp)
++        { u8(0xF3); u8(0x0F); u8(0x10); modrmDisp32(reg, base, disp); }
++        void cvtdq2ps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5B); modrmReg(d, s); }
++        void mulps_rip(uint8_t reg, const void *c) { u8(0x0F); u8(0x59); modrmRip(reg, c); }
++        void maxps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5F); modrmReg(d, s); }
++        void minps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5D); modrmReg(d, s); }
++        void andps_rip(uint8_t reg, const void *c) { u8(0x0F); u8(0x54); modrmRip(reg, c); }
 +        void mulps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x59); modrmReg(d, s); }
 +        void addps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x58); modrmReg(d, s); }
 +        void subps_rr(uint8_t d, uint8_t s) { u8(0x0F); u8(0x5C); modrmReg(d, s); }
@@ -244,55 +263,121 @@ index 0000000..f61edf6
 +        e.movaps_rr(v, t1);
 +    }
 +
-+    // The FMAC shapes this first slice covers. `bc >= 0` selects a broadcast lane of vt.
-+    enum class FmacOp { Add, Sub, Mul, Madd, Msub };
++    // The FMAC shapes covered. Max/Min/Abs use the interpreter's `applyDest` (no result clamp and
++    // no flags) rather than `applyFmacDest` — a real semantic difference, so it is explicit here.
++    enum class FmacOp { Add, Sub, Mul, Madd, Msub, Max, Min, Abs, Nop, Itof };
 +
-+    // Emit one complete FMAC pair against a VU state pointer in rdi:
-+    //   vd[dest] = clamp( f(clamp(vf[fs]), bcast(clamp(vf[ft])), clamp(acc)) )
-+    // Offsets are byte offsets from rdi. Uses xmm0..xmm7; no REX, no branches.
-+    inline void emitFmacPair(Emitter &e, const CodeBuffer &buf, FmacOp op, int bc,
-+                             int32_t offFs, int32_t offFt, int32_t offAcc, int32_t offFd,
-+                             uint8_t dest)
++    // Where the second operand comes from. cont.186 showed the q/i-operand family is the single
++    // biggest gap in upper coverage (MULq alone is 6.8% of executed pairs).
++    enum class OperandSrc { VtLane, VtQuad, ScalarQ, ScalarI, None };
++
++    struct UpperPlan
 +    {
-+        const bool needsAcc = (op == FmacOp::Madd || op == FmacOp::Msub);
++        FmacOp op = FmacOp::Add;
++        OperandSrc src = OperandSrc::VtQuad;
++        int bc = 0;              // lane index when src == VtLane
++        bool clampResult = true; // false for MAX/MINI/ABS (they use applyDest)
++        bool writesAcc = false;  // the `special` A-forms accumulate into ACC
++        bool writesFt = false;   // ABS writes vf[ft], not vf[fd]
++        bool readsAcc = false;
++        uint8_t itofShift = 0;   // index into itofScale for ITOF0/4/12/15
++    };
 +
-+        e.movups_load_d(0, 7, offFs);                 // vs raw
++    // Emit one complete upper instruction against a VU state pointer in rdi.
++    //   vd[dest] = maybeClamp( f(clamp(vf[fs]), operand, clamp(acc)) )
++    // Offsets are byte offsets from rdi. Uses xmm0..xmm7; no REX, no branches.
++    inline void emitUpper(Emitter &e, const CodeBuffer &buf, const UpperPlan &plan,
++                          int32_t offFs, int32_t offFt, int32_t offAcc, int32_t offQ,
++                          int32_t offI, int32_t offDst, uint8_t dest)
++    {
++        if (plan.op == FmacOp::Nop)
++            return; // upper NOP: no operands read, no destination written
++
++        if (plan.op == FmacOp::Itof)
++        {
++            // ★ ITOF reads vf[fs] as RAW INT32 BITS, not as a clamped float operand — the
++            // interpreter memcpy's the bits into an int32. Clamping here would corrupt every
++            // value whose bit pattern happens to look like a denormal or an infinity.
++            // No result clamp either: ITOF uses applyDest, not applyFmacDest.
++            e.movups_load_d(0, 7, offFs);
++            e.cvtdq2ps_rr(0, 0);
++            if (plan.itofShift != 0u)
++                e.mulps_rip(0, buf.itofScale(plan.itofShift));
++            e.movaps_rip(2, buf.destMask(dest));
++            e.pand_rr(0, 2);
++            e.movups_load_d(1, 7, offDst);
++            e.pandn_rr(2, 1);
++            e.por_rr(0, 2);
++            e.movups_store_d(7, offDst, 0);
++            return;
++        }
++
++        // vs
++        e.movups_load_d(0, 7, offFs);
 +        emitNormOperand(e, buf, 0, 1, 2, 3, 4);
-+        e.movaps_rr(5, 0);                            // xmm5 = vs clamped
++        e.movaps_rr(5, 0); // xmm5 = vs
 +
-+        e.movups_load_d(0, 7, offFt);                 // vt raw
-+        emitNormOperand(e, buf, 0, 1, 2, 3, 4);
-+        if (bc >= 0)
-+            e.shufps_rri(0, 0, uint8_t(bc * 0x55));   // broadcast lane bc
-+        e.movaps_rr(6, 0);                            // xmm6 = vt clamped (maybe broadcast)
++        // second operand -> xmm6
++        switch (plan.src)
++        {
++        case OperandSrc::VtLane:
++            e.movups_load_d(0, 7, offFt);
++            emitNormOperand(e, buf, 0, 1, 2, 3, 4);
++            e.shufps_rri(0, 0, uint8_t(plan.bc * 0x55));
++            e.movaps_rr(6, 0);
++            break;
++        case OperandSrc::VtQuad:
++            e.movups_load_d(0, 7, offFt);
++            emitNormOperand(e, buf, 0, 1, 2, 3, 4);
++            e.movaps_rr(6, 0);
++            break;
++        case OperandSrc::ScalarQ:
++        case OperandSrc::ScalarI:
++            // The interpreter normalises q and i exactly like any other operand, then broadcasts.
++            e.movss_load_d(0, 7, plan.src == OperandSrc::ScalarQ ? offQ : offI);
++            e.shufps_rri(0, 0, 0x00);
++            emitNormOperand(e, buf, 0, 1, 2, 3, 4);
++            e.movaps_rr(6, 0);
++            break;
++        case OperandSrc::None:
++            break;
++        }
 +
-+        if (needsAcc)
++        if (plan.readsAcc)
 +        {
 +            e.movups_load_d(0, 7, offAcc);
 +            emitNormOperand(e, buf, 0, 1, 2, 3, 4);
-+            e.movaps_rr(7, 0);                        // xmm7 = acc clamped
++            e.movaps_rr(7, 0); // xmm7 = acc
 +        }
 +
 +        e.movaps_rr(0, 5);
-+        switch (op)
++        switch (plan.op)
 +        {
 +        case FmacOp::Add: e.addps_rr(0, 6); break;
 +        case FmacOp::Sub: e.subps_rr(0, 6); break;
 +        case FmacOp::Mul: e.mulps_rr(0, 6); break;
-+        case FmacOp::Madd: e.mulps_rr(0, 6); e.addps_rr(0, 7); break; // NOTE: acc + vs*vt
++        case FmacOp::Madd: e.mulps_rr(0, 6); e.addps_rr(0, 7); break;
 +        case FmacOp::Msub: e.mulps_rr(0, 6); e.movaps_rr(1, 7); e.subps_rr(1, 0); e.movaps_rr(0, 1); break;
++        // maxps/minps are `dst = (dst OP src) ? dst : src`, matching the interpreter's
++        // `(vs > bc) ? vs : bc` exactly. Operands are already clamped, so no NaN can reach here
++        // and maxps's NaN behaviour never applies.
++        case FmacOp::Max: e.maxps_rr(0, 6); break;
++        case FmacOp::Min: e.minps_rr(0, 6); break;
++        case FmacOp::Abs: e.andps_rip(0, buf.magMask()); break;
 +        }
-+        emitNormResultValue(e, buf, 0, 1, 2, 3, 4);
 +
-+        // vd = (result & destMask) | (vd & ~destMask).
++        if (plan.clampResult)
++            emitNormResultValue(e, buf, 0, 1, 2, 3, 4);
++
++        // dst = (result & destMask) | (dst & ~destMask).
 +        // `pandn dst, src` is `dst = ~dst & src`, so the MASK must be the destination operand —
-+        // putting vd there would compute ~vd & mask instead.
-+        e.movaps_rip(2, buf.destMask(dest)); // xmm2 = destMask
-+        e.pand_rr(0, 2);                     // result &= destMask
-+        e.movups_load_d(1, 7, offFd);        // xmm1 = vd
-+        e.pandn_rr(2, 1);                    // xmm2 = ~destMask & vd
++        // putting the old value there would compute ~old & mask instead.
++        e.movaps_rip(2, buf.destMask(dest));
++        e.pand_rr(0, 2);
++        e.movups_load_d(1, 7, offDst);
++        e.pandn_rr(2, 1);
 +        e.por_rr(0, 2);
-+        e.movups_store_d(7, offFd, 0);
++        e.movups_store_d(7, offDst, 0);
 +    }
 +
 +    // ---- instruction compiler + cache ------------------------------------------------------
@@ -310,9 +395,12 @@ index 0000000..f61edf6
 +    // ★ Only valid when lazy flags is active for the program: the emitted code deliberately does
 +    // not derive MAC/status flags, which cont.177 proved unobservable for those programs.
 +
-+    // VU1State layout (include/runtime/ps2_vu1.h): float vf[32][4]; int32_t vi[16]; float acc[4];
-+    static constexpr int32_t kOffVf = 0;
-+    static constexpr int32_t kOffAcc = 32 * 16 + 16 * 4;
++    // Offsets into VU1State, taken from the struct itself rather than hardcoded — a layout change
++    // would otherwise silently point the emitted loads at the wrong fields.
++    static constexpr int32_t kOffVf = int32_t(offsetof(VU1State, vf));
++    static constexpr int32_t kOffAcc = int32_t(offsetof(VU1State, acc));
++    static constexpr int32_t kOffQ = int32_t(offsetof(VU1State, q));
++    static constexpr int32_t kOffI = int32_t(offsetof(VU1State, i));
 +
 +    struct Cache
 +    {
@@ -342,40 +430,116 @@ index 0000000..f61edf6
 +        }
 +    };
 +
-+    // Decode an upper instruction into the emitter's terms. Returns false if not covered.
-+    inline bool classifyUpper(uint32_t instr, FmacOp &op, int &bc, bool &writesAcc)
++    // Decode an upper instruction into a plan. Returns false if not covered.
++    // ★ The main and `special` switches DIVERGE in the 0x10-0x1F range — main 0x10-0x17 are
++    // MAXbc/MINIbc while special 0x10-0x17 are ITOF/FTOI — so the two are classified separately
++    // rather than through one shared table.
++    inline bool classifyUpperPlan(uint32_t instr, UpperPlan &plan)
 +    {
 +        const uint8_t o = uint8_t(instr & 0x3Fu);
-+        uint8_t sel = o;
-+        writesAcc = false;
-+        if (o >= 0x3Cu)
-+        {
-+            sel = uint8_t((instr & 3u) | ((instr >> 4) & 0x7Cu));
-+            writesAcc = true;
-+        }
-+        bc = -1;
++        const bool special = (o >= 0x3Cu);
++        const uint8_t sel = special ? uint8_t((instr & 3u) | ((instr >> 4) & 0x7Cu)) : o;
++        plan = UpperPlan{};
++        plan.writesAcc = special;
++
++        auto arith = [&](FmacOp op, OperandSrc src, int bc, bool clamp, bool readsAcc) {
++            plan.op = op; plan.src = src; plan.bc = bc;
++            plan.clampResult = clamp; plan.readsAcc = readsAcc;
++            return true;
++        };
++
++        // Shared between both switches: the bc arithmetic block and the *q/i and quad forms.
 +        if (sel <= 0x0Fu)
 +        {
-+            bc = int(sel & 3u);
++            const int bc = int(sel & 3u);
 +            switch (sel >> 2)
 +            {
-+            case 0: op = FmacOp::Add; return true;  // ADDbc  / ADDAbc
-+            case 1: op = FmacOp::Sub; return true;  // SUBbc  / SUBAbc
-+            case 2: op = FmacOp::Madd; return true; // MADDbc / MADDAbc
-+            case 3: op = FmacOp::Msub; return true; // MSUBbc / MSUBAbc
++            case 0: return arith(FmacOp::Add, OperandSrc::VtLane, bc, true, false);  // ADD(A)bc
++            case 1: return arith(FmacOp::Sub, OperandSrc::VtLane, bc, true, false);  // SUB(A)bc
++            case 2: return arith(FmacOp::Madd, OperandSrc::VtLane, bc, true, true);  // MADD(A)bc
++            case 3: return arith(FmacOp::Msub, OperandSrc::VtLane, bc, true, true);  // MSUB(A)bc
 +            }
 +            return false;
 +        }
-+        if (sel >= 0x18u && sel <= 0x1Bu) { bc = int(sel & 3u); op = FmacOp::Mul; return true; } // MULbc/MULAbc
-+        switch (sel)
++        if (sel >= 0x18u && sel <= 0x1Bu)
++            return arith(FmacOp::Mul, OperandSrc::VtLane, int(sel & 3u), true, false); // MUL(A)bc
++
++        if (!special)
 +        {
-+        case 0x28: op = FmacOp::Add; return true;  // ADD  / ADDA
-+        case 0x29: op = FmacOp::Madd; return true; // MADD / MADDA
-+        case 0x2A: op = FmacOp::Mul; return true;  // MUL  / MULA
-+        case 0x2C: op = FmacOp::Sub; return true;  // SUB  / SUBA
-+        case 0x2D: op = FmacOp::Msub; return true; // MSUB / MSUBA
-+        default: return false;
++            switch (sel)
++            {
++            case 0x10: case 0x11: case 0x12: case 0x13: // MAXbc — applyDest, no clamp
++                return arith(FmacOp::Max, OperandSrc::VtLane, int(sel & 3u), false, false);
++            case 0x14: case 0x15: case 0x16: case 0x17: // MINIbc — applyDest, no clamp
++                return arith(FmacOp::Min, OperandSrc::VtLane, int(sel & 3u), false, false);
++            case 0x1C: return arith(FmacOp::Mul, OperandSrc::ScalarQ, 0, true, false);  // MULq
++            case 0x1D: return arith(FmacOp::Max, OperandSrc::ScalarI, 0, false, false); // MAXi
++            case 0x1E: return arith(FmacOp::Mul, OperandSrc::ScalarI, 0, true, false);  // MULi
++            case 0x1F: return arith(FmacOp::Min, OperandSrc::ScalarI, 0, false, false); // MINIi
++            case 0x20: return arith(FmacOp::Add, OperandSrc::ScalarQ, 0, true, false);  // ADDq
++            case 0x21: return arith(FmacOp::Madd, OperandSrc::ScalarQ, 0, true, true);  // MADDq
++            case 0x22: return arith(FmacOp::Add, OperandSrc::ScalarI, 0, true, false);  // ADDi
++            case 0x23: return arith(FmacOp::Madd, OperandSrc::ScalarI, 0, true, true);  // MADDi
++            case 0x24: return arith(FmacOp::Sub, OperandSrc::ScalarQ, 0, true, false);  // SUBq
++            case 0x25: return arith(FmacOp::Msub, OperandSrc::ScalarQ, 0, true, true);  // MSUBq
++            case 0x26: return arith(FmacOp::Sub, OperandSrc::ScalarI, 0, true, false);  // SUBi
++            case 0x27: return arith(FmacOp::Msub, OperandSrc::ScalarI, 0, true, true);  // MSUBi
++            case 0x28: return arith(FmacOp::Add, OperandSrc::VtQuad, 0, true, false);   // ADD
++            case 0x29: return arith(FmacOp::Madd, OperandSrc::VtQuad, 0, true, true);   // MADD
++            case 0x2A: return arith(FmacOp::Mul, OperandSrc::VtQuad, 0, true, false);   // MUL
++            case 0x2B: return arith(FmacOp::Max, OperandSrc::VtQuad, 0, false, false);  // MAX
++            case 0x2C: return arith(FmacOp::Sub, OperandSrc::VtQuad, 0, true, false);   // SUB
++            case 0x2D: return arith(FmacOp::Msub, OperandSrc::VtQuad, 0, true, true);   // MSUB
++            case 0x2F: return arith(FmacOp::Min, OperandSrc::VtQuad, 0, false, false);  // MINI
++            default: return false; // 0x2E OPMSUB and everything else: not covered
++            }
 +        }
++
++        switch (sel) // special (A) forms — 0x10-0x17 are ITOF/FTOI here, NOT MAX/MINI
++        {
++        case 0x1C: return arith(FmacOp::Mul, OperandSrc::ScalarQ, 0, true, false);  // MULAq
++        case 0x1D:                                                                   // ABS
++            plan.writesFt = true;
++            plan.writesAcc = false; // ABS writes vf[ft], not ACC
++            return arith(FmacOp::Abs, OperandSrc::None, 0, false, false);
++        case 0x1E: return arith(FmacOp::Mul, OperandSrc::ScalarI, 0, true, false);  // MULAi
++        case 0x20: return arith(FmacOp::Add, OperandSrc::ScalarQ, 0, true, false);  // ADDAq
++        case 0x21: return arith(FmacOp::Madd, OperandSrc::ScalarQ, 0, true, true);  // MADDAq
++        case 0x22: return arith(FmacOp::Add, OperandSrc::ScalarI, 0, true, false);  // ADDAi
++        case 0x23: return arith(FmacOp::Madd, OperandSrc::ScalarI, 0, true, true);  // MADDAi
++        case 0x24: return arith(FmacOp::Sub, OperandSrc::ScalarQ, 0, true, false);  // SUBAq
++        case 0x25: return arith(FmacOp::Msub, OperandSrc::ScalarQ, 0, true, true);  // MSUBAq
++        case 0x26: return arith(FmacOp::Sub, OperandSrc::ScalarI, 0, true, false);  // SUBAi
++        case 0x27: return arith(FmacOp::Msub, OperandSrc::ScalarI, 0, true, true);  // MSUBAi
++        case 0x28: return arith(FmacOp::Add, OperandSrc::VtQuad, 0, true, false);   // ADDA
++        case 0x29: return arith(FmacOp::Madd, OperandSrc::VtQuad, 0, true, true);   // MADDA
++        case 0x2A: return arith(FmacOp::Mul, OperandSrc::VtQuad, 0, true, false);   // MULA
++        case 0x2C: return arith(FmacOp::Sub, OperandSrc::VtQuad, 0, true, false);   // SUBA
++        case 0x2D: return arith(FmacOp::Msub, OperandSrc::VtQuad, 0, true, true);   // MSUBA
++        case 0x10: case 0x11: case 0x12: case 0x13: // ITOF0 / ITOF4 / ITOF12 / ITOF15
++            plan.writesFt = true;
++            plan.writesAcc = false;
++            plan.itofShift = uint8_t(sel & 3u);
++            return arith(FmacOp::Itof, OperandSrc::None, 0, false, false);
++        case 0x2F:
++        case 0x30:
++            // ★ Upper NOP. It emits NOTHING, but it must count as COVERED: it is 26.4% of executed
++            // pairs (cont.178 census), so treating it as an opcode gap would break almost every
++            // run a block could otherwise cover.
++            plan.writesAcc = false;
++            return arith(FmacOp::Nop, OperandSrc::None, 0, false, false);
++        default: return false; // ITOF/FTOI/CLIP/OPMULA: not covered yet
++        }
++    }
++
++    // Back-compat shim for the census, which only asks "is this upper covered?".
++    inline bool classifyUpper(uint32_t instr, FmacOp &op, int &bc, bool &writesAcc)
++    {
++        UpperPlan plan;
++        if (!classifyUpperPlan(instr, plan))
++            return false;
++        op = plan.op; bc = plan.bc; writesAcc = plan.writesAcc;
++        return true;
 +    }
 +
 +    typedef void (*UpperFn)(void *state);
@@ -393,26 +557,24 @@ index 0000000..f61edf6
 +        }
 +        ++cache.misses;
 +
-+        FmacOp op = FmacOp::Add;
-+        int bc = -1;
-+        bool writesAcc = false;
++        UpperPlan plan;
 +        UpperFn produced = nullptr;
-+        if (classifyUpper(instr, op, bc, writesAcc) && buf.room() > 512)
++        if (classifyUpperPlan(instr, plan) && plan.op != FmacOp::Nop && buf.room() > 512)
 +        {
 +            const uint8_t dest = uint8_t((instr >> 21) & 0xFu);
 +            const uint8_t ft = uint8_t((instr >> 16) & 0x1Fu);
 +            const uint8_t fs = uint8_t((instr >> 11) & 0x1Fu);
 +            const uint8_t fd = uint8_t((instr >> 6) & 0x1Fu);
++            const int32_t offDst = plan.writesAcc ? kOffAcc
++                                                  : (kOffVf + int32_t(plan.writesFt ? ft : fd) * 16);
 +            Emitter e;
 +            e.p = buf.code + buf.used;
 +            e.end = buf.base + buf.capacity;
 +            uint8_t *const start = e.p;
-+            emitFmacPair(e, buf, op, bc,
-+                         kOffVf + int32_t(fs) * 16,
-+                         kOffVf + int32_t(ft) * 16,
-+                         kOffAcc,
-+                         writesAcc ? kOffAcc : (kOffVf + int32_t(fd) * 16),
-+                         dest);
++            emitUpper(e, buf, plan,
++                      kOffVf + int32_t(fs) * 16,
++                      kOffVf + int32_t(ft) * 16,
++                      kOffAcc, kOffQ, kOffI, offDst, dest);
 +            e.ret();
 +            if (!e.overflow)
 +            {
@@ -514,6 +676,8 @@ index 0000000..f61edf6
 +    {
 +        alignas(16) float vf[32][4];
 +        alignas(16) float acc[4];
++        float q;
++        float i;
 +    };
 +
 +    // ---- block assembly + the cost microbenchmark ------------------------------------------
@@ -535,10 +699,16 @@ index 0000000..f61edf6
 +            const int phase = i & 3;
 +            // phase 0 starts the accumulation (MULA), phases 1..3 accumulate (MADDA).
 +            const FmacOp op = (phase == 0) ? FmacOp::Mul : FmacOp::Madd;
-+            emitFmacPair(e, buf, op, phase,
-+                         kOffVf + int32_t(1 + phase) * 16, // vs = one row of the source vector
-+                         kOffVf + int32_t(8) * 16,         // vt = the matrix row, broadcast
-+                         kOffAcc, kOffAcc, 0xF);
++            UpperPlan plan;
++            plan.op = op;
++            plan.src = OperandSrc::VtLane;
++            plan.bc = phase;
++            plan.clampResult = true;
++            plan.readsAcc = (op == FmacOp::Madd);
++            emitUpper(e, buf, plan,
++                      kOffVf + int32_t(1 + phase) * 16, // vs = one row of the source vector
++                      kOffVf + int32_t(8) * 16,         // vt = the matrix row, broadcast
++                      kOffAcc, kOffQ, kOffI, kOffAcc, 0xF);
 +        }
 +    }
 +
@@ -774,7 +944,15 @@ index 0000000..f61edf6
 +                    const int32_t offFt = int32_t(offsetof(FakeState, vf) + 2 * 16);
 +                    const int32_t offFd = int32_t(offsetof(FakeState, vf) + 3 * 16);
 +                    const int32_t offAcc = int32_t(offsetof(FakeState, acc));
-+                    emitFmacPair(e, buf, ops[oi], bc, offFs, offFt, offAcc, offFd, uint8_t(dest));
++                    UpperPlan tplan;
++                    tplan.op = ops[oi];
++                    tplan.src = (bc >= 0) ? OperandSrc::VtLane : OperandSrc::VtQuad;
++                    tplan.bc = (bc >= 0) ? bc : 0;
++                    tplan.clampResult = true;
++                    tplan.readsAcc = (ops[oi] == FmacOp::Madd || ops[oi] == FmacOp::Msub);
++                    emitUpper(e, buf, tplan, offFs, offFt, offAcc,
++                              int32_t(offsetof(FakeState, q)), int32_t(offsetof(FakeState, i)),
++                              offFd, uint8_t(dest));
 +                    e.ret();
 +                    if (e.overflow)
 +                    {
