@@ -127,7 +127,7 @@ The method compares **outputs for given inputs**. Timing is not an output. The E
 correctness is *when* things run relative to the vblank ladder, and that is load-bearing here, not
 academic: the PAL **50 Hz** vblank is mandatory for play, and the ladder fall-off bug was precisely
 a "reached the top" event delivered late by a 60 Hz vblank
-([[reference_pal_vblank_and_scheduler_race]]).
+(see the game repo's `docs/progress.md` on the PAL vblank rate and the `pc=0x3` scheduler race).
 
 So the single subsystem that most needs proof is the one this technique cannot provide it for.
 `lib/Kernel` therefore needs a **separately designed** validation approach — recorded timing traces
@@ -214,7 +214,8 @@ The units that dissolve do so one at a time, each unlocked when its last consume
   strength of a method that cannot see timing would be the single most dangerous step in the arc.
 - **Lifting VU without a census.** Microprograms are uploaded *as data*, so lifting VU means having
   lifted every program that can ever be uploaded — across all 44 archives, not just the levels that
-  have been exercised. This is exactly the [[reference_one_level_is_not_the_game]] trap; do the
+  have been exercised. This is exactly the same trap as "the sequencer is inert", which came from
+  one level and died to an offline census of all 44 archives; do the
   offline census before committing to the VU rung.
 - **Scale denial.** 889,469 transliterated lines. Even at the much higher density of hand-written
   code this is a multi-year arc. It is tractable *only* because it is incremental, verifiable per
