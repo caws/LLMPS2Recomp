@@ -517,3 +517,44 @@ pay, whatever the coverage, and the per-pair call plus cache lookup eats most of
 The JIT ships **default OFF** (`PS2X_VU1_JIT=1` to enable): +3% does not justify running
 hand-encoded machine code against guest state by default. It is the verified foundation for step 1
 above, not a shippable optimization at instruction granularity.
+
+
+## 5c. The block-JIT ceiling, measured before building it (cont.184)
+
+§5b concluded a JIT pays only when a block subsumes the loop. The obvious first block shape — runs
+of consecutive pairs whose **lower is NOP** (no upper/lower interleaving to model) and whose upper
+is a covered FMAC op — was measured first:
+
+```
+[vu1:blockcensus] compilablePairs=14572797 (4.0%) runs=9511643 meanRun=1.53
+                  pairsInRunsGe2=6718607 (1.9%)
+                  hist= 1:7854190  2:770437  3:186225  4:398142  10:302649
+```
+
+**Only 1.9% of executed pairs sit in a compilable run of length ≥ 2.** Against the **40.8%** the
+per-instruction JIT covered on uppers alone, the entire gap is the lower slot: VU1 microcode uses
+dual issue heavily, so `lower == NOP` discards ~95% of the opportunity.
+
+> **⇒ An upper-only block JIT is a dead end.** The block compiler must translate the LOWER
+> instructions as well — by executed share: `0x01` store 15.1%, clip readers `0x13`+`0x12` 10.3%,
+> `0x00` load 5.3%, `0x08` IADDIU 4.6% — plus the branches that terminate blocks.
+
+**Ceiling refreshed at the current baseline** (build 246): `PS2X_VU1_NOSCHED=1` gives **91.70 vs
+123.65 ns/pair (25.8%)** — so **even with the scheduler entirely free, 30 fps is still 5.4× away.**
+No single subsystem is the answer any more. Reaching 17 ns/pair requires a compiled block to
+eliminate *essentially all* per-pair interpreter work — decode fetch, dispatch, the scheduler, the
+shadow dance and **both instruction slots** — rather than to speed any one of them up.
+
+### The build order this leaves
+
+1. **Lower-slot codegen** for store / load / IADDIU / clip readers — the coverage blocker, and the
+   thing that decides whether runs get long enough to matter. Re-run the block census after each
+   opcode lands; it is the coverage meter.
+2. **Block assembly**: runs of consecutive fully-covered pairs → one function, operands kept in
+   registers across pairs, one call per block.
+3. **Pipeline elimination inside a block** via cont.179b's write-visibility analysis — with the
+   branch-delay-slot exclusion and the `m_vfLatestWrite` sequence bump.
+4. **Block linking** (mean basic block ≈ 6 pairs, §5).
+
+Each stage has a ready-made verification path: the three-layer harness in §5b (emitter self-test,
+FMAC self-test, live shadow-verify) already exists and generalises to every new opcode.
