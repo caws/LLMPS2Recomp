@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..d49ff1c 100644
+index 8590f14..b80a947 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 8590f14..d49ff1c 100644
  #include <cstring>
  
  namespace
-@@ -119,7 +121,49 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -119,7 +121,79 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
              clearBit(PAD_SELECT);
      }
  
@@ -34,6 +34,36 @@ index 8590f14..d49ff1c 100644
 +                static bool s_announced = false;
 +                if (!s_announced) { s_announced = true;
 +                    std::fprintf(stderr, "[pad:force] CROSS held from call #%u for %d calls\n", c, s_crossLen); }
++            }
++        }
++    }
++
++    // cont.230: PS2X_PAD_LY_AT=<call> (default 0 = off) / PS2X_PAD_LY_LEN=<calls> (default 100) /
++    // PS2X_PAD_LY=<0..255> (default 0x00 = stick fully UP = walk forward) / PS2X_PAD_LX=<0..255>
++    // (default 0x80 = centred) / PS2X_PAD_UP=1 (also hold the d-pad UP bit): headless LEFT-STICK
++    // driver, the same shape as the CROSS driver above and for the same reason (XTEST is racy on a
++    // live desktop). From readState() call #AT for LEN calls the stick bytes are forced, so a run
++    // can walk the player without window focus. Diagnostic driving lever; default OFF.
++    {
++        static const int s_lyAt  = [](){ const char *e = std::getenv("PS2X_PAD_LY_AT");  return e ? std::atoi(e) : 0; }();
++        static const int s_lyLen = [](){ const char *e = std::getenv("PS2X_PAD_LY_LEN"); return e ? std::atoi(e) : 100; }();
++        static const int s_lyVal = [](){ const char *e = std::getenv("PS2X_PAD_LY");     return e ? std::atoi(e) : 0x00; }();
++        static const int s_lxVal = [](){ const char *e = std::getenv("PS2X_PAD_LX");     return e ? std::atoi(e) : 0x80; }();
++        static const bool s_upToo = [](){ const char *e = std::getenv("PS2X_PAD_UP");    return e && e[0] == '1'; }();
++        if (s_lyAt > 0)
++        {
++            static unsigned s_stickCalls = 0;
++            const unsigned c = ++s_stickCalls;
++            if ((int)c >= s_lyAt && (int)c < s_lyAt + s_lyLen)
++            {
++                data[6] = static_cast<uint8_t>(s_lxVal & 0xFF);
++                data[7] = static_cast<uint8_t>(s_lyVal & 0xFF);
++                if (s_upToo)
++                    btns &= ~PAD_UP;
++                static bool s_stickAnnounced = false;
++                if (!s_stickAnnounced) { s_stickAnnounced = true;
++                    std::fprintf(stderr, "[pad:force] left stick LX=0x%02x LY=0x%02x%s from call #%u for %d calls\n",
++                                 s_lxVal & 0xFF, s_lyVal & 0xFF, s_upToo ? " +UP" : "", c, s_lyLen); }
 +            }
 +        }
 +    }

@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..93385d8 100644
+index bd75bba..c51a96e 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,6 +3,7 @@
@@ -1501,9 +1501,10 @@ index bd75bba..93385d8 100644
  {
 -    for (PendingStore &store : m_storePipeline)
 +    if (s_vu1NoSched)
-+    {
+     {
+-        if (!store.valid)
 +        if (m_activeVuData && address + 16u <= m_activeVuDataSize)
-+        {
+         {
 +            uint32_t oldWords[4]{};
 +            std::memcpy(oldWords, m_activeVuData + address, sizeof(oldWords));
 +            for (uint32_t component = 0; component < 4u; ++component)
@@ -1515,12 +1516,11 @@ index bd75bba..93385d8 100644
 +        }
 +        return;
 +    }
-     {
--        if (!store.valid)
++    {
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_storePipeline, pipe.store, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
-         {
++        {
 +            PendingStore &store = m_storePipeline[static_cast<size_t>(slot)];
              store.valid = true;
              store.readyCycle = m_cycle + 1u;
@@ -1618,20 +1618,20 @@ index bd75bba..93385d8 100644
          return;
 -    for (PendingAccWrite &write : m_accWritePipeline)
 +    if (s_vu1NoSched)
-+    {
+     {
+-        if (!write.valid)
 +        for (uint32_t component = 0; component < 4u; ++component)
-+        {
+         {
 +            if ((laneMask & laneForComponent(component)) != 0u)
 +                m_state.acc[component] = value[component];
 +        }
 +        return;
 +    }
-     {
--        if (!write.valid)
++    {
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_accWritePipeline, pipe.acc, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
-         {
++        {
 +            PendingAccWrite &write = m_accWritePipeline[static_cast<size_t>(slot)];
              write = {};
              write.valid = true;
@@ -2428,14 +2428,14 @@ index bd75bba..93385d8 100644
      }
  
 -    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
--    {
++    uint32_t viWrite = static_cast<uint32_t>(decoded.lowerUsage.viWrite) & kViRegMask;
++    if (viWrite != 0u)
+     {
 -        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
 -            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
 -    }
 -    for (uint32_t component = 0; component < 4u; ++component)
-+    uint32_t viWrite = static_cast<uint32_t>(decoded.lowerUsage.viWrite) & kViRegMask;
-+    if (viWrite != 0u)
-     {
+-    {
 -        if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
 -            m_accReady[component] = m_cycle + kAccForwardLatency;
 +        const uint64_t viReady = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
@@ -2631,7 +2631,7 @@ index bd75bba..93385d8 100644
      resetScheduler();
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
-@@ -1633,20 +3260,1653 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,20 +3260,1627 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -3351,24 +3351,27 @@ index bd75bba..93385d8 100644
 +                const uint32_t dynCycles = dynIssue[blk->pairs - 1u] + 1u;
 +                if (dynCycles > blk->cycles)
 +                    ++bstore.rescheduled;
-+                if (!s_vu1BlockVerify)
++                // ★★★ cont.230: the ONE preamble that honours the entry guard's promises, run by
++                // BOTH the production block (on m_state) and the shadow-verify copy
++                // (blockVerifyRef). It used to be two copies, and only the second applied the clip
++                // and Q promises -- which is how the level-era dark-wedge artifact hid behind
++                // "0 mismatches" for ten cycles. Anything the guard admits early MUST be applied
++                // here and nowhere else; the counters are the census of how often each fires.
++                const auto applyGuardAdmitted = [&](VU1State &dst)
 +                {
-+                    const uint8_t tailReg = blk->tailViBackupReg;
-+                    const int32_t tailOld = tailReg != 0u ? m_state.vi[tailReg] : 0;
-+
-+                    // Apply, early, every pending VF write the block touches (supersession rule:
-+                    // only the latest write to a lane is the live one). ★ Walks only the VALID
-+                    // slots via the cont.175 PipeTrack bitmask -- scanning all 16 PendingVfWrite
-+                    // entries (~640 bytes) on every block entry was itself the cost that made
-+                    // cont.196's first cut SLOWER than the block it enabled.
++                    // Pending VF writes the block touches (supersession rule: only the latest write
++                    // to a lane is live). Walks only the VALID slots via the PipeTrack bitmask --
++                    // scanning all 16 PendingVfWrite entries on every entry was itself the cost that
++                    // made cont.196's first cut slower than the block it enabled.
 +                    if (blockVfMask != 0u)
 +                    {
++                        bool applied = false;
 +                        uint32_t m = blockVfMask;
 +                        while (m != 0u)
 +                        {
 +                            const uint32_t i = uint32_t(__builtin_ctz(m));
 +                            m &= m - 1u;
-+                            PendingVfWrite &w = m_vfWritePipeline[i];
++                            const PendingVfWrite &w = m_vfWritePipeline[i];
 +                            if (!w.valid)
 +                                continue;
 +                            uint32_t lanes =
@@ -3379,29 +3382,23 @@ index bd75bba..93385d8 100644
 +                                lanes &= lanes - 1u;
 +                                const uint32_t c = 3u - bit;
 +                                if (m_vfLatestWrite[w.reg][c] == w.sequence)
-+                                    m_state.vf[w.reg][c] = w.value[c];
++                                {
++                                    dst.vf[w.reg][c] = w.value[c];
++                                    applied = true;
++                                }
 +                            }
 +                        }
++                        if (applied)
++                            ++bstore.earlyVf;
 +                    }
-+
-+                    // ★★★ cont.230: the entry guard ADMITTED this block on the promise that every
-+                    // pending CLIP-flag write (and the pending Q) would have COMMITTED before the
-+                    // block's first reader of it (`blockApplyClip` / `blockApplyQ`, cont.201) -- but
-+                    // only the shadow-verify branch ever applied them, to `blockVerifyRef`. Production
-+                    // ran the block against the STALE m_state.clip / m_state.q, so FCAND/FCOR/FCGET and
-+                    // every MULq/ADDq in such a block read the value from BEFORE the CLIP/DIV. That is
-+                    // invisible to PS2X_VU1_BLOCKVERIFY by construction (its copy got the writes) and
-+                    // to the interpreter (which commits them on time): it showed up as the level-era
-+                    // "dark wedge" artifact -- one character's near-plane clipper output computed with
-+                    // stale clip flags, fanning across the whole frame -- and as the JIT-only spread
-+                    // of z/q (stale Q in the perspective divide). The latest-ISSUED pending clip entry
-+                    // carries the fully shifted register (queueClip chains m_workingClip), so apply
-+                    // that one; slot order is NOT issue order.
++                    // Pending CLIP-flag write(s) the guard proved committed before the block's first
++                    // clip reader. The latest-ISSUED entry carries the fully shifted 24-bit register
++                    // (queueClip chains m_workingClip); slot order is NOT issue order.
 +                    if (blockApplyClip)
 +                    {
 +                        uint64_t latestIssue = 0;
 +                        bool any = false;
-+                        uint32_t latestClip = m_state.clip;
++                        uint32_t latestClip = dst.clip;
 +                        uint32_t m = blockFlagMask;
 +                        while (m != 0u)
 +                        {
@@ -3416,10 +3413,24 @@ index bd75bba..93385d8 100644
 +                            }
 +                        }
 +                        if (any)
-+                            m_state.clip = latestClip;
++                        {
++                            dst.clip = latestClip;
++                            ++bstore.earlyClip;
++                        }
 +                    }
++                    // Pending FDIV result the guard proved committed before the block's first Q reader.
 +                    if (blockApplyQ && m_fdiv.valid)
-+                        m_state.q = m_fdiv.value;
++                    {
++                        dst.q = m_fdiv.value;
++                        ++bstore.earlyQ;
++                    }
++                };
++                if (!s_vu1BlockVerify)
++                {
++                    const uint8_t tailReg = blk->tailViBackupReg;
++                    const int32_t tailOld = tailReg != 0u ? m_state.vi[tailReg] : 0;
++
++                    applyGuardAdmitted(m_state);
 +
 +                    const unsigned long long bpT3 = s_vu1BlockProfSeg ? __rdtsc() : 0ull;
 +                    if (s_vu1BlockProfSeg) g_bpApply += bpT3 - bpT2;
@@ -3902,44 +3913,7 @@ index bd75bba..93385d8 100644
 +                // later, skipping every slot the interpreter still has a write in flight for —
 +                // those legitimately lag, because the block applies its writes immediately.
 +                blockVerifyRef = m_state;
-+                // The block sees early-applied pending writes in the real path, so the reference
-+                // copy must get them too or it would read stale values.
-+                for (const PendingVfWrite &w : m_vfWritePipeline)
-+                {
-+                    if (!w.valid)
-+                        continue;
-+                    uint32_t lanes = uint32_t(blk->vfTouched[w.reg & 31u] & w.laneMask & 0xFu);
-+                    while (lanes != 0u)
-+                    {
-+                        const uint32_t bit = uint32_t(__builtin_ctz(lanes));
-+                        lanes &= lanes - 1u;
-+                        const uint32_t c = 3u - bit;
-+                        if (m_vfLatestWrite[w.reg][c] == w.sequence)
-+                            blockVerifyRef.vf[w.reg][c] = w.value[c];
-+                    }
-+                }
-+                if (blockApplyClip)
-+                {
-+                    // cont.230: latest-ISSUED entry wins (slot order is not issue order), matching
-+                    // the production apply above.
-+                    uint64_t latestIssue = 0;
-+                    bool any = false;
-+                    uint32_t m = blockFlagMask;
-+                    while (m != 0u)
-+                    {
-+                        const uint32_t i = uint32_t(__builtin_ctz(m));
-+                        m &= m - 1u;
-+                        const FlagPipelineEntry &fe = m_flagPipeline[i];
-+                        if (fe.valid && fe.writesClip && (!any || fe.issueCycle >= latestIssue))
-+                        {
-+                            latestIssue = fe.issueCycle;
-+                            blockVerifyRef.clip = fe.clip;
-+                            any = true;
-+                        }
-+                    }
-+                }
-+                if (blockApplyQ && m_fdiv.valid)
-+                    blockVerifyRef.q = m_fdiv.value;
++                applyGuardAdmitted(blockVerifyRef);
 +                blockVerifyCycles = dynCycles;
 +                blockVerifyEntryCycle = m_cycle;
 +                // ★ Slots with a write already in flight at block ENTRY are not comparable: the
@@ -4286,7 +4260,7 @@ index bd75bba..93385d8 100644
          while (readyCycle > m_cycle)
          {
              if (readyCycle >= budgetEnd)
-@@ -1656,20 +4916,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1656,20 +4890,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              }
              advanceTo(readyCycle);
              readyCycle = calculatePairReadyCycle(decoded);
@@ -4313,7 +4287,7 @@ index bd75bba..93385d8 100644
          }
  
          const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1677,12 +4936,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1677,12 +4910,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          const bool hasUpperWrite = upperWrite.reg != 0u;
          const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
          const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
@@ -4344,7 +4318,7 @@ index bd75bba..93385d8 100644
          if (hasUpperWrite)
              std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
          if (hasDistinctLowerWrite)
-@@ -1819,7 +5090,256 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1819,7 +5064,256 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              m_pendingHaltT = tHalt;
          }
  
@@ -4601,7 +4575,7 @@ index bd75bba..93385d8 100644
          if (programEnded)
              break;
      }
-@@ -1835,4 +5355,316 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1835,4 +5329,318 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_state.cycles = m_cycle;
      if (useVuRounding && previousRoundingMode != -1)
          std::fesetround(previousRoundingMode);
@@ -4673,6 +4647,7 @@ index bd75bba..93385d8 100644
 +                             "[vu1:block] entered=%lu pairsRun=%lu (%.1f%% of pairs) "
 +                             "meanPairs=%.2f compiled=%lu rejected=%lu resched=%lu inval=%lu hashHit=%lu guardBlocked=%lu"
 +                             " (vf=%lu vi=%lu acc=%lu store=%lu q=%lu clip=%lu budget=%lu)"
++                             " early-apply(vf=%lu clip=%lu q=%lu)"
 +                             " | verify checked=%llu mismatches=%llu flagEntries=%llu flagBad=%llu clipEntries=%llu clipBad=%llu\n",
 +                             bs.entered, bs.pairsRun,
 +                             g_vu1Pairs ? 100.0 * double(bs.pairsRun) / double(g_vu1Pairs) : 0.0,
@@ -4680,7 +4655,8 @@ index bd75bba..93385d8 100644
 +                             bs.compiled, bs.rejected, bs.rescheduled, bs.invalidations, bs.hashHits,
 +                             bs.guardBlocked,
 +                             bs.gbVf, bs.gbVi, bs.gbAcc, bs.gbStore, bs.gbQ, bs.gbClip,
-+                             bs.gbBudget, g_blockVerifyChecked, g_blockVerifyMismatch,
++                             bs.gbBudget, bs.earlyVf, bs.earlyClip, bs.earlyQ,
++                             g_blockVerifyChecked, g_blockVerifyMismatch,
 +                             g_fcChecked, g_fcBad, g_ccChecked, g_ccBad);
 +                if (s_vu1ReadyVerify)
 +                    std::fprintf(stderr, "[vu1:readyverify] checked=%llu mismatches=%llu\n",

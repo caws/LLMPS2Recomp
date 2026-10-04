@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..d8217fa 100644
+index 9c39ae2..8572d28 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -9,10 +9,26 @@
@@ -5605,7 +5605,7 @@ index 9c39ae2..d8217fa 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +6841,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +6841,57 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;
@@ -5616,10 +5616,16 @@ index 9c39ae2..d8217fa 100644
 +            static unsigned long s_presN = 0;
 +            ++s_presN;
 +            const char *pd = std::getenv("PS2X_GS_PRESENT_SAVE");
-+            if (pd && g_gs2EraOpen && (s_presN % 32u) == 0u && !pixels.empty())
++            // cont.230: PS2X_GS_PRESENT_SAVE_EVERY (default 32) / PS2X_GS_PRESENT_SAVE_SLOTS (default
++            // 16) make the rotation cover a whole level-era walk instead of its last ~13 s.
++            static const unsigned long s_presEvery = []
++            { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_EVERY"); unsigned long v = e ? std::strtoul(e, nullptr, 10) : 32ul; return v ? v : 32ul; }();
++            static const unsigned long s_presSlots = []
++            { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_SLOTS"); unsigned long v = e ? std::strtoul(e, nullptr, 10) : 16ul; return v ? v : 16ul; }();
++            if (pd && g_gs2EraOpen && (s_presN % s_presEvery) == 0u && !pixels.empty())
 +            {
 +                char path[512];
-+                std::snprintf(path, sizeof(path), "%s/present_%02lu.ppm", pd, (s_presN / 32u) % 16u);
++                std::snprintf(path, sizeof(path), "%s/present_%02lu.ppm", pd, (s_presN / s_presEvery) % s_presSlots);
 +                if (FILE *f = std::fopen(path, "wb"))
 +                {
 +                    std::fprintf(f, "P6\n%u %u\n255\n", width, height);

@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..92793c5
+index 0000000..677dd3a
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,3261 @@
+@@ -0,0 +1,3264 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -2207,6 +2207,9 @@ index 0000000..92793c5
 +        unsigned long rescheduled = 0;
 +        unsigned long gbVf = 0, gbVi = 0, gbAcc = 0, gbStore = 0, gbQ = 0, gbClip = 0,
 +                      gbXgkick = 0, gbBudget = 0;
++        // cont.230 census: how often each guard-admitted EARLY APPLY fires (the values a block
++        // reads before their pipeline commit -- the exact class the dark-wedge bug lived in).
++        unsigned long earlyVf = 0, earlyClip = 0, earlyQ = 0;
 +
 +        // Returns true when the store was actually wiped.
 +        bool revalidate(uint64_t gen, uint64_t hash)
