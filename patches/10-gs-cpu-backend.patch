@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index 9c39ae2..fd63462 100644
+index 9c39ae2..4a5f962 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -9,10 +9,26 @@
@@ -29,7 +29,7 @@ index 9c39ae2..fd63462 100644
  
  using namespace GSInternal;
  
-@@ -468,12 +484,806 @@ namespace
+@@ -468,12 +484,898 @@ namespace
      }
  }
  
@@ -532,6 +532,96 @@ index 9c39ae2..fd63462 100644
 +// target is narrow enough to be worth specialising: 83.0% of texel fetches are PSMT4.
 +static const bool s_gsFastTex = []
 +{ const char *e = std::getenv("PS2X_GS_FASTTEX"); return !(e && e[0] == '0'); }();
++// ---- Triangle coverage census (PS2X_GS_TRICENSUS, default OFF; cont.229) ------------------
++// DrawTriangle walks the FULL bounding box of every triangle and runs the three-edge test per
++// pixel. The incremental-DDA fix for that is NOT bit-exact (accumulated float error moves edge
++// coverage), and the pixel-exact VRAM hash is this project's correctness gate -- so before
++// designing anything, count how much of the walk is actually wasted. Non-atomic; the census
++// forces the band fan-out off exactly as PS2X_GS_CENSUS2 does.
++static const bool s_gsTriCensus = []
++{ const char *e = std::getenv("PS2X_GS_TRICENSUS"); return e && e[0] && e[0] != '0'; }();
++// ★★★ cont.229 ANALYTIC ROW SPAN (PS2X_GS_FASTTRI, default ON, "=0" restores the full-bbox walk).
++// The census above measured 85.45% of all edge tests as pure waste: 42.79% of scanlines cover
++// NOTHING, and lead+trail waste is another 48.6%. The textbook fix -- incremental DDA edge
++// functions -- is NOT bit-exact (accumulated float error moves coverage at the edges), and the
++// pixel-exact VRAM hash is this project's correctness gate. So the per-pixel predicate is left
++// EXACTLY as it was, and we only skip pixels PROVEN unable to pass it: each of the three edge
++// functions is affine in x, so each admits a half-line, and their intersection is computed in
++// DOUBLE precision then widened by a slack far larger than any float/double discrepancy plus a
++// whole-pixel margin. Skipping pixels that could never pass cannot change a single output bit.
++static const bool s_gsFastTri = []
++{ const char *e = std::getenv("PS2X_GS_FASTTRI"); return !(e && e[0] == '0'); }();
++// PS2X_GS_SPANVERIFY=1 (default OFF): walk the FULL bbox anyway and report any covered pixel that
++// fell outside the computed span -- the oracle that the narrowing is a superset. PS2X_GS_SPANMUTATE
++// shrinks the span by that many pixels per side, to prove the oracle can fail.
++static const bool s_gsSpanVerify = []
++{ const char *e = std::getenv("PS2X_GS_SPANVERIFY"); return e && e[0] && e[0] != '0'; }();
++static const int s_gsSpanMutate = []
++{ const char *e = std::getenv("PS2X_GS_SPANMUTATE"); return e ? std::atoi(e) : 0; }();
++
++namespace
++{
++    struct Gs2SpanVerify
++    {
++        unsigned long long rows = 0;
++        unsigned long long escaped = 0;   // covered pixels found OUTSIDE the span
++        unsigned long long skipped = 0;   // pixels the span removed from the walk
++    };
++    Gs2SpanVerify g_spanVerify;
++
++    void gs2SpanVerifyDump(const char *where)
++    {
++        if (!s_gsSpanVerify)
++            return;
++        std::fprintf(stderr, "[gs2:spanverify/%s] rows=%llu skipped=%llu ESCAPED=%llu%s\n",
++                     where, g_spanVerify.rows, g_spanVerify.skipped, g_spanVerify.escaped,
++                     s_gsSpanMutate ? " (MUTATED)" : "");
++    }
++}
++
++namespace
++{
++    struct Gs2TriCensus
++    {
++        unsigned long long tris = 0;        // DrawTriangle calls that reached the walk
++        unsigned long long rows = 0;        // scanlines walked
++        unsigned long long emptyRows = 0;   // ... covering no pixel at all
++        unsigned long long tested = 0;      // inner-loop iterations (edge tests)
++        unsigned long long covered = 0;     // pixels that passed
++        unsigned long long lead = 0;        // tested before the first covered pixel of a row
++        unsigned long long trail = 0;       // tested after the last covered pixel of a row
++        unsigned long long bboxW = 0;       // summed row widths, for a mean
++        unsigned long long walked = 0;      // summed WALKED row widths (span-narrowed)
++    };
++    Gs2TriCensus g_triCensus;
++
++    void gs2TriCensusDump(const char *where)
++    {
++        if (!s_gsTriCensus)
++            return;
++        const Gs2TriCensus &c = g_triCensus;
++        const double tested = c.tested ? static_cast<double>(c.tested) : 1.0;
++        const double rows = c.rows ? static_cast<double>(c.rows) : 1.0;
++        std::fprintf(stderr,
++                     "[gs2:tricensus/%s] tris=%llu rows=%llu (%.1f/tri, empty=%.2f%%)"
++                     " meanRowW=%.1f\n",
++                     where, c.tris, c.rows,
++                     static_cast<double>(c.rows) / (c.tris ? static_cast<double>(c.tris) : 1.0),
++                     100.0 * static_cast<double>(c.emptyRows) / rows,
++                     static_cast<double>(c.bboxW) / rows);
++        std::fprintf(stderr, "[gs2:tricensus/%s] meanWalkedW=%.2f (%.1f%% of bbox row)\n",
++                     where, static_cast<double>(c.walked) / rows,
++                     100.0 * static_cast<double>(c.walked) /
++                         (c.bboxW ? static_cast<double>(c.bboxW) : 1.0));
++        std::fprintf(stderr,
++                     "[gs2:tricensus/%s] tested=%llu covered=%llu (%.2f%%)"
++                     " | WASTED lead=%.2f%% trail=%.2f%% total=%.2f%%\n",
++                     where, c.tested, c.covered, 100.0 * static_cast<double>(c.covered) / tested,
++                     100.0 * static_cast<double>(c.lead) / tested,
++                     100.0 * static_cast<double>(c.trail) / tested,
++                     100.0 * static_cast<double>(c.tested - c.covered) / tested);
++    }
++}
 +// PS2X_GS_CLUTVERIFY=1 (default OFF): differential oracle -- every cached hit is compared against
 +// a live LookupCLUT of the same texel. The bench's VRAM hash already proves pixel-equality, but it
 +// cannot distinguish "never sampled differently" from "correct", and per the cont.216 lesson a
@@ -802,6 +892,8 @@ index 9c39ae2..fd63462 100644
 +                 m_bandRuns, static_cast<unsigned long long>(hash));
 +    gs2TexCensusDump("bench");
 +    gs2ClutVerifyDump("bench");
++    gs2TriCensusDump("bench");
++    gs2SpanVerifyDump("bench");
 +}
 +
 +
@@ -836,7 +928,7 @@ index 9c39ae2..fd63462 100644
      for (size_t i = 0; i < kPsmHandlerCount; ++i)
      {
          switch (i)
-@@ -531,8 +1341,14 @@ GSCpuBackend::GSCpuBackend()
+@@ -531,8 +1433,14 @@ GSCpuBackend::GSCpuBackend()
              m_writeVramFuncs[i] = WriteZ16S;
              break;
          default:
@@ -853,7 +945,7 @@ index 9c39ae2..fd63462 100644
              break;
          }
      }
-@@ -541,30 +1357,59 @@ GSCpuBackend::GSCpuBackend()
+@@ -541,30 +1449,59 @@ GSCpuBackend::GSCpuBackend()
  
  void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
  {
@@ -913,7 +1005,7 @@ index 9c39ae2..fd63462 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!m_vram || batch.vertexCount == 0u)
          return;
-@@ -573,22 +1418,136 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -573,22 +1510,136 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::Flush()
  {
@@ -934,12 +1026,10 @@ index 9c39ae2..fd63462 100644
 -    // backends use this boundary to invalidate texture views.
 +    // CPU texture reads are coherent with local memory, and the worker queue is strict
 +    // FIFO (an upload queued before a draw executes before it), so no drain is needed.
- }
- 
--void GSCpuBackend::Sync(GSSyncReason)
++}
++
 +void GSCpuBackend::Sync(GSSyncReason reason)
- {
--    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
++{
 +    // Presentation must NOT drain (cont.163): with the EE producing draws continuously,
 +    // a full drain can starve the MAIN thread for long stretches — and the main thread is
 +    // the only one pumping X events, so input (and the present cadence itself) dies
@@ -977,10 +1067,12 @@ index 9c39ae2..fd63462 100644
 +                                      .count()),
 +            std::memory_order_release);
 +    }
-+}
-+
+ }
+ 
+-void GSCpuBackend::Sync(GSSyncReason)
 +void GSCpuBackend::OnDisplayFlip(uint64_t preFlipDispfb1, uint64_t preFlipDispfb2)
-+{
+ {
+-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
 +    // The guest just flipped the display. The buffer the PRE-flip registers point to holds the
 +    // last fully completed frame (its UI text was drawn onto it right after ITS flip -- proven
 +    // cont.165: 128 glyph draws land in every inter-flip window, always AFTER the flip). Capture
@@ -1055,7 +1147,7 @@ index 9c39ae2..fd63462 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      return ReadVramUnlocked(psm, base, bw, x, y);
  }
-@@ -602,43 +1561,2688 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+@@ -602,43 +1653,2694 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
  
  void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
  {
@@ -1163,19 +1255,8 @@ index 9c39ae2..fd63462 100644
 +            ph = 32u;
 +            break;
 +        }
-     }
--    out.resize(m_vramSize);
--    std::memcpy(out.data(), m_vram, m_vramSize);
--}
- 
--GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
--{
--    std::lock_guard<std::mutex> lock(m_mutex);
--    GSTransferSnapshot result = m_transferState;
--    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
--                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
--                                         : 0u;
--    return result;
++    }
++
 +    // Extra pages a rect can spill past its own last page. Address() adds
 +    // (bp%32 + BlockId)*PixelsPerBlock, so when bp is NOT page-aligned a pixel can land up
 +    // to ~63/32 of a page beyond its page -- but when bp%32 == 0 the offset is bounded by
@@ -3241,7 +3322,7 @@ index 9c39ae2..fd63462 100644
 +    // cyan probes are plain non-atomic statics, and the raster-verify bisect swaps m_vram around
 +    // the call. RasterFanOut has carried this guard since cont.207; the RUN path needs it too,
 +    // and it matters more now that the pool is on by default (cont.210). All are default OFF.
-+    if (m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus)
++    if (m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus || s_gsTriCensus)
 +    {
 +        for (size_t i = 0; i < count; ++i)
 +            if (items[i].vertexCount != 0u)
@@ -3471,7 +3552,7 @@ index 9c39ae2..fd63462 100644
 +    // cyan probes are plain non-atomic statics, and the raster-verify bisect swaps m_vram around
 +    // the call. All are default OFF, so this costs nothing in a normal run.
 +    const long long approxPix = static_cast<long long>(rows) * gs2BandWidth(batch);
-+    if (m_bandThreads.empty() || m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus ||
++    if (m_bandThreads.empty() || m_rawDraw || g_gs2FontTrace || s_gsCensus2 || s_gsTexCensus || s_gsTriCensus ||
 +        approxPix < s_gsBandMinPix || rows < static_cast<int>(m_bandCount))
 +    {
 +        ++m_bandDirect;
@@ -3503,12 +3584,12 @@ index 9c39ae2..fd63462 100644
 +        m_bandDoneCv.wait(lk, [&] { return m_bandPending == 0u; });
 +        m_bandBatch = nullptr;
 +    }
- }
- 
- void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
- {
-     const GSDrawState &state = batch.state;
-     const auto &ctx = state.context;
++}
++
++void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
++{
++    const GSDrawState &state = batch.state;
++    const auto &ctx = state.context;
 +    if (!m_rawDraw)
 +        rasterCapRecord(batch);
 +    if (s_gsStateCensus)
@@ -3574,6 +3655,12 @@ index 9c39ae2..fd63462 100644
 +        static unsigned long s_clutVerifyDraws = 0;
 +        if ((++s_clutVerifyDraws % 200000ul) == 0ul)
 +            gs2ClutVerifyDump("game");
++    }
++    if (s_gsSpanVerify)
++    {
++        static unsigned long s_spanVerifyDraws = 0;
++        if ((++s_spanVerifyDraws % 200000ul) == 0ul)
++            gs2SpanVerifyDump("game");
 +    }
 +    if (s_gsCensus2)
 +    {
@@ -3756,11 +3843,29 @@ index 9c39ae2..fd63462 100644
 +                         g_gs2Draw.lastTfx, g_gs2Draw.lastFbp);
 +            gs2PrintXfer(); // same cadence, so the transfer state is era-resolvable
 +        }
-+    }
+     }
+-    out.resize(m_vramSize);
+-    std::memcpy(out.data(), m_vram, m_vramSize);
+-}
+-
+-GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+-{
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    GSTransferSnapshot result = m_transferState;
+-    result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
+-                                         ? m_localToHostBuffer.size() - m_localToHostReadPos
+-                                         : 0u;
+-    return result;
+-}
+-
+-void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+-{
+-    const GSDrawState &state = batch.state;
+-    const auto &ctx = state.context;
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -745,34 +4349,191 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -745,34 +4447,191 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
          }
      });
  
@@ -3960,7 +4065,7 @@ index 9c39ae2..fd63462 100644
  void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
  {
      const auto &ctx = state.context;
-@@ -792,11 +4553,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -792,11 +4651,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          b = applyFog(b, state.fogB);
      }
  
@@ -3975,7 +4080,7 @@ index 9c39ae2..fd63462 100644
  
      const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
      if (!writeMask.writesAnything())
-@@ -813,11 +4573,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -813,11 +4671,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
      // TODO: only one address lookup for rmw
      const bool frmw = destinationAlphaTestNeedsRead || (writeMask.writesFramebuffer() && ((ctx.frame.fbmsk != 0) || alphaBlendEnabled || preserveDestinationAlpha));
  
@@ -4002,7 +4107,7 @@ index 9c39ae2..fd63462 100644
          fbrgba = rawFramebufferPixel;
  
          if (bitsPerPixel(fpsm) == 16)
-@@ -847,11 +4621,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -847,11 +4719,25 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
          zpass = true;
          break;
      case 2:
@@ -4030,7 +4135,7 @@ index 9c39ae2..fd63462 100644
          zpass = static_cast<uint32_t>(z) > storedZ;
          break;
      }
-@@ -930,12 +4718,45 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+@@ -930,12 +4816,45 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
              pixel = Rgba8888ToRgba5551(pixel);
          }
  
@@ -4078,7 +4183,7 @@ index 9c39ae2..fd63462 100644
      }
  }
  
-@@ -947,15 +4768,60 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -947,15 +4866,60 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                    uint8_t csa,
                                    uint8_t sourcePsm)
  {
@@ -4143,7 +4248,7 @@ index 9c39ae2..fd63462 100644
      case GS_PSM_CT24:
          return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
      case GS_PSM_CT16:
-@@ -969,32 +4835,90 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+@@ -969,32 +4933,90 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
      return 0xFFFF00FFu;
  }
  
@@ -4248,7 +4353,7 @@ index 9c39ae2..fd63462 100644
      }
  
      auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
-@@ -1002,7 +4926,29 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1002,7 +5024,29 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
          sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
  
@@ -4279,7 +4384,7 @@ index 9c39ae2..fd63462 100644
  
          switch (tex.psm)
          {
-@@ -1021,10 +4967,37 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1021,10 +5065,37 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
          case GS_PSM_T4:
          case GS_PSM_T4HL:
          case GS_PSM_T4HH:
@@ -4318,7 +4423,7 @@ index 9c39ae2..fd63462 100644
      };
  
      if (!state.linearFilter)
-@@ -1073,7 +5046,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+@@ -1073,7 +5144,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
             (static_cast<uint32_t>(a) << 24);
  }
  
@@ -4327,7 +4432,7 @@ index 9c39ae2..fd63462 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1110,6 +5083,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1110,6 +5181,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
      const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
      const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
      const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
@@ -4338,7 +4443,7 @@ index 9c39ae2..fd63462 100644
  
      const uint64_t alphaReg = ctx.alpha;
      const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
-@@ -1148,8 +5125,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1148,8 +5223,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
          if (spriteH < 1.0f)
              spriteH = 1.0f;
  
@@ -4351,7 +4456,7 @@ index 9c39ae2..fd63462 100644
              float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
              float texVf = v0f + (v1f - v0f) * ty;
  
-@@ -1183,13 +5163,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+@@ -1183,13 +5261,18 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
      }
      else
      {
@@ -4372,7 +4477,7 @@ index 9c39ae2..fd63462 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1225,8 +5210,18 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1225,11 +5308,144 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
      const float invAbsDenom = 1.0f / std::fabs(denom);
      constexpr float kEdgeEpsilon = 1.0e-4f;
  
@@ -4383,15 +4488,168 @@ index 9c39ae2..fd63462 100644
 +    if (bandY0 > minY) minY = bandY0;
 +    if (bandY1 < maxY) maxY = bandY1;
 +
++    if (s_gsTriCensus)
++        ++g_triCensus.tris;
++
++    // ★★★ cont.229: coefficients of the three edge functions as exact affine forms in x.
++    // w_i(x) = a_i * (x - ox) + c_i, with c_i depending only on the row. `winding` is exactly
++    // +-1.0, so folding it into k is bit-exact -- and note the per-pixel code below still does
++    // its own two multiplies; this double copy exists ONLY to bound the span, never to produce a
++    // pixel value.
++    const double dk = static_cast<double>(winding) * static_cast<double>(invAbsDenom);
++    const double sa0 = static_cast<double>(fy1 - fy2) * dk;
++    const double sa1 = static_cast<double>(fy2 - fy0) * dk;
++    const double sa2 = -(sa0 + sa1);
++    const double sb0 = static_cast<double>(fx2 - fx1) * dk;
++    const double sb1 = static_cast<double>(fx0 - fx2) * dk;
++    const double sox = static_cast<double>(fx2) - 0.5;
++    // ★★ The slack must be DERIVED, not guessed. The float predicate computes
++    // E = A*(px-fx2) + B*(py-fy2) and then scales by k; when the triangle is thin, E is a
++    // catastrophic cancellation of two large terms and its absolute error is set by the
++    // MAGNITUDE OF THOSE TERMS, not by the tiny result. A fixed slack is therefore unsound in
++    // exactly the case that matters. Bound it instead by (|A|*umax + |B|*|vy|) * |k| * K, with
++    // K = 32 * 2^-24 -- a generous multiple of the unit roundoff for the handful of operations
++    // involved. (cont.229: the first cut used a fixed 1e-3 with a 2-pixel margin. It happened to
++    // verify clean, but the margin was so wide that a deliberately shrunk span ALSO verified
++    // clean -- the mutation test could not fail, which is the tell that a bound is not doing any
++    // work. It also cost most of the win: 2 px x 2 sides x 131,631 rows is more waste than the
++    // narrowing removed.)
++    constexpr double kSpanUlp = 32.0 / 16777216.0;
++    constexpr int kSpanMargin = 0; // floor/ceil below already widen to whole pixels
++    const double umax = std::max(std::fabs(static_cast<double>(minX) + 0.5 - static_cast<double>(fx2)),
++                                 std::fabs(static_cast<double>(maxX) + 0.5 - static_cast<double>(fx2)));
++    const double adk = std::fabs(dk);
++    const double sA0 = std::fabs(static_cast<double>(fy1 - fy2));
++    const double sA1 = std::fabs(static_cast<double>(fy2 - fy0));
++    const double sB0 = std::fabs(static_cast<double>(fx2 - fx1));
++    const double sB1 = std::fabs(static_cast<double>(fx0 - fx2));
++    // The three divisions do NOT depend on y -- hoist them out of the row loop (131,631 rows vs
++    // 19,712 triangles in the capture). Multiplying by the reciprocal costs at most an extra ULP
++    // on a BOUND, which floor/ceil absorbs whole.
++    const double sinv0 = (sa0 != 0.0) ? 1.0 / sa0 : 0.0;
++    const double sinv1 = (sa1 != 0.0) ? 1.0 / sa1 : 0.0;
++    const double sinv2 = (sa2 != 0.0) ? 1.0 / sa2 : 0.0;
++    const bool spanOk = s_gsFastTri && std::isfinite(sa0) && std::isfinite(sa1) &&
++                        std::isfinite(sb0) && std::isfinite(sb1) && std::isfinite(sox) &&
++                        std::isfinite(umax) && std::isfinite(sinv0) && std::isfinite(sinv1) &&
++                        std::isfinite(sinv2);
++
      for (int y = minY; y <= maxY; ++y)
      {
 +        // ★ cont.210: striped band -- this row belongs to another thread.
 +        if (s_bandOwnRows && !s_bandOwnRows[static_cast<unsigned>(y) & (kBandRowSpace - 1u)])
 +            continue;
          float py = static_cast<float>(y) + 0.5f;
-         for (int x = minX; x <= maxX; ++x)
+-        for (int x = minX; x <= maxX; ++x)
++        int censusFirst = -1, censusLast = -1, censusCovered = 0;
++
++        // ★★ Solve the row's covered interval. Each constraint a*(x-ox) + c >= -eps' is a
++        // half-line; intersect the three, then widen. A row whose intersection is empty is
++        // skipped entirely -- the census measured 42.79% of scanlines covering nothing.
++        int spanX0 = minX, spanX1 = maxX;
++        if (spanOk)
++        {
++            const double vy = static_cast<double>(py) - static_cast<double>(fy2);
++            const double vya = std::fabs(vy);
++            const double sc0 = sb0 * vy;
++            const double sc1 = sb1 * vy;
++            // Per-constraint float-error bound (see kSpanUlp above). w2 is derived from w0 and
++            // w1, so its error is theirs plus a rounding of a quantity of order 1.
++            const double e0 = kSpanUlp * ((sA0 * umax + sB0 * vya) * adk + 1.0);
++            const double e1 = kSpanUlp * ((sA1 * umax + sB1 * vya) * adk + 1.0);
++            const double ee[3] = {e0, e1, e0 + e1 + kSpanUlp};
++            const double aa[3] = {sa0, sa1, sa2};
++            const double ii[3] = {sinv0, sinv1, sinv2};
++            const double cc[3] = {sc0, sc1, 1.0 - sc0 - sc1};
++            double lo = static_cast<double>(minX), hi = static_cast<double>(maxX);
++            bool empty = false;
++            for (int i = 0; i < 3; ++i)
++            {
++                const double relaxed = static_cast<double>(kEdgeEpsilon) + ee[i];
++                const double lim = -relaxed - cc[i];
++                if (aa[i] > 0.0)
++                {
++                    const double b = sox + lim * ii[i];
++                    if (b > lo) lo = b;
++                }
++                else if (aa[i] < 0.0)
++                {
++                    const double b = sox + lim * ii[i];
++                    if (b < hi) hi = b;
++                }
++                else if (cc[i] < -relaxed)
++                {
++                    empty = true;
++                    break;
++                }
++            }
++            if (empty)
++            {
++                spanX0 = minX + 1;
++                spanX1 = minX; // provably no coverage on this row
++            }
++            else if (std::isfinite(lo) && std::isfinite(hi))
++            {
++                const double flo = std::floor(lo) - kSpanMargin + s_gsSpanMutate;
++                const double fhi = std::ceil(hi) + kSpanMargin - s_gsSpanMutate;
++                if (flo > static_cast<double>(spanX0))
++                    spanX0 = (flo > static_cast<double>(spanX1)) ? spanX1 + 1
++                                                                 : static_cast<int>(flo);
++                if (fhi < static_cast<double>(spanX1))
++                    spanX1 = (fhi < static_cast<double>(spanX0)) ? spanX0 - 1
++                                                                 : static_cast<int>(fhi);
++            }
++        }
++        // The verifier walks the ORIGINAL bbox and flags any covered pixel the span excluded,
++        // which is exactly the property that makes the narrowing sound.
++        const int walkX0 = s_gsSpanVerify ? minX : spanX0;
++        const int walkX1 = s_gsSpanVerify ? maxX : spanX1;
++        if (s_gsSpanVerify)
++        {
++            ++g_spanVerify.rows;
++            g_spanVerify.skipped += static_cast<unsigned>((spanX0 - minX) + (maxX - spanX1));
++        }
++
++        if (s_gsTriCensus)
++        {
++            ++g_triCensus.rows;
++            g_triCensus.bboxW += static_cast<unsigned>(maxX - minX + 1);
++            g_triCensus.walked += static_cast<unsigned>(walkX1 >= walkX0 ? walkX1 - walkX0 + 1 : 0);
++        }
++        for (int x = walkX0; x <= walkX1; ++x)
          {
-@@ -1281,7 +5276,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
++            if (s_gsTriCensus)
++                ++g_triCensus.tested;
+             float px = static_cast<float>(x) + 0.5f;
+ 
+             float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+@@ -1239,6 +5455,25 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+                 continue;
+ 
++            if (s_gsTriCensus)
++            {
++                ++g_triCensus.covered;
++                ++censusCovered;
++                if (censusFirst < 0) censusFirst = x;
++                censusLast = x;
++            }
++
++            if (s_gsSpanVerify && (x < spanX0 || x > spanX1))
++            {
++                if (g_spanVerify.escaped++ < 8ull)
++                    std::fprintf(stderr,
++                                 "[gs2:spanverify] ESCAPED x=%d y=%d span=[%d,%d] bbox=[%d,%d]"
++                                 " w=%.9g/%.9g/%.9g\n",
++                                 x, y, spanX0, spanX1, minX, maxX,
++                                 static_cast<double>(w0), static_cast<double>(w1),
++                                 static_cast<double>(w2));
++            }
++
+             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+ 
+             uint8_t r, g, b, a;
+@@ -1281,7 +5516,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                      iv = 0;
                  }
  
@@ -4400,7 +4658,7 @@ index 9c39ae2..fd63462 100644
  
                  uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                  uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-@@ -1299,6 +5294,32 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+@@ -1299,15 +5534,54 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                  g = color.g;
                  b = color.b;
                  a = color.a;
@@ -4433,7 +4691,21 @@ index 9c39ae2..fd63462 100644
              }
  
              const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-@@ -1307,7 +5328,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+         }
++        if (s_gsTriCensus)
++        {
++            if (censusCovered == 0)
++                ++g_triCensus.emptyRows;
++            else
++            {
++                // ★ relative to the WALK, not the bbox: with the span active the two would
++                // otherwise double-count the pixels the span already skipped (cont.229 first
++                // reading showed lead+trail = 131% of tested, which is the tell).
++                g_triCensus.lead += static_cast<unsigned>(censusFirst - walkX0);
++                g_triCensus.trail += static_cast<unsigned>(walkX1 - censusLast);
++            }
++        }
      }
  }
  
@@ -4442,7 +4714,7 @@ index 9c39ae2..fd63462 100644
  {
      const GSDrawState &state = batch.state;
      const GSVertex &v0 = batch.vertices[0];
-@@ -1354,7 +5375,10 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1354,7 +5628,10 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
          double z = (v0.z + (v1.z - v0.z) * t);
          const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
@@ -4454,7 +4726,7 @@ index 9c39ae2..fd63462 100644
  
          if (x0 == x1 && y0 == y1)
              break;
-@@ -1376,7 +5400,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1376,7 +5653,20 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
  
  void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  {
@@ -4475,7 +4747,7 @@ index 9c39ae2..fd63462 100644
      m_transfer = command;
      m_transferState.x = command.trxpos.dsax;
      m_transferState.y = command.trxpos.dsay;
-@@ -1385,6 +5422,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1385,6 +5675,21 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
  
@@ -4497,7 +4769,7 @@ index 9c39ae2..fd63462 100644
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
      else if (command.direction == 1u)
-@@ -1393,9 +5445,31 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1393,9 +5698,31 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
@@ -4529,7 +4801,7 @@ index 9c39ae2..fd63462 100644
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
          return;
  
-@@ -1406,6 +5480,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1406,6 +5733,151 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
      const uint32_t dsax = m_transfer.trxpos.dsax;
      uint32_t offset = 0u;
  
@@ -4681,7 +4953,7 @@ index 9c39ae2..fd63462 100644
      auto advancePixel = [&](uint32_t count)
      {
          const uint32_t totalPixels = m_transferState.totalPixels;
-@@ -1496,12 +5715,49 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+@@ -1496,12 +5968,49 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
              return;
          }
      }
@@ -4731,7 +5003,7 @@ index 9c39ae2..fd63462 100644
  
      const uint32_t rrw = m_transfer.trxreg.rrw;
      const uint32_t rrh = m_transfer.trxreg.rrh;
-@@ -1536,6 +5792,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+@@ -1536,6 +6045,22 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
  
      m_transferState.copiedPixels = total;
      m_transferState.direction = 3u;
@@ -4754,7 +5026,7 @@ index 9c39ae2..fd63462 100644
  }
  
  void GSCpuBackend::PerformLocalToHostTransfer()
-@@ -1610,6 +5882,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+@@ -1610,6 +6135,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
  
  uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  {
@@ -4762,7 +5034,7 @@ index 9c39ae2..fd63462 100644
      std::lock_guard<std::mutex> lock(m_mutex);
      if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
          return 0u;
-@@ -1622,9 +5895,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+@@ -1622,9 +6148,15 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
  
  bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
  {
@@ -4778,7 +5050,7 @@ index 9c39ae2..fd63462 100644
  
      const uint32_t x0 = context.scissor.x0;
      const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
-@@ -1656,6 +5935,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1656,6 +6188,10 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -4789,7 +5061,7 @@ index 9c39ae2..fd63462 100644
          return true;
      }
  
-@@ -1674,11 +5957,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+@@ -1674,11 +6210,81 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
                  }
                  WriteVramUnlocked(context.frame.psm, fbp, fbw, x, y, pixel);
              }
@@ -4871,7 +5143,7 @@ index 9c39ae2..fd63462 100644
  bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         uint32_t width,
                                         uint32_t height,
-@@ -1688,6 +6041,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1688,6 +6294,46 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
                                         bool frameBaseIsPages,
                                         uint32_t sourceOriginX,
                                         uint32_t sourceOriginY) const
@@ -4918,7 +5190,7 @@ index 9c39ae2..fd63462 100644
  {
      if (!m_vram || m_vramSize == 0u)
          return false;
-@@ -1759,16 +6152,66 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
+@@ -1759,16 +6405,66 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
  
  PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
  {
@@ -4989,7 +5261,7 @@ index 9c39ae2..fd63462 100644
  }
  
  PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
-@@ -1812,6 +6255,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+@@ -1812,6 +6508,51 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
          }
          if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
              return false;
