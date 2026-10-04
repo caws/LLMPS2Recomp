@@ -94,16 +94,20 @@ and the disasm, then gdb, before asserting or acting.
   the PCSX2 source** as the reference implementation rather than guessing or re-deriving. Cite the
   file/function you mirrored, and still verify it against our generated C++ + disasm + gdb (it's a
   strong hypothesis, not gospel — the game's own data/flow is the final arbiter).
-- **★ Sanity-check EVERY runtime change against PCSX2 before finalizing the patch.** Any edit to
-  `tools/<game>/PS2Recomp/ps2xRuntime/` — i.e. any new/updated `patches/NN-*.patch` — changes how we
-  model PS2 hardware, so before capturing the patch read the matching PCSX2 subsystem code and confirm
-  the change agrees on **sizing, fallbacks for undefined/edge values, and the exact command/mode
-  path**. This is the *proactive* companion to the *when-stuck* PCSX2 rule ([resources.md](resources.md)
-  BINDING callouts): do it on every runtime change, not only when blocked — **a patch that compiles
+- **★ Sanity-check EVERY runtime change against PCSX2 before committing it.** Any edit to
+  `tools/<game>/PS2Recomp/ps2xRuntime/` — i.e. any commit on the fork's `lotr` branch — changes how
+  we model PS2 hardware, so before committing read the matching PCSX2 subsystem code and confirm the
+  change agrees on **sizing, fallbacks for undefined/edge values, and the exact command/mode path**.
+  This is the *proactive* companion to the *when-stuck* PCSX2 rule ([resources.md](resources.md)
+  BINDING callouts): do it on every runtime change, not only when blocked — **a change that compiles
   and stops a crash can still be subtly unfaithful** (the GS `ReadVram` psm off-by-one fix
   was right on sizing but first drafted the wrong undefined-PSM fallback — `ReadNull`/0 vs PCSX2's
-  `PSMCT32`; only reading `GSLocalMemory.cpp` surfaced it). Cite the PCSX2 file/function in the patch's
-  `patches/README.md` row.
+  `PSMCT32`; only reading `GSLocalMemory.cpp` surfaced it). Cite the PCSX2 file/function in the
+  commit message and in the fork's `docs/llmps2recomp-patches.md` row for that file.
+- **The toolchain is our fork, committed, not a patch stack.** `tools/<game>/PS2Recomp` is a clone of
+  `caws/PS2Recomp` branch `lotr` (upstream = the `upstream` remote). Commit + push runtime changes
+  there in the same cycle as the game-repo commit, and bump `<game_dir>/recomp/runtime.lock` to the
+  new commit. The `patches/*.patch` mechanism was retired (cont.230).
 
 ## The bug/fix taxonomy (quick index)
 

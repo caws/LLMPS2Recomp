@@ -5,8 +5,9 @@ Handoff document for the **VU1 interpreter → JIT** work. It records *why* the 
 two steps with their verified design inputs.
 
 Game-agnostic: the VU1 interpreter lives in the toolchain clone
-(`tools/<game>/PS2Recomp/ps2xRuntime/src/lib/vu/`) and is carried by engine
-[`patches/16-vu1-core.patch`](../patches/README.md). The *measurements* below come from the LOTR
+(`tools/<game>/PS2Recomp/ps2xRuntime/src/lib/vu/`), committed on our fork's `lotr` branch (the
+former engine patches 16/17/19/24/25; write-ups in the fork's `docs/llmps2recomp-patches.md`). The
+*measurements* below come from the LOTR
 bring-up (`rotk_decomp`, level era) and live in that game's `docs/progress.md` cont.175–176.
 
 ## 1. Why: the budget says the interpreter cannot get there

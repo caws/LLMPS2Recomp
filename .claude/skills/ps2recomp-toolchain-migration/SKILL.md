@@ -5,11 +5,20 @@ description: Migrate a game's PS2Recomp toolchain clone to a newer upstream comm
 
 # Migrate the PS2Recomp toolchain to a newer upstream
 
+> **★ (cont.230): the patch stack is RETIRED.** The clone at `tools/<game>/PS2Recomp`
+> is now our private fork (`caws/PS2Recomp`, branch `lotr`) with the former patches as commits and
+> upstream as the `upstream` remote. A migration is therefore a git merge:
+> `git -C tools/<game>/PS2Recomp fetch upstream && git merge upstream/main`, resolve conflicts per
+> file, rebuild (FULL regen if `ps2xRecomp/` changed), verify the boot per the method below, push,
+> and bump `<game_dir>/recomp/runtime.lock`. The bare-baseline / re-apply-patches steps below are
+> the historical method; the *verification* discipline (what to check, in what order) still applies.
+
 Upstream `ran-j/PS2Recomp` (the recompiler `ps2xRecomp/` + runtime `ps2xRuntime/` + now
 `ps2xIOP/`) evolves. Our setup keeps a **per-game clone** at `tools/<game>/PS2Recomp` with our
-local correctness fixes applied as **`patches/*.patch`** and all game-specific behavior in the
-**game repo's `src/` overrides**. A migration = move the clone to a newer commit and get our
-patches + overrides working on it again — **without regressing the boot**.
+local correctness fixes (formerly **`patches/*.patch`**, now commits on the fork) and all
+game-specific behavior in the **game repo's `src/` overrides**. A migration = move the clone to a
+newer upstream commit and get our fixes + overrides working on it again — **without regressing
+the boot**.
 
 This is an occasional, multi-step task with a specific method. Do NOT wing it — bad migrations
 silently drop a patch or an override and the boot regresses in confusing ways.

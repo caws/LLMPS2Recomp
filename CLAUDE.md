@@ -45,10 +45,17 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   `No such file or directory`. The Bash tool cwd resets to this engine dir between calls, so a
   plain `scripts/…` from a fresh call is correct; pass **absolute** `<game_dir>` + log paths.
   (Full detail under "Build / run" below.)
-- **Never modify PS2Recomp's tracked source** under `tools/<game>/PS2Recomp/` — it's a
-  separate git repo (cloned per game). In particular
-  `tools/<game>/PS2Recomp/ps2xRuntime/src/runner/` is **wiped and regenerated on every
-  build**; never hand-edit it.
+- **`tools/<game>/PS2Recomp/` is a clone of OUR PRIVATE FORK of PS2Recomp**
+  (`https://github.com/caws/PS2Recomp.git`, branch **`lotr`**; upstream `ran-j/PS2Recomp` is the
+  `upstream` remote, merged in periodically with `git merge upstream/main`). Runtime/recompiler
+  changes are made **in that clone and COMMITTED + PUSHED there** — one focused commit per change,
+  PCSX2 citation in the message, and a row in the fork's `docs/llmps2recomp-patches.md` (the
+  former `patches/README.md`). The `patches/*.patch` stack was **retired (cont.230)**;
+  never reintroduce it. The game pins the toolchain commit it was verified against in
+  `<game_dir>/recomp/runtime.lock` (`01_setup.sh` warns on a mismatch) — update the lock in the
+  same change that moves the branch. `tools/<game>/PS2Recomp/ps2xRuntime/src/runner/` is still
+  **wiped and regenerated on every build**; never hand-edit it, and never commit it (the build
+  also drops the game's override headers into `ps2xRuntime/include/`; leave those untracked).
 - **All game-specific behavior goes through override hooks** in the game repo's `src/` — never
   patch generated runner files directly. `src/` has a **control plane + domain modules** shape:
   - `src/register_overrides.cpp` is the **CONTROL PLANE**. It owns the single
@@ -86,11 +93,12 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
 
 ## Engine layout
 
-- `scripts/01_setup.sh <game_dir>` — clone + build `ps2_recomp` (gcc-13, SSE4.1) into that
-  game's own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`),
-  then apply **`patches/*.patch`** (our local upstream-PS2Recomp correctness fixes — see
-  `patches/README.md`; idempotent, warns on upstream drift). Keep new tools-clone fixes
-  captured as patches there, or a re-clone loses them.
+- `scripts/01_setup.sh <game_dir> [--upstream]` — clone our fork (branch `lotr`, or what
+  `<game_dir>/recomp/runtime.lock` names) + build `ps2_recomp` (gcc-13, SSE4.1) into that game's
+  own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`), add the
+  `upstream` remote, and warn if the clone is not at the lock's commit. `--upstream` clones bare
+  `ran-j/PS2Recomp` for a baseline build. Commit + push toolchain fixes in the clone, or a
+  re-clone loses them.
 - `scripts/03_build_game.sh <game_dir> [flags]` — regen → install → cmake build.
 - `scripts/04_run_game.sh <game_dir> [run_log]` — run the last-built runner (ELF read from config); log to file if given, else console.
 - `scripts/05_screenshot.sh [--launch] <game_dir> [count] [interval]` — burst-screenshot the **game
