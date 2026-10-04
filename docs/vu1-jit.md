@@ -46,8 +46,10 @@ deliberately unfaithful — they are measurement instruments, never correctness 
 
 ## 2. Already landed — stage 1 (1.37×) and lazy flags (1.20×)
 
-Cumulative: **280.7 → 155.5 ns/pair = 1.81×**, all bit-exact, all default ON with kill switches.
-Stage 1 is below; lazy flags (cont.177) is §4; dispatch + operand-prologue overhead (cont.178) is §4b.
+Cumulative: **280.7 → 141.2 ns/pair = 1.99×**, all default ON with kill switches. Stage 1 is below;
+lazy flags (cont.177) is §4; dispatch + operand-prologue overhead (cont.178) is §4b; the PCSX2 FMAC
+result model (cont.180, the one change that is *not* bit-exact — adopted on a user decision with the
+divergence measured at 0.001% of lanes) is §4c.
 
 ### Stage 1 — 1.37×, bit-exact
 
@@ -326,7 +328,40 @@ What it must eliminate, in measured priority order:
    `memcpy` shadow dance in `run()`; dest masks become blends; the decoded-pair by-value copy and
    the `switch` dispatch disappear entirely.
 
-### ★★★ The decision native codegen runs into: EXACTNESS vs VECTORISATION
+## 4c. PCSX2 FMAC result model ✅ **ADOPTED (cont.180): 1.104×** — the JIT's value representation
+
+`158.1 → 143.2 ns/pair` (`PS2X_VU1_FLOATCLAMP`, default ON, `=0` restores the exact model).
+**This is the one change in the arc that is not bit-exact**, taken on a user decision after the
+divergence was measured rather than assumed.
+
+Our model computed each lane twice — float, then **double** so the clamp and flags came from the
+exact result. PCSX2 derives both purely from the float result's bits (`VUflags.cpp VU_MAC_UPDATE`:
+sign; `f==0` → Z; `exp==0` → Z|U and flush to signed zero; `exp==255` → O and clamp to
+`sign|0x7F7FFFFF`). **Our `normalizeResult` already was a bit-exact re-implementation of that
+function**, so adopting PCSX2's model meant routing every lane through it and deleting the double
+recompute — no new arithmetic.
+
+**Measured divergence over 801,234,541 lanes** (`PS2X_VU1_FLOATVERIFY=1` runs both and tallies while
+keeping the exact answer):
+
+| | count | rate |
+|---|---|---|
+| value differs | 8,391 | **0.001047%** (1 in ~95,000) |
+| flags differ | 23,602 | 0.002946% (1 in ~34,000) |
+
+The dominant case is **flags-only with an identical value** — `op=0x1c raw=7f7fffff
+float=…/f0 exact=…/f8`: the float result saturates to exactly FLT_MAX without becoming Inf, so the
+float model sees a normal number where the exact model flags overflow. Same narrow multi-rounding
+class as the §3 counterexample. With lazy flags those MAC flags are unobserved in ~89% of programs
+and no status reader executes at all. Verified: 0 degenerate primitives and 0 kick-drops over 14.3M
+sampled draws, MOVIE-END, correct level frames.
+
+**Why it matters far more for the JIT than the 10% suggests:** the exact path is four *scalar*
+double computations plus per-lane branches per instruction — unvectorisable, and it would dominate a
+translated block. The float model is a pure function of the result bits, which becomes a handful of
+SSE ops across all four lanes at once. That is the shape ~60 host cycles/pair requires.
+
+### (settled) The decision native codegen ran into: EXACTNESS vs VECTORISATION
 
 Our FMAC model computes each lane **twice**: once in float (`execUpper`), then again in **double**
 (`fmacExactLane`) so `fmacClampExact` can decide the clamp and the flags from the exact result.

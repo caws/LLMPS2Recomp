@@ -71,7 +71,7 @@ rm -rf $SC && mkdir -p $SC && git -C $LIVE archive 14b1e5c | tar -x -C $SC
 cd $SC && git init -q . && for p in ../../patches/*.patch; do git apply "$p" || echo "FAIL $p"; done
 # then diff every patched file against $LIVE -- must be byte-identical
 ```
-Last verified (cont.179b): **20/20 patches apply, 20/20 files byte-identical.**
+Last verified (cont.180): **20/20 patches apply, 20/20 files byte-identical.**
 (upstream migration: 11/11 apply, 11/11 byte-identical.)
 
 ## Topic details (kept patches)
