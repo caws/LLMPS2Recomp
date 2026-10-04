@@ -1,9 +1,9 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
 new file mode 100644
-index 0000000..3f0083d
+index 0000000..28db1a9
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_jit.h
-@@ -0,0 +1,2365 @@
+@@ -0,0 +1,2361 @@
 +#ifndef PS2_VU1_JIT_H
 +#define PS2_VU1_JIT_H
 +
@@ -1094,7 +1094,11 @@ index 0000000..3f0083d
 +        uint16_t issue = 0; // static issue cycle relative to block entry
 +    };
 +
-+    static constexpr uint32_t kMaxBlockPairs = 32;
++    // ★ cont.197: 8, not 32. Mean block is 3.5 pairs, and `Block` is indexed per entry --
++    // sizing its arrays for 32 made it ~2.2 KB, so every block entry touched many cold
++    // cache lines. Longer runs are simply truncated, not rejected. (§5d also measured long
++    // blocks as slightly WORSE: 256 pairs overflows L1i.)
++    static constexpr uint32_t kMaxBlockPairs = 8;
 +    static constexpr uint32_t kMaxReadyWrites = kMaxBlockPairs * 9;
 +
 +    typedef void (*BlockFn)(void *state, void *vuData, uint32_t dataSizeMask);
@@ -1113,8 +1117,6 @@ index 0000000..3f0083d
 +        // reads or writes the very slot it targets (read -> the interpreter would have stalled
 +        // for it; write -> it would clobber the block's newer value on a later commit).
 +        uint8_t vfTouched[32] = {}; // per-register lane mask, reads and writes together
-+        uint8_t vfWritten[32] = {}; // writes only -- these need m_vfLatestWrite bumped after the
-+                                    // block so a still-pending older write cannot clobber them
 +        PairSched sched[kMaxBlockPairs];
 +        uint16_t viTouched = 0;
 +        uint8_t accTouched = 0;
@@ -1266,15 +1268,9 @@ index 0000000..3f0083d
 +                for (uint32_t k = 0; k < pi.vfReadCount && k < 4u; ++k)
 +                    touch->vfTouched[pi.vfReadReg[k] & 31u] |= (pi.vfReadLanes[k] & 0xFu);
 +                if (pi.upperWriteReg != 0u)
-+                {
 +                    touch->vfTouched[pi.upperWriteReg & 31u] |= (pi.upperWriteLanes & 0xFu);
-+                    touch->vfWritten[pi.upperWriteReg & 31u] |= (pi.upperWriteLanes & 0xFu);
-+                }
 +                if (pi.lowerWriteReg != 0u && pi.suppressedLowerVf != pi.lowerWriteReg)
-+                {
 +                    touch->vfTouched[pi.lowerWriteReg & 31u] |= (pi.lowerWriteLanes & 0xFu);
-+                    touch->vfWritten[pi.lowerWriteReg & 31u] |= (pi.lowerWriteLanes & 0xFu);
-+                }
 +                touch->viTouched |= uint16_t(pi.viReadMask | pi.viWriteMask);
 +                touch->accTouched |= uint8_t(pi.accRead | pi.accWrite);
 +                if (up.src == OperandSrc::ScalarQ)
