@@ -32,11 +32,24 @@ deliberately unfaithful — they are measurement instruments, never correctness 
 | `PS2X_VU1_NOFLAGS=1` — **all** FMAC flag work | 149.4 | ~27% |
 | `PS2X_VU1_NOEXACT=1` — only the per-lane exact double recompute | 197.0 | ~7.5% |
 
+> ⚠ **The `NOFLAGS` 27% is NOT all recoverable, and the `NOEXACT` instrument no longer exists.**
+> `NOFLAGS` skips `normalizeFmacResult`, which does not merely *derive* flags — it **clamps the lane
+> values in place** (`fmacClampExact` / `normalizeResult` take the float by reference), and the PS2
+> has no NaN/Inf, so dropping it changes architectural VF/ACC contents. `NOFLAGS` is therefore
+> **value-unfaithful**, not flag-unfaithful, and only the ~17% that is genuinely flag-only can be
+> taken losslessly — which is exactly what §4 measured (cont.177). `PS2X_VU1_NOEXACT` was removed
+> along with the reverted FASTFMAC experiment; only its measurement survives, above.
+
 > **With the scheduler AND the flags both entirely free the interpreter lands near ~90–100 ns/pair
 > (~2.3×) — still ~5× short of 30 fps. No interpreter-level work reaches the target. The JIT is
 > not optional.**
 
-## 2. Already landed (stage 1) — 1.37×, bit-exact
+## 2. Already landed — stage 1 (1.37×) and lazy flags (1.20×)
+
+Cumulative: **280.7 → ~175 ns/pair ≈ 1.6×**, all bit-exact, all default ON with kill switches.
+Stage 1 is below; lazy flags (cont.177) is §4.
+
+### Stage 1 — 1.37×, bit-exact
 
 `280.7 → 204.6 ns/pair`, ~54% of the `NOSCHED` ceiling. Both default ON with kill switches:
 
@@ -74,10 +87,60 @@ The multi-rounding ops, for reference: `0x08–0x0F` (MADD/MSUB bc), `0x21`, `0x
 `0x29`, `0x2D`, and the `0x2E` OPMULA/OPMSUB family — plus the same values in the `special` (≥0x3C)
 decode.
 
-## 4. Step 1 — LAZY FLAGS (bit-exact, worth ~1.37×)
+## 4. Step 1 — LAZY FLAGS ✅ **LANDED (cont.177): 1.20×, scan-gated, default ON**
 
-The MAC/status/clip flags are derived for **every** FMAC, but they are only *observable* if
-something reads them. Skip the work when nothing can — unobservable ⇒ bit-exact.
+`210.7 → 175.5 ns/pair` at matched cumulative pairs (`PS2X_VU1_LAZYFLAGS`, default 1, `=0` reverts).
+
+The MAC/status flags are derived for **every** FMAC, but they are only *observable* if something
+reads them. `rebuildDecodedCodeCache` — which already walks the whole buffer and re-runs on every
+code-generation change — now also answers "does this program contain a MAC/status reader?"; when it
+does not (and the unit is VU1), `applyFmacDest`/`applyFmacDestAcc` skip
+`calculateFmacProductSticky` + `updateFmacFlags`.
+
+**What it does NOT skip, and why the win is 1.20× rather than the 27% `NOFLAGS` suggested:**
+`normalizeFmacResult` stays on both paths, because it **clamps the lane values in place**. Only the
+flag-only work is removed. The gap between lazy flags (175.5) and full `NOFLAGS` (149.1) is exactly
+that clamp — real architectural work that cannot be dropped.
+
+**Measured (build 227, one binary, matched cumulative pairs; the end-of-run number is NOT comparable
+because runs reach different eras in a fixed wall time — compare at equal `pairs=`):**
+
+| config | ns/pair @300M pairs |
+|---|---|
+| `LAZYFLAGS=0` (baseline of this build) | 210.70 |
+| **`LAZYFLAGS=1` (shipped)** | **175.47** |
+| `LAZYFLAGS=2` (force ablation) | 208.59 |
+| `NOFLAGS=1` (value-unfaithful reference) | 149.12 |
+
+⚠ **The `=2` "force" ablation is worthless as a ceiling instrument here** — feeding stale flags to
+the ~1M MAC reads per run *changes what the guest does*, so it is not the same workload. The
+scan-gated mode is both the correct one and the fast one.
+
+### Correctness argument (structural) + how it was verified
+
+Skipping touches **only** `m_state.mac` and `m_state.status` (the flag-pipeline entry sets
+`writesMac`/`writesStatus`; `writesClip` is set solely by `queueClip`/`queueFcset`). VF/ACC/VI are
+untouched, so the only question is whether anything reads mac/status — answered by the scan plus:
+
+- `PS2X_VU1_LAZYVERIFY=1` over a full run: **0 MISS** (no reader ever issued while the fast path
+  was armed) — the scan is exactly right.
+- **The cross-program hole is real and was closed separately.** mac/status persist *across*
+  programs, so a reader in a later program could observe flags an earlier fast-path program skipped.
+  Reader programs exist here (122 of 1166 scanned), so this is not hypothetical. Measured:
+  **`preWrite=0`** — no reader ever issues before its own program has written flags — and
+  **`stsRd=0`** — no status reader (FSEQ/FSAND/FSOR) executes at all, so the accumulating sticky
+  bits are moot; all 1.01M reads are MAC reads. An **always-on guard** at the reader-issue site
+  latches the optimization off for the session (and reports) if a reader ever issues while flags are
+  stale — `s_macDirty` clears on the next real flag write, `s_stickyDirty` only on FSSET, because a
+  later commit *preserves* status bits 4..11. It never tripped (`off=0 dirtyReads=0`).
+- 0 kick-drops / 0 degenerate / 0 reserved; MOVIE-END reached; correct level-era frames.
+
+⚠ **A VRAM byte-compare at a fixed draw index does NOT work as a proof here** — the control
+(same config, two runs) also differs, so the runner is not deterministic at a fixed draw index.
+Run that control before trusting any such comparison.
+
+Residual, documented: skipping the flag-pipeline entry frees a slot, so end-of-program drain cycles
+can differ marginally. Both configs show identical health counters.
 
 ### Verified design inputs (audited; re-verify before building)
 
@@ -140,6 +203,35 @@ The only route to ~60 host cycles/pair. Translate a **basic block** (start PC �
 native SSE once, cached per `(code generation, start PC)` — the decode cache already has exactly
 that keying and invalidation.
 
+### Measured workload (cont.178 groundwork, `PS2X_VU1_JITCENSUS=1`, 400M pairs of real play)
+
+```
+pairs=400,017,473  branches=63,477,115  → 1 branch per 6.3 pairs  ibit=0.6%  ebit=282,899
+upper:        3f=37.0% 3d=12.6% 3e=9.9% 1c=6.8% 3c=5.4% 1f=3.6% 29=3.5% 08=3.3% 00=3.1% 02=3.0%
+upperSpecial: 2f=26.4% 1b=6.9%  09=6.2% 0a=5.2% 12=4.6% 1f=3.7% 15=3.3% 1d=2.9% 14=1.6% 18=1.6%
+lower:        40=46.4% 01=15.1% 29=12.5% 13=6.7% 00=5.3% 08=4.6% 12=3.6% 28=2.4% 04=1.0%
+```
+
+Design consequences, in order of impact:
+
+1. **★ Mean basic block is only ~6 pairs, and a program run averages ~1,400 pairs (≈220 blocks).**
+   Per-block entry/exit overhead therefore dominates unless blocks are **chained/linked** — a
+   translate-and-return-to-dispatcher design would spend most of its time in dispatch. This is why
+   PCSX2's microVU compiles whole programs with linked blocks; mirror that, do not build a
+   one-block-at-a-time trampoline.
+2. **Coverage is cheap to reach.** `upper 0x3C–0x3F` (the `special` block) is **64.9%** of pairs,
+   and within it `special 0x2F` — *no upper op* — is 26.4% of all pairs. On the lower side
+   `0x40` (NOP) is 46.4%. So roughly a quarter of pairs have no upper work and nearly half have no
+   lower work: a first JIT slice covering NOP + the top ~10 upper and ~8 lower opcodes already
+   covers the overwhelming majority of executed instructions.
+3. **Loads/stores are the single busiest real lower op** (`0x01` store 15.1%, `0x00` load 5.3%),
+   ahead of everything except branches — so VU-memory addressing must be fast from day one, not an
+   afterthought.
+4. **★ Clip-flag readers are ~10.3% of all pairs** (`0x13` FCOR 6.7% + `0x12` FCAND 3.6%). This
+   independently confirms the §4 decision to exclude CLIP readers from the lazy-flag gate: had they
+   been included, essentially no program would have qualified and lazy flags would have measured
+   nothing. The JIT must treat clip as a *live* value while mac/status stay skippable.
+
 What it must eliminate, in measured priority order:
 
 1. **The cycle-accurate scheduler (~33%)** — resolve hazards and stall counts **statically at
@@ -184,8 +276,9 @@ code + disasm + gdb.
 |---|---|
 | `PS2X_VU1_PERF=1` | ns/pair + pairs/call throughput report |
 | `PS2X_VU1_NOSCHED=1` | ablation: scheduler free (~33%) |
-| `PS2X_VU1_NOFLAGS=1` | ablation: all FMAC flag work free (~27%) — also the lazy-flags prototype |
-| `PS2X_VU1_NOEXACT=1` | ablation: exact double recompute free (~7.5%) |
+| `PS2X_VU1_NOFLAGS=1` | ablation: all FMAC flag work free (~27%) — **value-unfaithful** (skips the clamp), so it is an upper bound, not a target |
+| `PS2X_VU1_LAZYFLAGS` | **default 1 (ON)**, `=0` reverts; `=2` forces the fast path (behaviour-changing ablation, see §4) |
+| `PS2X_VU1_LAZYVERIFY=1` | lazy-flag self-check + tallies (scan MISS, macRd/stsRd, preWrite, dirtyReads) |
 | `PS2X_VU1_FASTSCAN` | **default ON**, `=0` reverts stage 1a |
 | `PS2X_VU1_PIPEVERIFY=1` | stage 1b valid-mask self-check |
 | `PS2X_VU1_COMMITSKIP` | **default ON**, `=0` reverts the cont.158b watermark |

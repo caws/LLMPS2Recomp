@@ -1,16 +1,19 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..498eafc 100644
+index bd75bba..aed8de0 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-@@ -10,6 +10,7 @@
+@@ -10,8 +10,10 @@
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
 +#include <chrono>
  #include <filesystem>
  #include <limits>
++#include <utility>
  #include <ps2_log.h>
-@@ -20,6 +21,177 @@ namespace
+ 
+ namespace
+@@ -20,6 +22,278 @@ namespace
      {
          return static_cast<uint8_t>(1u << (3u - component));
      }
@@ -84,9 +87,110 @@ index bd75bba..498eafc 100644
 +// argument; this makes it empirically checkable on a real run.
 +static const bool s_vu1PipeVerify = []
 +{ const char *e = std::getenv("PS2X_VU1_PIPEVERIFY"); return e && e[0] && e[0] != '0'; }();
++// PS2X_VU1_LAZYFLAGS (cont.177; default 1 = ON, "=0" reverts): LAZY FMAC FLAGS. The MAC/status
++// flags are derived for every FMAC but are only OBSERVABLE if something reads them, so for a
++// microprogram that contains no reader the derivation is dead work and skipping it is BIT-EXACT.
++//   0 = off (the kill switch: full flag derivation on every FMAC, the pre-cont.177 behaviour).
++//   1 = scan-gated (the honest optimization, DEFAULT): the whole-buffer scan in
++//       rebuildDecodedCodeCache must prove the program contains no MAC/status reader.
++//   2 = FORCE, an ABLATION: take the fast path regardless of the scan. Deliberately unfaithful
++//       (a program that DOES read flags reads stale ones). ⚠ It turned out to be USELESS as a
++//       ceiling instrument here: feeding stale flags to the ~1M MAC reads/run CHANGES WHAT THE
++//       GUEST DOES, so it measured 208.6 ns/pair — no faster than the 210.7 baseline and slower
++//       than the honest mode 1 (175.5). Kept only to reproduce that result. Never a correctness run.
++// ★ Scope: this skips ONLY calculateFmacProductSticky + updateFmacFlags. It does NOT skip
++// normalizeFmacResult, because that call also CLAMPS the lane values in place (fmacClampExact /
++// normalizeResult take the float by reference) — the PS2 has no NaN/Inf, so dropping the clamp
++// changes architectural VF/ACC values, not just flags. That is exactly why the fast path here is
++// NOT PS2X_VU1_NOFLAGS (which skips the clamp too and is therefore value-unfaithful).
++// Restricted to VU1: VU0's flags ARE EE-visible (copyVu0StateToContext copies state.mac/clip/
++// status into the R5900 context on every VCALLMS), whereas no vu1_mac/vu1_clip/vu1_status field
++// exists anywhere in the runtime, so VU1's flags escape only through the reader opcodes below.
++static const int s_vu1LazyFlags = []
++{ const char *e = std::getenv("PS2X_VU1_LAZYFLAGS"); return (e && e[0]) ? std::atoi(e) : 1; }();
++// PS2X_VU1_LAZYVERIFY (default OFF): self-check for the scan — report if a MAC/status reader ever
++// ISSUES while the fast path is armed (i.e. the static scan missed a reader the run executes).
++// Same role PS2X_VU1_PIPEVERIFY played for stage 1b: make the by-construction argument empirically
++// checkable on a real run.
++static const bool s_vu1LazyVerify = []
++{ const char *e = std::getenv("PS2X_VU1_LAZYVERIFY"); return e && e[0] && e[0] != '0'; }();
++
++// PS2X_VU1_JITCENSUS (default OFF): cont.178 groundwork for the VU1 block JIT. Histograms what the
++// interpreter ACTUALLY executes -- upper opcode, lower opcode, branch density, and the distribution
++// of run() entry PCs -- so the JIT's opcode coverage and block-cache design are driven by measured
++// workload rather than by the ISA manual. Per-instruction increments, so it is gated OFF.
++static const bool s_vu1JitCensus = []
++{ const char *e = std::getenv("PS2X_VU1_JITCENSUS"); return e && e[0] && e[0] != '0'; }();
++static unsigned long long g_jitUpper[64] = {};
++static unsigned long long g_jitUpperSpecial[128] = {};
++static unsigned long long g_jitLower[128] = {};
++static unsigned long long g_jitPairs = 0, g_jitBranches = 0, g_jitIBit = 0, g_jitEBit = 0;
++
++// The ONLY instructions that can observe m_state.mac / m_state.status inside a microprogram
++// (ps2_vu1_lower.cpp, switch on opHi = (instr >> 25) & 0x7F):
++//   0x14 FSEQ, 0x16 FSAND, 0x17 FSOR  -> read m_state.status
++//   0x18 FMEQ, 0x1A FMAND, 0x1B FMOR  -> read m_state.mac
++// The CLIP readers (0x10 FCEQ, 0x12 FCAND, 0x13 FCOR, 0x1C FCGET) are deliberately NOT here:
++// clip is produced by the CLIP instruction via queueClip(), which this optimization does not
++// touch. Including them would disqualify most T&L programs (CLIP+FCAND is the standard cull
++// test) for no correctness gain.
++// Returns which flag register the lower instruction observes: bit 0 = m_state.mac,
++// bit 1 = m_state.status. They are tracked separately because their staleness differs (see the
++// dirty guard in run()): mac is OVERWRITTEN wholesale by the next FMAC flag write, while the
++// status STICKY bits (6..11) only accumulate and are cleared solely by FSSET.
++static constexpr unsigned kFlagReadMac = 1u;
++static constexpr unsigned kFlagReadStatus = 2u;
++static inline unsigned lowerFlagReads(uint32_t lower)
++{
++    const uint8_t opHi = static_cast<uint8_t>((lower >> 25) & 0x7Fu);
++    if (opHi == 0x18u || opHi == 0x1Au || opHi == 0x1Bu) // FMEQ / FMAND / FMOR
++        return kFlagReadMac;
++    if (opHi == 0x14u || opHi == 0x16u || opHi == 0x17u) // FSEQ / FSAND / FSOR
++        return kFlagReadStatus;
++    return 0u;
++}
++
 +static unsigned long long g_vu1Ns = 0, g_vu1Pairs = 0, g_vu1Calls = 0, g_vu1NextReport = 20000000ull;
++// cont.177 lazy-flag tallies. progsScanned/progsClean are per code-buffer rebuild (negligible, so
++// always on); runsArmed counts run() calls that took the fast path; readerIssues counts every
++// MAC/status reader that actually EXECUTES and is only maintained under PS2X_VU1_LAZYVERIFY (it is
++// a per-pair test). readerIssues == 0 over a full run is the empirical proof that the flags are
++// dead in this workload -- which is also what closes the cross-program staleness question (a
++// reader in a LATER program would otherwise observe flags an earlier fast-path program skipped).
++static unsigned long long g_lazyProgsScanned = 0, g_lazyProgsClean = 0,
++                          g_lazyRunsArmed = 0, g_lazyReaderIssues = 0,
++                          g_lazyMacReads = 0, g_lazyStatusReads = 0,
++                          g_lazyReadsBeforeWrite = 0, g_lazyDirtyReads = 0;
 +namespace
 +{
++    // Result of the whole-code-buffer flag-reader scan, recorded by rebuildDecodedCodeCache.
++    // File-static on purpose: a member would touch include/runtime/ps2_vu1.h, which the generated
++    // code includes (~60 min rebuild). The identity fields mirror EXACTLY the freshness check in
++    // getDecodedInstructionPairForPc, so "record matches" == "the decode cache this scan walked is
++    // still the live one" (m_decodedCodeCacheValid is only ever set true, never invalidated).
++    struct LazyScan
++    {
++        const void *owner = nullptr;
++        const uint8_t *code = nullptr;
++        const void *memory = nullptr;
++        uint32_t codeSize = 0;
++        uint64_t generation = ~0ull;
++        bool complete = false;         // the scan covered every pair in the buffer
++        bool readsMacOrStatus = true;  // conservative default
++    };
++    LazyScan s_lazyScan;
++    // Armed once per run() call (VU1 only) — read per FMAC, so it must be a plain bool test.
++    bool s_lazyActive = false;
++    // Latched off permanently by the cross-program dirty guard (see run()).
++    bool s_lazyDisabled = false;
++    // Staleness bookkeeping for that guard. Both are set when an armed run skips flag writes.
++    // s_macDirty clears on the next real flag write (mac is overwritten wholesale); s_stickyDirty
++    // clears only on FSSET, because the status sticky bits accumulate and a later write PRESERVES
++    // bits 4..11 — so a skipped write leaves them permanently under-set until FSSET resets them.
++    bool s_macDirty = false;
++    bool s_stickyDirty = false;
++    // Has any real flag write been queued during the current run()?
++    bool s_flagWriteThisRun = false;
 +    struct PipeTrack
 +    {
 +        const void *owner = nullptr;
@@ -188,7 +292,7 @@ index bd75bba..498eafc 100644
  }
  
  void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
-@@ -66,21 +238,42 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+@@ -66,21 +340,42 @@ VU1Interpreter::VU1Interpreter(Unit unit)
  
  void VU1Interpreter::resetScheduler()
  {
@@ -245,7 +349,7 @@ index bd75bba..498eafc 100644
      m_efuResourceReady = 0;
      m_workingClip = m_state.clip;
      m_viBranchBackupValue = 0;
-@@ -98,6 +291,15 @@ void VU1Interpreter::reset()
+@@ -98,6 +393,15 @@ void VU1Interpreter::reset()
      m_state.q = 1.0f;
      m_state.r = 0x3F800000u;
      m_cycle = 0;
@@ -261,7 +365,7 @@ index bd75bba..498eafc 100644
      resetScheduler();
  }
  
-@@ -123,129 +325,110 @@ float VU1Interpreter::normalizeOperand(float value) const
+@@ -123,129 +427,110 @@ float VU1Interpreter::normalizeOperand(float value) const
      return value;
  }
  
@@ -471,7 +575,7 @@ index bd75bba..498eafc 100644
  
      if (op < 0x3Cu)
      {
-@@ -313,7 +496,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -313,7 +598,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
                  static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
                  static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
                  result = component == 3u
@@ -480,7 +584,7 @@ index bd75bba..498eafc 100644
                               : acc(component) - vs(left[component]) * vt(right[component]);
                  break;
              }
-@@ -324,6 +507,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -324,6 +609,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
          return true;
      }
  
@@ -488,7 +592,7 @@ index bd75bba..498eafc 100644
      if (special <= 0x03u)
          result = vs(component) + vt(special & 3u);
      else if (special <= 0x07u)
-@@ -388,7 +572,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -388,7 +674,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
              static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
              static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
              result = component == 3u
@@ -497,7 +601,7 @@ index bd75bba..498eafc 100644
                           : vs(left[component]) * vt(right[component]);
              break;
          }
-@@ -399,34 +583,130 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -399,34 +685,130 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
      return true;
  }
  
@@ -647,7 +751,7 @@ index bd75bba..498eafc 100644
  }
  
  uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
-@@ -478,8 +758,10 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+@@ -478,8 +860,10 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
          }
  
          float product = left * right;
@@ -660,7 +764,21 @@ index bd75bba..498eafc 100644
          // Product-sum instructions report Z/S/U/O from the add/subtract result
          // as current flags, while every product condition accumulates into the
          // corresponding sticky flag.
-@@ -514,20 +796,24 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -494,6 +878,13 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     if (dest == 0u)
+         return;
+ 
++    // cont.177 staleness bookkeeping (see the dirty guard in run()): a real flag write overwrites
++    // mac wholesale, so any earlier skipped write stops being observable in mac. It does NOT clear
++    // s_stickyDirty — the commit preserves status bits 4..11, so skipped sticky contributions stay
++    // missing until an FSSET resets them.
++    s_flagWriteThisRun = true;
++    s_macDirty = false;
++
+     uint32_t mac = 0u;
+     uint32_t status = 0u;
+     for (uint32_t component = 0; component < 4u; ++component)
+@@ -514,20 +905,24 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
          status |= flags;
      }
  
@@ -693,7 +811,7 @@ index bd75bba..498eafc 100644
  
      *entry = {};
      entry->valid = true;
-@@ -538,10 +824,16 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -538,42 +933,65 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
      entry->extraSticky = extraSticky;
      entry->writesMac = true;
      entry->writesStatus = true;
@@ -708,9 +826,15 @@ index bd75bba..498eafc 100644
 +        return;
 +    }
      uint8_t laneFlags[4]{};
++    // normalizeFmacResult stays on BOTH paths: it clamps the lane values IN PLACE (PS2 floats have
++    // no NaN/Inf), so skipping it would change architectural VF/ACC contents, not just flags.
++    // That is precisely why the lazy path is NOT s_vu1NoFlags.
      normalizeFmacResult(result, dest, laneFlags);
-     updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
-@@ -550,6 +842,11 @@ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    if (!s_lazyActive)
++        updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+     applyDest(dst, result, dest);
+ }
  
  void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
  {
@@ -720,9 +844,23 @@ index bd75bba..498eafc 100644
 +        return;
 +    }
      uint8_t laneFlags[4]{};
-     normalizeFmacResult(result, dest, laneFlags);
-     updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
-@@ -564,16 +861,19 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+-    normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    normalizeFmacResult(result, dest, laneFlags); // clamps values — never skipped (see applyFmacDest)
++    if (!s_lazyActive)
++        updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+     applyDestAcc(result, dest);
+ }
+ 
+ void VU1Interpreter::queueFsset(uint16_t immediate)
+ {
++    // FSSET overwrites the status sticky bits outright, so it is the one point where a skipped
++    // lazy-flag write stops being observable in status (cont.177 dirty guard).
++    s_stickyDirty = false;
++    s_flagWriteThisRun = true;
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+         if (entry.valid && entry.issueCycle == m_cycle)
              entry.writesStatus = false;
      }
  
@@ -744,7 +882,7 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -583,16 +883,19 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+@@ -583,16 +1001,19 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
  void VU1Interpreter::queueClip(uint32_t clip)
  {
      m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
@@ -766,7 +904,7 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -607,16 +910,19 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+@@ -607,16 +1028,19 @@ void VU1Interpreter::queueFcset(uint32_t clip)
          if (entry.valid && entry.issueCycle == m_cycle)
              entry.writesClip = false;
      }
@@ -788,7 +926,7 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -627,6 +933,14 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+@@ -627,6 +1051,14 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
  {
      uint32_t ignoredFlags = 0u;
      value = normalizeResult(value, ignoredFlags);
@@ -803,7 +941,7 @@ index bd75bba..498eafc 100644
      m_fdiv.valid = true;
      m_fdiv.readyCycle = m_cycle + latency;
      m_fdiv.value = value;
-@@ -637,15 +951,18 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -637,15 +1069,18 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
  {
      uint32_t ignoredFlags = 0u;
      value = normalizeResult(value, ignoredFlags);
@@ -824,15 +962,16 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -654,15 +971,33 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -654,15 +1089,33 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
  
  void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
  {
 -    for (PendingStore &store : m_storePipeline)
 +    if (s_vu1NoSched)
-+    {
+     {
+-        if (!store.valid)
 +        if (m_activeVuData && address + 16u <= m_activeVuDataSize)
-+        {
+         {
 +            uint32_t oldWords[4]{};
 +            std::memcpy(oldWords, m_activeVuData + address, sizeof(oldWords));
 +            for (uint32_t component = 0; component < 4u; ++component)
@@ -844,12 +983,11 @@ index bd75bba..498eafc 100644
 +        }
 +        return;
 +    }
-     {
--        if (!store.valid)
++    {
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_storePipeline, pipe.store, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
-         {
++        {
 +            PendingStore &store = m_storePipeline[static_cast<size_t>(slot)];
              store.valid = true;
              store.readyCycle = m_cycle + 1u;
@@ -860,7 +998,7 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -674,10 +1009,21 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -674,10 +1127,21 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
  {
      if (reg == 0u || laneMask == 0u)
          return;
@@ -884,7 +1022,7 @@ index bd75bba..498eafc 100644
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-@@ -685,11 +1031,10 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -685,11 +1149,10 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
              write.reg = reg;
              write.laneMask = laneMask;
              std::copy(value, value + 4, write.value.begin());
@@ -900,18 +1038,18 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -700,10 +1045,17 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -700,10 +1163,17 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
  {
      if (reg == 0u)
          return;
 -    for (PendingViWrite &write : m_viWritePipeline)
 +    if (s_vu1NoSched)
-     {
--        if (!write.valid)
++    {
 +        m_state.vi[reg] = static_cast<int16_t>(value);
 +        return;
 +    }
-+    {
+     {
+-        if (!write.valid)
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_viWritePipeline, pipe.vi, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
@@ -920,7 +1058,7 @@ index bd75bba..498eafc 100644
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-@@ -711,6 +1063,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -711,6 +1181,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
              write.reg = reg;
              write.value = value;
              m_viLatestWrite[reg] = write.sequence;
@@ -928,13 +1066,14 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -721,21 +1074,31 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -721,21 +1192,31 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
  {
      if (laneMask == 0u)
          return;
 -    for (PendingAccWrite &write : m_accWritePipeline)
 +    if (s_vu1NoSched)
-+    {
+     {
+-        if (!write.valid)
 +        for (uint32_t component = 0; component < 4u; ++component)
 +        {
 +            if ((laneMask & laneForComponent(component)) != 0u)
@@ -942,8 +1081,7 @@ index bd75bba..498eafc 100644
 +        }
 +        return;
 +    }
-     {
--        if (!write.valid)
++    {
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_accWritePipeline, pipe.acc, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
@@ -967,7 +1105,7 @@ index bd75bba..498eafc 100644
              return;
          }
      }
-@@ -744,11 +1107,59 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+@@ -744,11 +1225,59 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
  
  void VU1Interpreter::commitReadyPipelines()
  {
@@ -1030,7 +1168,7 @@ index bd75bba..498eafc 100644
          if (entry.writesMac)
              m_state.mac = entry.mac;
          if (entry.writesStatus)
-@@ -763,80 +1174,158 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -763,80 +1292,158 @@ void VU1Interpreter::commitReadyPipelines()
          if (entry.writesClip)
              m_state.clip = entry.clip;
          entry = {};
@@ -1228,7 +1366,7 @@ index bd75bba..498eafc 100644
      }
  }
  
-@@ -851,6 +1340,44 @@ void VU1Interpreter::progressXgkick()
+@@ -851,6 +1458,44 @@ void VU1Interpreter::progressXgkick()
          m_xgkick.cycleCredit -= 2u;
          if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
          {
@@ -1273,7 +1411,7 @@ index bd75bba..498eafc 100644
              reportReservedInstruction(false, 0xFFFFFFFBu);
              m_xgkick.active = false;
              return;
-@@ -879,10 +1406,16 @@ void VU1Interpreter::progressXgkick()
+@@ -879,10 +1524,16 @@ void VU1Interpreter::progressXgkick()
                  tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
              else if (format == 1u)
                  tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
@@ -1292,7 +1430,7 @@ index bd75bba..498eafc 100644
                  reportReservedInstruction(false, 0xFFFFFFF8u);
                  m_xgkick.active = false;
                  return;
-@@ -890,6 +1423,12 @@ void VU1Interpreter::progressXgkick()
+@@ -890,6 +1541,12 @@ void VU1Interpreter::progressXgkick()
  
              if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
              {
@@ -1305,7 +1443,7 @@ index bd75bba..498eafc 100644
                  reportReservedInstruction(false, 0xFFFFFFFBu);
                  m_xgkick.active = false;
                  return;
-@@ -922,15 +1461,33 @@ void VU1Interpreter::finishXgkick()
+@@ -922,15 +1579,33 @@ void VU1Interpreter::finishXgkick()
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
@@ -1339,7 +1477,7 @@ index bd75bba..498eafc 100644
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
      m_xgkick = {};
      m_xgkick.active = true;
-@@ -959,6 +1516,11 @@ bool VU1Interpreter::pipelinesPending() const
+@@ -959,6 +1634,11 @@ bool VU1Interpreter::pipelinesPending() const
  {
      if (m_fdiv.valid || m_xgkick.active)
          return true;
@@ -1351,7 +1489,7 @@ index bd75bba..498eafc 100644
      for (const ScalarPipelineEntry &entry : m_efu)
          if (entry.valid)
              return true;
-@@ -988,6 +1550,8 @@ void VU1Interpreter::flushPipelines()
+@@ -988,6 +1668,8 @@ void VU1Interpreter::flushPipelines()
  
  uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
  {
@@ -1360,7 +1498,7 @@ index bd75bba..498eafc 100644
      uint64_t ready = m_cycle;
      const InstructionUsage *usages[2] = {
          &decoded.upperUsage,
-@@ -996,6 +1560,24 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -996,6 +1678,24 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
      {
          if (!usage)
              continue;
@@ -1385,7 +1523,7 @@ index bd75bba..498eafc 100644
          for (uint32_t index = 0; index < usage->vfReadCount; ++index)
          {
              const VfAccess &access = usage->vfRead[index];
-@@ -1036,6 +1618,47 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -1036,6 +1736,47 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
  
  void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
  {
@@ -1433,7 +1571,7 @@ index bd75bba..498eafc 100644
      const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
      if (lowerWrite.reg != 0u &&
          decoded.suppressedLowerVf != lowerWrite.reg)
-@@ -1043,11 +1666,10 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+@@ -1043,11 +1784,10 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
          const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
                                       ? decoded.lowerUsage.vfLatency
                                       : decoded.lowerUsage.latency;
@@ -1449,7 +1587,7 @@ index bd75bba..498eafc 100644
      }
  
      const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1056,23 +1678,22 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+@@ -1056,23 +1796,22 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
          const uint32_t latency = decoded.upperUsage.vfLatency != 0u
                                       ? decoded.upperUsage.vfLatency
                                       : decoded.upperUsage.latency;
@@ -1485,7 +1623,41 @@ index bd75bba..498eafc 100644
  }
  
  VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper) const
-@@ -1590,6 +2211,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -1535,8 +2274,32 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+                                              const PS2Memory *memory, uint64_t generation)
+ {
+     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
++    // cont.177 lazy flags: one pass, no extra walk — the cache rebuild already visits every pair,
++    // and it is re-run whenever the code generation changes, so this is the natural place for the
++    // program-level "does anything read MAC/status" question. Conservative by construction: a
++    // reader ANYWHERE in the buffer disables the fast path for the whole program (a branch can
++    // reach anywhere, so per-block reasoning is not available to an interpreter).
++    bool readsMacOrStatus = false;
+     for (uint32_t i = 0; i < pairCount; ++i)
+-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
++    {
++        const DecodedInstructionPair &decoded = (m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u));
++        // With the I bit set the lower word is a float immediate, NOT an instruction.
++        if (!decoded.iBit && lowerFlagReads(decoded.lower) != 0u)
++            readsMacOrStatus = true;
++    }
++    if (m_unit == Unit::VU1)
++    {
++        s_lazyScan.owner = this;
++        s_lazyScan.code = vuCode;
++        s_lazyScan.memory = memory;
++        s_lazyScan.codeSize = codeSize;
++        s_lazyScan.generation = generation;
++        s_lazyScan.complete = (pairCount == codeSize / 8u); // else tail pairs went unscanned
++        s_lazyScan.readsMacOrStatus = readsMacOrStatus;
++        ++g_lazyProgsScanned;
++        if (!readsMacOrStatus && s_lazyScan.complete)
++            ++g_lazyProgsClean;
++    }
+ 
+     m_cachedVuCode = vuCode;
+     m_cachedMemory = memory;
+@@ -1590,6 +2353,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t startPC, uint32_t top, uint32_t itop,
                               uint32_t maxCycles)
  {
@@ -1546,7 +1718,7 @@ index bd75bba..498eafc 100644
      resetScheduler();
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
-@@ -1633,8 +2308,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,13 +2450,129 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -1556,13 +1728,127 @@ index bd75bba..498eafc 100644
 +    std::chrono::steady_clock::time_point perfT0;
 +    if (perfTrack)
 +        perfT0 = std::chrono::steady_clock::now();
++    // cont.177: arm lazy MAC/status flags for this program. Armed ONCE per run() call, not per
++    // instruction, because the code generation cannot change mid-program. The default is the slow
++    // (full-fidelity) path, so every case we cannot prove — VU0, untracked code, a stale or
++    // incomplete scan, the very first run after a code upload (the scan is recorded by the cache
++    // rebuild that run itself triggers) — simply keeps deriving flags.
++    s_lazyActive = false;
++    s_flagWriteThisRun = false;
++    if (s_vu1LazyFlags != 0 && m_unit == Unit::VU1 && !s_lazyDisabled)
++    {
++        if (s_vu1LazyFlags >= 2)
++        {
++            s_lazyActive = true; // ABLATION (force), see the flag comment
++        }
++        else if (memory != nullptr &&
++                 s_lazyScan.owner == this &&
++                 s_lazyScan.code == vuCode &&
++                 s_lazyScan.memory == memory &&
++                 s_lazyScan.codeSize == codeSize &&
++                 s_lazyScan.generation == memory->getVU1CodeGeneration() &&
++                 s_lazyScan.complete &&
++                 !s_lazyScan.readsMacOrStatus)
++        {
++            s_lazyActive = true;
++        }
++        if (s_lazyActive)
++        {
++            ++g_lazyRunsArmed;
++            s_macDirty = true; // this program will skip flag writes
++            s_stickyDirty = true;
++        }
++    }
      while (m_cycle < budgetEnd && !m_stopRequested)
      {
 +        ++perfPairs;
          commitReadyPipelines();
          if (m_state.pc + 8u > codeSize)
              break;
-@@ -1660,16 +2342,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        // ★ CROSS-PROGRAM SAFETY GUARD (always on when lazy flags are enabled). The scan proves
++        // the flags are unobservable WITHIN a program, but m_state.mac/status persist ACROSS
++        // programs, so a reader in a LATER program could observe flags an earlier fast-path
++        // program skipped writing. Reader-containing programs are real in this workload (343 of
++        // 2078), so this is not hypothetical. The exact dangerous condition is checked here, at
++        // the only place it can matter: a MAC/status reader ISSUING while (a) the flags are stale
++        // from a skipped write and (b) nothing in THIS run has written them yet. It latches the
++        // optimization off for the rest of the session and reports once, so exposure is bounded to
++        // the single instruction that detects it and the condition can never be silent.
++        if (s_vu1JitCensus && m_unit == Unit::VU1)
++        {
++            ++g_jitPairs;
++            const uint8_t uop = static_cast<uint8_t>(decoded.upper & 0x3Fu);
++            ++g_jitUpper[uop];
++            if (uop >= 0x3Cu)
++                ++g_jitUpperSpecial[(decoded.upper & 3u) | ((decoded.upper >> 4) & 0x7Cu)];
++            if (decoded.iBit)
++            {
++                ++g_jitIBit;
++            }
++            else
++            {
++                const uint8_t lop = static_cast<uint8_t>((decoded.lower >> 25) & 0x7Fu);
++                ++g_jitLower[lop];
++                // 0x20..0x2F is the branch/jump block in the lower opcode map: these are the
++                // instructions that TERMINATE a JIT basic block.
++                if (lop >= 0x20u && lop <= 0x2Fu)
++                    ++g_jitBranches;
++            }
++            if (decoded.eBit)
++                ++g_jitEBit;
++        }
++        const unsigned flagReads =
++            (s_vu1LazyFlags != 0 && !decoded.iBit) ? lowerFlagReads(decoded.lower) : 0u;
++        if (flagReads != 0u)
++        {
++            if (s_vu1LazyVerify)
++            {
++                if (flagReads & kFlagReadMac)
++                    ++g_lazyMacReads;
++                if (flagReads & kFlagReadStatus)
++                    ++g_lazyStatusReads;
++                // Every executed reader, armed or not, plus the subset that could see another
++                // program's flags: readsBeforeWrite == 0 over a full run is the empirical proof
++                // that no reader ever depends on flags produced outside its own program.
++                ++g_lazyReaderIssues;
++                if (!s_flagWriteThisRun)
++                    ++g_lazyReadsBeforeWrite;
++                if (s_lazyActive)
++                {
++                    // The scan claimed this program never reads MAC/status, yet a reader is
++                    // issuing. Under LAZYFLAGS=1 that is a scan bug; under the =2 ablation it is
++                    // expected. Rate-limited (this site is per-instruction).
++                    static uint64_t lazyMisses = 0;
++                    if (lazyMisses < 32u)
++                    {
++                        ++lazyMisses;
++                        RUNTIME_ERROR("[VU1 lazy-flag MISS] pc=0x" << std::hex << m_state.pc
++                                                                   << " lower=0x" << decoded.lower << std::dec
++                                                                   << " (mode=" << s_vu1LazyFlags << ")");
++                    }
++                }
++            }
++            const bool couldSeeStale =
++                ((flagReads & kFlagReadMac) != 0u && s_macDirty && !s_flagWriteThisRun) ||
++                ((flagReads & kFlagReadStatus) != 0u && s_stickyDirty);
++            if (couldSeeStale && !s_lazyDisabled)
++            {
++                ++g_lazyDirtyReads;
++                s_lazyDisabled = true;
++                s_lazyActive = false;
++                RUNTIME_ERROR("[VU1 lazy-flag DIRTY] a "
++                              << (((flagReads & kFlagReadMac) != 0u) ? "MAC" : "status")
++                              << " reader issued at pc=0x" << std::hex << m_state.pc << std::dec
++                              << " while lazy flags had skipped writes -- lazy flags are now "
++                                 "disabled for the rest of this session");
++            }
++        }
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -1660,16 +2593,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          if (m_cycle >= budgetEnd)
              break;
  
@@ -1583,7 +1869,7 @@ index bd75bba..498eafc 100644
          }
  
          const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1835,4 +2514,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1835,4 +2765,64 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_state.cycles = m_cycle;
      if (useVuRounding && previousRoundingMode != -1)
          std::fesetround(previousRoundingMode);
@@ -1599,11 +1885,52 @@ index bd75bba..498eafc 100644
 +            g_vu1NextReport = g_vu1Pairs + 20000000ull;
 +            std::fprintf(stderr,
 +                         "[vu1:perf] pairs=%llu calls=%llu ns=%llu | %.2f ns/pair "
-+                         "%.1f pairs/call (fastscan=%d nosched=%d)\n",
++                         "%.1f pairs/call (fastscan=%d nosched=%d lazy=%d off=%d) "
++                         "| lazy: progs=%llu clean=%llu armed=%llu macRd=%llu stsRd=%llu "
++                         "preWrite=%llu dirtyReads=%llu\n",
 +                         g_vu1Pairs, g_vu1Calls, g_vu1Ns,
 +                         g_vu1Pairs ? double(g_vu1Ns) / double(g_vu1Pairs) : 0.0,
 +                         g_vu1Calls ? double(g_vu1Pairs) / double(g_vu1Calls) : 0.0,
-+                         s_vu1FastScan ? 1 : 0, s_vu1NoSched ? 1 : 0);
++                         s_vu1FastScan ? 1 : 0, s_vu1NoSched ? 1 : 0, s_vu1LazyFlags,
++                         s_lazyDisabled ? 1 : 0,
++                         g_lazyProgsScanned, g_lazyProgsClean, g_lazyRunsArmed,
++                         g_lazyMacReads, g_lazyStatusReads,
++                         g_lazyReadsBeforeWrite, g_lazyDirtyReads);
++            if (s_vu1JitCensus && g_jitPairs)
++            {
++                // Sorted top-N per category, plus the block-shape numbers the JIT needs.
++                auto dumpTop = [](const char *what, const unsigned long long *tab, size_t n)
++                {
++                    std::pair<unsigned long long, size_t> top[12]{};
++                    for (size_t i = 0; i < n; ++i)
++                    {
++                        if (!tab[i]) continue;
++                        for (size_t s = 0; s < 12; ++s)
++                        {
++                            if (tab[i] > top[s].first)
++                            {
++                                for (size_t k = 11; k > s; --k) top[k] = top[k - 1];
++                                top[s] = {tab[i], i};
++                                break;
++                            }
++                        }
++                    }
++                    std::fprintf(stderr, "[vu1:jitcensus] %s:", what);
++                    for (const auto &e : top)
++                        if (e.first) std::fprintf(stderr, " %02zx=%.1f%%", e.second,
++                                                  100.0 * double(e.first) / double(g_jitPairs));
++                    std::fprintf(stderr, "\n");
++                };
++                std::fprintf(stderr,
++                             "[vu1:jitcensus] pairs=%llu branches=%llu (1 per %.1f pairs = mean "
++                             "block length) ibit=%.1f%% ebit=%llu\n",
++                             g_jitPairs, g_jitBranches,
++                             g_jitBranches ? double(g_jitPairs) / double(g_jitBranches) : 0.0,
++                             100.0 * double(g_jitIBit) / double(g_jitPairs), g_jitEBit);
++                dumpTop("upper", g_jitUpper, 64);
++                dumpTop("upperSpecial", g_jitUpperSpecial, 128);
++                dumpTop("lower", g_jitLower, 128);
++            }
 +        }
 +    }
  }
