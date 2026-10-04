@@ -14,7 +14,7 @@ set -euo pipefail
 # ★ The toolchain is OUR FORK of PS2Recomp (private repo, branch `lotr`), not upstream plus a
 # patch stack (the patches/*.patch mechanism was retired, cont.230; its change log
 # lives in the fork as docs/llmps2recomp-patches.md). Runtime/recompiler changes are made IN
-# the clone and COMMITTED + PUSHED there. Upstream is kept as the `upstream` remote so it can
+# the clone and COMMITTED there (pushed only with the user's approval). Upstream is kept as the `upstream` remote so it can
 # be merged periodically:  git -C tools/<game>/PS2Recomp fetch upstream && git merge upstream/main
 #
 # The game records the exact toolchain commit it was built against in
@@ -106,7 +106,7 @@ if [[ -n "$LOCK_COMMIT" && "$HEAD_COMMIT" != "$LOCK_COMMIT"* ]]; then
 fi
 if [[ -n "$(git -C "$PS2RECOMP_DIR" status --porcelain --untracked-files=no)" ]]; then
     echo "    NOTE: the clone has uncommitted tracked changes (git -C \"$PS2RECOMP_DIR\" status)."
-    echo "          Commit + push them to the fork; a re-clone would lose them."
+    echo "          Commit them in the clone (push only with approval); a re-clone would lose them."
 fi
 
 echo "[4/5] Configuring PS2Recomp..."

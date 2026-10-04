@@ -105,8 +105,8 @@ and the disasm, then gdb, before asserting or acting.
   `PSMCT32`; only reading `GSLocalMemory.cpp` surfaced it). Cite the PCSX2 file/function in the
   commit message and in the fork's `docs/llmps2recomp-patches.md` row for that file.
 - **The toolchain is our fork, committed, not a patch stack.** `tools/<game>/PS2Recomp` is a clone of
-  `caws/PS2Recomp` branch `lotr` (upstream = the `upstream` remote). Commit + push runtime changes
-  there in the same cycle as the game-repo commit, and bump `<game_dir>/recomp/runtime.lock` to the
+  `caws/PS2Recomp` branch `lotr` (upstream = the `upstream` remote). Commit runtime changes
+  there in the same cycle as the game-repo commit (push ONLY with the user's explicit approval), and bump `<game_dir>/recomp/runtime.lock` to the
   new commit. The `patches/*.patch` mechanism was retired (cont.230).
 
 ## The bug/fix taxonomy (quick index)

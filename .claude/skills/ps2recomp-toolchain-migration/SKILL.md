@@ -9,7 +9,7 @@ description: Migrate a game's PS2Recomp toolchain clone to a newer upstream comm
 > is now our private fork (`caws/PS2Recomp`, branch `lotr`) with the former patches as commits and
 > upstream as the `upstream` remote. A migration is therefore a git merge:
 > `git -C tools/<game>/PS2Recomp fetch upstream && git merge upstream/main`, resolve conflicts per
-> file, rebuild (FULL regen if `ps2xRecomp/` changed), verify the boot per the method below, push,
+> file, rebuild (FULL regen if `ps2xRecomp/` changed), verify the boot per the method below, commit (push only with the user's approval),
 > and bump `<game_dir>/recomp/runtime.lock`. The bare-baseline / re-apply-patches steps below are
 > the historical method; the *verification* discipline (what to check, in what order) still applies.
 

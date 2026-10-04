@@ -48,7 +48,7 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
 - **`tools/<game>/PS2Recomp/` is a clone of OUR PRIVATE FORK of PS2Recomp**
   (`https://github.com/caws/PS2Recomp.git`, branch **`lotr`**; upstream `ran-j/PS2Recomp` is the
   `upstream` remote, merged in periodically with `git merge upstream/main`). Runtime/recompiler
-  changes are made **in that clone and COMMITTED + PUSHED there** — one focused commit per change,
+  changes are made **in that clone and COMMITTED there** — one focused commit per change (★ **never push** — the user pushes, or approves each push explicitly),
   PCSX2 citation in the message, and a row in the fork's `docs/llmps2recomp-patches.md` (the
   former `patches/README.md`). The `patches/*.patch` stack was **retired (cont.230)**;
   never reintroduce it. The game pins the toolchain commit it was verified against in
@@ -88,7 +88,7 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   needed or a file elsewhere looks removable, **say so and let the user decide** — do not delete
   it yourself. Inside the two allowed folders, still prefer surfacing over deleting anything you
   did not create (see the `.bak` runner binaries).
-- **No `git commit` / destructive git** unless explicitly asked.
+- **Git: local commits on validated progress are fine (operating-manual §8); ★ NEVER push, force-push, create remote branches/tags or change repo settings without the user's explicit approval for that specific action** (user directive). No destructive git unless explicitly asked.
 - No "auto mode" — only take actions the user has asked for.
 
 ## Engine layout
@@ -97,7 +97,7 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `docs/`. Ignored
   `<game_dir>/recomp/runtime.lock` names) + build `ps2_recomp` (gcc-13, SSE4.1) into that game's
   own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`), add the
   `upstream` remote, and warn if the clone is not at the lock's commit. `--upstream` clones bare
-  `ran-j/PS2Recomp` for a baseline build. Commit + push toolchain fixes in the clone, or a
+  `ran-j/PS2Recomp` for a baseline build. Commit toolchain fixes in the clone (push only with approval), or a
   re-clone loses them.
 - `scripts/03_build_game.sh <game_dir> [flags]` — regen → install → cmake build.
 - `scripts/04_run_game.sh <game_dir> [run_log]` — run the last-built runner (ELF read from config); log to file if given, else console.
