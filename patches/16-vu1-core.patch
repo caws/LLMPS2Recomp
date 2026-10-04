@@ -1,5 +1,5 @@
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..080d11b 100644
+index bd75bba..3c30032 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 @@ -3,6 +3,7 @@
@@ -22,7 +22,7 @@ index bd75bba..080d11b 100644
  #include <ps2_log.h>
  
  namespace
-@@ -20,6 +24,492 @@ namespace
+@@ -20,6 +24,517 @@ namespace
      {
          return static_cast<uint8_t>(1u << (3u - component));
      }
@@ -249,6 +249,31 @@ index bd75bba..080d11b 100644
 +// word and the code dump prints memory, and nothing printed the two side by side for ONE address.
 +static const bool s_vuDecProbe = []
 +{ const char *e = std::getenv("PS2X_VU_DECPROBE"); return e && e[0] && e[0] != '0'; }();
++// ★★ cont.217 (PS2X_VU1_FLAGVERIFY=1, default OFF): the differential oracle the block driver's FLAG
++// REPLAY has never had. `BLOCKVERIFY` cannot cover it -- the entire driver path from early-apply
++// through retire lives inside `if (!s_vu1BlockVerify)`, so verify mode never executes it (that
++// structural blind spot is exactly what hid the cont.216 overflow). cont.212's `READYVERIFY` covers
++// the READY-TABLE replay, a different list.
++// Same shape as READYVERIFY: from ONE snapshot, run the production path and an INDEPENDENT
++// restatement, then compare. Production walks clip events and MAC events in two separate passes and
++// picks slots via the valid-slot bitmask + ctz; the reference merges both event streams into one
++// ascending-cycle sequence (which is the order the INTERPRETER would have issued them in, one pair
++// at a time) and uses plain linear scans for both retire and slot selection. So the check is not a
++// restatement of the same code -- it is the interpreter's ordering contract versus the driver's.
++static const bool s_vu1FlagVerify = []
++{ const char *e = std::getenv("PS2X_VU1_FLAGVERIFY"); return e && e[0] && e[0] != '0'; }();
++static unsigned long long g_fvChecked = 0, g_fvBad = 0, g_fvEvents = 0, g_fvOverflow = 0;
++static unsigned long long g_fvDeferred = 0;
++// ★★ cont.217 (PS2X_VU1_FLAGMUTATE=<n>, default 0 = off): DELIBERATE DEFECTS injected into the flag
++// replay, so FLAGVERIFY can be shown CAPABLE OF FAILING. A verifier that has only ever passed has
++// proven nothing (the cont.194 lesson: 10 injected defects found a real gap in the JIT self-tests).
++// Diagnostics only -- never enable during a real run.
++//   1 = never retire during the replay (the cont.216 bug itself)
++//   2 = drop the last MAC event
++//   3 = replay MAC events in REVERSE pair order
++//   4 = replay MAC events one cycle late
++static const int s_vu1FlagMutate = []
++{ const char *e = std::getenv("PS2X_VU1_FLAGMUTATE"); return e ? std::atoi(e) : 0; }();
 +struct LastBlk { uint32_t entryPc, pairs, endsBranch, outPc, cycles; };
 +static LastBlk g_lastBlk[2][4] = {};
 +static unsigned g_lastBlkN[2] = {};
@@ -515,7 +540,7 @@ index bd75bba..080d11b 100644
  }
  
  void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
-@@ -66,21 +556,42 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+@@ -66,21 +581,42 @@ VU1Interpreter::VU1Interpreter(Unit unit)
  
  void VU1Interpreter::resetScheduler()
  {
@@ -572,7 +597,7 @@ index bd75bba..080d11b 100644
      m_efuResourceReady = 0;
      m_workingClip = m_state.clip;
      m_viBranchBackupValue = 0;
-@@ -98,6 +609,15 @@ void VU1Interpreter::reset()
+@@ -98,6 +634,15 @@ void VU1Interpreter::reset()
      m_state.q = 1.0f;
      m_state.r = 0x3F800000u;
      m_cycle = 0;
@@ -588,7 +613,7 @@ index bd75bba..080d11b 100644
      resetScheduler();
  }
  
-@@ -123,129 +643,110 @@ float VU1Interpreter::normalizeOperand(float value) const
+@@ -123,129 +668,110 @@ float VU1Interpreter::normalizeOperand(float value) const
      return value;
  }
  
@@ -797,7 +822,7 @@ index bd75bba..080d11b 100644
  
      if (op < 0x3Cu)
      {
-@@ -313,7 +814,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -313,7 +839,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
                  static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
                  static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
                  result = component == 3u
@@ -806,7 +831,7 @@ index bd75bba..080d11b 100644
                               : acc(component) - vs(left[component]) * vt(right[component]);
                  break;
              }
-@@ -324,6 +825,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -324,6 +850,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
          return true;
      }
  
@@ -814,7 +839,7 @@ index bd75bba..080d11b 100644
      if (special <= 0x03u)
          result = vs(component) + vt(special & 3u);
      else if (special <= 0x07u)
-@@ -388,7 +890,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -388,7 +915,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
              static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
              static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
              result = component == 3u
@@ -823,7 +848,7 @@ index bd75bba..080d11b 100644
                           : vs(left[component]) * vt(right[component]);
              break;
          }
-@@ -399,34 +901,208 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -399,34 +926,208 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
      return true;
  }
  
@@ -1051,7 +1076,7 @@ index bd75bba..080d11b 100644
  }
  
  uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
-@@ -478,8 +1154,10 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+@@ -478,8 +1179,10 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
          }
  
          float product = left * right;
@@ -1064,7 +1089,7 @@ index bd75bba..080d11b 100644
          // Product-sum instructions report Z/S/U/O from the add/subtract result
          // as current flags, while every product condition accumulates into the
          // corresponding sticky flag.
-@@ -494,6 +1172,13 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -494,6 +1197,13 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
      if (dest == 0u)
          return;
  
@@ -1078,7 +1103,7 @@ index bd75bba..080d11b 100644
      uint32_t mac = 0u;
      uint32_t status = 0u;
      for (uint32_t component = 0; component < 4u; ++component)
-@@ -514,20 +1199,31 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -514,20 +1224,31 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
          status |= flags;
      }
  
@@ -1119,7 +1144,7 @@ index bd75bba..080d11b 100644
  
      *entry = {};
      entry->valid = true;
-@@ -538,65 +1234,97 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+@@ -538,65 +1259,97 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
      entry->extraSticky = extraSticky;
      entry->writesMac = true;
      entry->writesStatus = true;
@@ -1226,7 +1251,7 @@ index bd75bba..080d11b 100644
  }
  
  void VU1Interpreter::queueFcset(uint32_t clip)
-@@ -607,26 +1335,37 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+@@ -607,26 +1360,37 @@ void VU1Interpreter::queueFcset(uint32_t clip)
          if (entry.valid && entry.issueCycle == m_cycle)
              entry.writesClip = false;
      }
@@ -1267,7 +1292,7 @@ index bd75bba..080d11b 100644
      m_fdiv.valid = true;
      m_fdiv.readyCycle = m_cycle + latency;
      m_fdiv.value = value;
-@@ -637,36 +1376,57 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+@@ -637,36 +1401,57 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
  {
      uint32_t ignoredFlags = 0u;
      value = normalizeResult(value, ignoredFlags);
@@ -1296,9 +1321,10 @@ index bd75bba..080d11b 100644
  {
 -    for (PendingStore &store : m_storePipeline)
 +    if (s_vu1NoSched)
-+    {
+     {
+-        if (!store.valid)
 +        if (m_activeVuData && address + 16u <= m_activeVuDataSize)
-+        {
+         {
 +            uint32_t oldWords[4]{};
 +            std::memcpy(oldWords, m_activeVuData + address, sizeof(oldWords));
 +            for (uint32_t component = 0; component < 4u; ++component)
@@ -1310,12 +1336,11 @@ index bd75bba..080d11b 100644
 +        }
 +        return;
 +    }
-     {
--        if (!store.valid)
++    {
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_storePipeline, pipe.store, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
-         {
++        {
 +            PendingStore &store = m_storePipeline[static_cast<size_t>(slot)];
              store.valid = true;
              store.readyCycle = m_cycle + 1u;
@@ -1331,31 +1356,31 @@ index bd75bba..080d11b 100644
  }
  
  void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
-@@ -674,10 +1434,21 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -674,10 +1459,21 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
  {
      if (reg == 0u || laneMask == 0u)
          return;
 -    for (PendingVfWrite &write : m_vfWritePipeline)
 +    if (s_vu1NoSched)
-+    {
+     {
+-        if (!write.valid)
 +        for (uint32_t component = 0; component < 4u; ++component)
-+        {
+         {
 +            if ((laneMask & laneForComponent(component)) != 0u)
 +                m_state.vf[reg][component] = value[component];
 +        }
 +        return;
 +    }
-     {
--        if (!write.valid)
++    {
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_vfWritePipeline, pipe.vf, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
-         {
++        {
 +            PendingVfWrite &write = m_vfWritePipeline[static_cast<size_t>(slot)];
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-@@ -685,25 +1456,31 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+@@ -685,25 +1481,31 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
              write.reg = reg;
              write.laneMask = laneMask;
              std::copy(value, value + 4, write.value.begin());
@@ -1381,12 +1406,12 @@ index bd75bba..080d11b 100644
          return;
 -    for (PendingViWrite &write : m_viWritePipeline)
 +    if (s_vu1NoSched)
-+    {
+     {
+-        if (!write.valid)
 +        m_state.vi[reg] = static_cast<int16_t>(value);
 +        return;
 +    }
-     {
--        if (!write.valid)
++    {
 +        PipeTrack &pipe = pipeFor(this);
 +        const int slot = freeSlot(m_viWritePipeline, pipe.vi, s_vu1CommitSkip && pipe.owner == this);
 +        if (slot >= 0)
@@ -1395,7 +1420,7 @@ index bd75bba..080d11b 100644
              write = {};
              write.valid = true;
              write.readyCycle = m_cycle + latency;
-@@ -711,44 +1488,103 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+@@ -711,44 +1513,103 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
              write.reg = reg;
              write.value = value;
              m_viLatestWrite[reg] = write.sequence;
@@ -1476,7 +1501,7 @@ index bd75bba..080d11b 100644
 +        if (readyCycle < nextReady)
 +            nextReady = readyCycle;
 +    };
-+
+ 
 +    if (s_vu1PipeVerify && tracked)
 +    {
 +        // Self-check (PS2X_VU1_PIPEVERIFY=1): the only dangerous direction is a mask that
@@ -1500,7 +1525,7 @@ index bd75bba..080d11b 100644
 +        check("vi", m_viWritePipeline, pipe.vi);
 +        check("acc", m_accWritePipeline, pipe.acc);
 +    }
- 
++
 +    fresh.flag = retirePipe(m_flagPipeline, pipe.flag, tracked, [&](FlagPipelineEntry &entry)
 +    {
 +        if (entry.readyCycle > m_cycle)
@@ -1511,7 +1536,7 @@ index bd75bba..080d11b 100644
          if (entry.writesMac)
              m_state.mac = entry.mac;
          if (entry.writesStatus)
-@@ -763,80 +1599,158 @@ void VU1Interpreter::commitReadyPipelines()
+@@ -763,80 +1624,158 @@ void VU1Interpreter::commitReadyPipelines()
          if (entry.writesClip)
              m_state.clip = entry.clip;
          entry = {};
@@ -1586,9 +1611,40 @@ index bd75bba..080d11b 100644
 -    }
 +        return true;
 +    });
++
++    fresh.vf = retirePipe(m_vfWritePipeline, pipe.vf, tracked, [&](PendingVfWrite &write)
++    {
++        if (write.readyCycle > m_cycle)
++        {
++            note(write.readyCycle);
++            return false;
++        }
++        uint32_t lanes = write.laneMask & 0xFu;
++        while (lanes != 0u)
++        {
++            const uint32_t component = 3u - nextSetBit(lanes);
++            if (m_vfLatestWrite[write.reg][component] == write.sequence)
++                m_state.vf[write.reg][component] = write.value[component];
++        }
++        write = {};
++        return true;
++    });
++
++    fresh.vi = retirePipe(m_viWritePipeline, pipe.vi, tracked, [&](PendingViWrite &write)
++    {
++        if (write.readyCycle > m_cycle)
++        {
++            note(write.readyCycle);
++            return false;
++        }
++        if (m_viLatestWrite[write.reg] == write.sequence)
++            m_state.vi[write.reg] = static_cast<int16_t>(write.value);
++        write = {};
++        return true;
++    });
  
 -    for (PendingVfWrite &write : m_vfWritePipeline)
-+    fresh.vf = retirePipe(m_vfWritePipeline, pipe.vf, tracked, [&](PendingVfWrite &write)
++    fresh.acc = retirePipe(m_accWritePipeline, pipe.acc, tracked, [&](PendingAccWrite &write)
      {
 -        if (!write.valid || write.readyCycle > m_cycle)
 -            continue;
@@ -1598,50 +1654,8 @@ index bd75bba..080d11b 100644
 -            if ((write.laneMask & laneForComponent(component)) != 0u &&
 -                m_vfLatestWrite[write.reg][component] == write.sequence)
 -            {
-+            note(write.readyCycle);
-+            return false;
-+        }
-+        uint32_t lanes = write.laneMask & 0xFu;
-+        while (lanes != 0u)
-+        {
-+            const uint32_t component = 3u - nextSetBit(lanes);
-+            if (m_vfLatestWrite[write.reg][component] == write.sequence)
-                 m_state.vf[write.reg][component] = write.value[component];
+-                m_state.vf[write.reg][component] = write.value[component];
 -            }
-         }
-         write = {};
--    }
-+        return true;
-+    });
- 
--    for (PendingViWrite &write : m_viWritePipeline)
-+    fresh.vi = retirePipe(m_viWritePipeline, pipe.vi, tracked, [&](PendingViWrite &write)
-     {
--        if (!write.valid || write.readyCycle > m_cycle)
--            continue;
-+        if (write.readyCycle > m_cycle)
-+        {
-+            note(write.readyCycle);
-+            return false;
-+        }
-         if (m_viLatestWrite[write.reg] == write.sequence)
-             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
-         write = {};
--    }
-+        return true;
-+    });
- 
--    for (PendingAccWrite &write : m_accWritePipeline)
-+    fresh.acc = retirePipe(m_accWritePipeline, pipe.acc, tracked, [&](PendingAccWrite &write)
-     {
--        if (!write.valid || write.readyCycle > m_cycle)
--            continue;
--        for (uint32_t component = 0; component < 4u; ++component)
-+        if (write.readyCycle > m_cycle)
-         {
--            if ((write.laneMask & laneForComponent(component)) != 0u &&
--                m_accLatestWrite[component] == write.sequence)
--            {
 +            note(write.readyCycle);
 +            return false;
 +        }
@@ -1650,13 +1664,21 @@ index bd75bba..080d11b 100644
 +        {
 +            const uint32_t component = 3u - nextSetBit(lanes);
 +            if (m_accLatestWrite[component] == write.sequence)
-                 m_state.acc[component] = write.value[component];
--            }
++                m_state.acc[component] = write.value[component];
          }
          write = {};
+-    }
 +        return true;
 +    });
-+
+ 
+-    for (PendingViWrite &write : m_viWritePipeline)
+-    {
+-        if (!write.valid || write.readyCycle > m_cycle)
+-            continue;
+-        if (m_viLatestWrite[write.reg] == write.sequence)
+-            m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+-        write = {};
+-    }
 +    fresh.owner = this;
 +    fresh.nextReady = nextReady;
 +    pipe = fresh;
@@ -1672,7 +1694,8 @@ index bd75bba..080d11b 100644
 +//   kick and continued. Upstream's m_stopRequested abort turned every garbage-tag kick into a
 +//   whole dead geometry batch (~140 killed programs / 10 min in the LOTR level era).
 +extern "C" void ps2xGsSetGifPath(uint32_t); // gs_frontend.cpp per-path GIF resume selector
-+
+ 
+-    for (PendingAccWrite &write : m_accWritePipeline)
 +static const bool s_vu1KickFlg3Image = []
 +{ const char *e = std::getenv("PS2X_VU1_KICKFLG3"); return !(e && e[0] == '0'); }();
 +static const bool s_vu1KickDropSoft = []
@@ -1686,15 +1709,21 @@ index bd75bba..080d11b 100644
 +    static unsigned long s_drops = 0;
 +    ++s_drops;
 +    if (s_drops <= 24u || (s_drops % 1024u) == 0u)
-+    {
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
+-            continue;
+-        for (uint32_t component = 0; component < 4u; ++component)
 +        std::fprintf(stderr, "[VU1 kick-drop] n=%lu reason=0x%x pc=0x%x cycle=%llu src=0x%x\n",
 +                     s_drops, reason, pc, cycle, srcAddr);
 +        // Rule 12: dump the bytes the counter counts — the first two qwords at the kick source
 +        // identify the corruption class (zeros / file data / shifted stream / floats-as-tag).
 +        if (vuData && dataSize)
-+        {
+         {
+-            if ((write.laneMask & laneForComponent(component)) != 0u &&
+-                m_accLatestWrite[component] == write.sequence)
 +            for (uint32_t q = 0; q < 2u; ++q)
-+            {
+             {
+-                m_state.acc[component] = write.value[component];
 +                uint32_t w[4];
 +                for (uint32_t i = 0; i < 4u; ++i)
 +                {
@@ -1704,12 +1733,13 @@ index bd75bba..080d11b 100644
 +                    w[i] = v;
 +                }
 +                std::fprintf(stderr, "    q%u: %08x %08x %08x %08x\n", q, w[0], w[1], w[2], w[3]);
-+            }
-+        }
+             }
+         }
+-        write = {};
      }
  }
  
-@@ -851,6 +1765,44 @@ void VU1Interpreter::progressXgkick()
+@@ -851,6 +1790,44 @@ void VU1Interpreter::progressXgkick()
          m_xgkick.cycleCredit -= 2u;
          if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
          {
@@ -1754,7 +1784,7 @@ index bd75bba..080d11b 100644
              reportReservedInstruction(false, 0xFFFFFFFBu);
              m_xgkick.active = false;
              return;
-@@ -879,10 +1831,16 @@ void VU1Interpreter::progressXgkick()
+@@ -879,10 +1856,16 @@ void VU1Interpreter::progressXgkick()
                  tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
              else if (format == 1u)
                  tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
@@ -1773,7 +1803,7 @@ index bd75bba..080d11b 100644
                  reportReservedInstruction(false, 0xFFFFFFF8u);
                  m_xgkick.active = false;
                  return;
-@@ -890,6 +1848,12 @@ void VU1Interpreter::progressXgkick()
+@@ -890,6 +1873,12 @@ void VU1Interpreter::progressXgkick()
  
              if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
              {
@@ -1786,7 +1816,7 @@ index bd75bba..080d11b 100644
                  reportReservedInstruction(false, 0xFFFFFFFBu);
                  m_xgkick.active = false;
                  return;
-@@ -922,15 +1886,33 @@ void VU1Interpreter::finishXgkick()
+@@ -922,15 +1911,33 @@ void VU1Interpreter::finishXgkick()
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
@@ -1820,7 +1850,7 @@ index bd75bba..080d11b 100644
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
      m_xgkick = {};
      m_xgkick.active = true;
-@@ -959,6 +1941,11 @@ bool VU1Interpreter::pipelinesPending() const
+@@ -959,6 +1966,11 @@ bool VU1Interpreter::pipelinesPending() const
  {
      if (m_fdiv.valid || m_xgkick.active)
          return true;
@@ -1832,7 +1862,7 @@ index bd75bba..080d11b 100644
      for (const ScalarPipelineEntry &entry : m_efu)
          if (entry.valid)
              return true;
-@@ -988,6 +1975,8 @@ void VU1Interpreter::flushPipelines()
+@@ -988,6 +2000,8 @@ void VU1Interpreter::flushPipelines()
  
  uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
  {
@@ -1841,7 +1871,7 @@ index bd75bba..080d11b 100644
      uint64_t ready = m_cycle;
      const InstructionUsage *usages[2] = {
          &decoded.upperUsage,
-@@ -996,6 +1985,24 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -996,6 +2010,24 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
      {
          if (!usage)
              continue;
@@ -1866,7 +1896,7 @@ index bd75bba..080d11b 100644
          for (uint32_t index = 0; index < usage->vfReadCount; ++index)
          {
              const VfAccess &access = usage->vfRead[index];
-@@ -1036,6 +2043,47 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+@@ -1036,6 +2068,47 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
  
  void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
  {
@@ -1914,7 +1944,7 @@ index bd75bba..080d11b 100644
      const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
      if (lowerWrite.reg != 0u &&
          decoded.suppressedLowerVf != lowerWrite.reg)
-@@ -1043,11 +2091,10 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+@@ -1043,11 +2116,10 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
          const uint32_t latency = decoded.lowerUsage.vfLatency != 0u
                                       ? decoded.lowerUsage.vfLatency
                                       : decoded.lowerUsage.latency;
@@ -1930,7 +1960,7 @@ index bd75bba..080d11b 100644
      }
  
      const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1056,23 +2103,22 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+@@ -1056,23 +2128,22 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
          const uint32_t latency = decoded.upperUsage.vfLatency != 0u
                                       ? decoded.upperUsage.vfLatency
                                       : decoded.upperUsage.latency;
@@ -1966,7 +1996,7 @@ index bd75bba..080d11b 100644
  }
  
  VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper) const
-@@ -1535,8 +2581,52 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+@@ -1535,8 +2606,52 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
                                               const PS2Memory *memory, uint64_t generation)
  {
      const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
@@ -2020,7 +2050,7 @@ index bd75bba..080d11b 100644
  
      m_cachedVuCode = vuCode;
      m_cachedMemory = memory;
-@@ -1581,6 +2671,61 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
+@@ -1581,6 +2696,61 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
                << " pc=0x" << std::hex << m_state.pc
                << " instruction=0x" << instruction
                << std::dec << '\n');
@@ -2082,7 +2112,7 @@ index bd75bba..080d11b 100644
      m_stopRequested = true;
  }
  
-@@ -1590,6 +2735,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -1590,6 +2760,60 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t startPC, uint32_t top, uint32_t itop,
                               uint32_t maxCycles)
  {
@@ -2143,7 +2173,7 @@ index bd75bba..080d11b 100644
      resetScheduler();
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
-@@ -1633,20 +2832,1249 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1633,20 +2857,1518 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
      bool programEnded = false;
@@ -2443,6 +2473,91 @@ index bd75bba..080d11b 100644
 +        // a due commit.
 +        if (tracked)
 +            pipe.flag = survivors;
++    };
++    // ★★ cont.217 FLAGVERIFY reference. Deliberately an INDEPENDENT restatement, not a refactor of
++    // the production path: it merges the clip and MAC event streams into ONE ascending-cycle
++    // sequence (the order the interpreter issues them in, one pair at a time) and uses plain linear
++    // scans where production uses the valid-slot bitmask and ctz. Statics because run() executes on
++    // the guest thread's small stack (the cont.183 SIGBUS trap).
++    struct FvEvent { uint64_t cycle; uint32_t a, b; bool isClip; };
++    static FvEvent fvEv[64];
++    static std::array<FlagPipelineEntry, kMaxFlagEntries> fvSnapPipe, fvProdPipe, fvRefPipe;
++    static uint32_t fvSnapMac, fvSnapStatus, fvSnapClip, fvSnapWorking;
++    static uint32_t fvProdMac, fvProdStatus, fvProdClip, fvProdWorking;
++    static std::array<FlagPipelineEntry, kMaxFlagEntries> fvKeepPipe;
++    static uint32_t fvKeepMac, fvKeepStatus, fvKeepClip;
++    static uint32_t fvSnapMask;
++    // Apply one committed entry exactly as commitReadyPipelines does.
++    const auto fvApply = [](const FlagPipelineEntry &e, uint32_t &mac, uint32_t &status,
++                            uint32_t &clip)
++    {
++        if (e.writesMac)
++            mac = e.mac;
++        if (e.writesStatus)
++        {
++            const uint32_t cur = e.status & 0xFu;
++            status = (status & 0xFF0u) | cur | ((cur | e.extraSticky) << 6);
++        }
++        if (e.writesSticky)
++            status = (status & 0x03Fu) | (e.status & 0xFC0u);
++        if (e.writesClip)
++            clip = e.clip;
++    };
++    // ★★ Bring a pipeline to a CHECKPOINT the way the interpreter would: retire every entry due
++    // by `cycle`, lowest ISSUE cycle first. Issue order is canonical here because every flag entry
++    // has the same kFmacLatency, so ready order == issue order -- and it is slot-index independent,
++    // which matters because production's ctz-off-the-mask and the reference's linear scan can pick
++    // different (equally free) slots for the same entry.
++    // ★ WHY A CHECKPOINT AT ALL: production defers the commits the interpreter would have made
++    // DURING the block to the next commitReadyPipelines() at m_cycle = entry + dynCycles (or to
++    // flushPipelines() at program end, ps2_vu1_core.cpp). That deferral is unobservable -- nothing
++    // reads mac/status/clip between the block returning and that commit -- so comparing before it
++    // reports a transient, not a defect. Comparing AFTER it is the real contract.
++    const auto fvDrainDue = [&fvApply](std::array<FlagPipelineEntry, kMaxFlagEntries> &pipe,
++                                       uint32_t &mac, uint32_t &status, uint32_t &clip,
++                                       uint64_t cycle)
++    {
++        for (;;)
++        {
++            uint32_t best = kMaxFlagEntries;
++            for (uint32_t i = 0; i < kMaxFlagEntries; ++i)
++            {
++                if (!pipe[i].valid || pipe[i].readyCycle > cycle)
++                    continue;
++                if (best == kMaxFlagEntries || pipe[i].issueCycle < pipe[best].issueCycle)
++                    best = i;
++            }
++            if (best == kMaxFlagEntries)
++                break;
++            fvApply(pipe[best], mac, status, clip);
++            pipe[best] = {};
++        }
++    };
++    // Canonical view of what is still in flight: the LIVE entries sorted by issue cycle. Comparing
++    // by SLOT INDEX would report benign divergence, because a valid-slot mask that is a strict
++    // superset of reality makes freeSlot's ctz pick a different (still free) slot than a linear
++    // scan -- same contents, different index.
++    const auto fvLive = [](const std::array<FlagPipelineEntry, kMaxFlagEntries> &pipe,
++                           FlagPipelineEntry *out) -> uint32_t
++    {
++        uint32_t n = 0;
++        for (uint32_t i = 0; i < kMaxFlagEntries; ++i)
++            if (pipe[i].valid)
++                out[n++] = pipe[i];
++        for (uint32_t i = 1; i < n; ++i) // insertion sort, n <= 16
++        {
++            FlagPipelineEntry key = out[i];
++            int32_t j = int32_t(i) - 1;
++            while (j >= 0 && (out[j].issueCycle > key.issueCycle ||
++                              (out[j].issueCycle == key.issueCycle &&
++                               out[j].readyCycle > key.readyCycle)))
++            {
++                out[j + 1] = out[j];
++                --j;
++            }
++            out[j + 1] = key;
++        }
++        return n;
 +    };
 +    const vu1jit::Block *blockVerifyBlk = nullptr;
 +    uint32_t blockVerifyLeft = 0u;
@@ -2934,6 +3049,27 @@ index bd75bba..080d11b 100644
 +                            m_nextWriteSequence = rvSeqC;
 +                        }
 +                    }
++                    // ---- cont.217 FLAGVERIFY: snapshot everything the replay can touch ------
++                    const bool fvOn = s_vu1FlagVerify && !s_vu1BlockVerify &&
++                                      (blk->clipCount != 0u ||
++                                       (blk->emitsFlags && blk->flagCount != 0u));
++                    if (fvOn)
++                    {
++                        fvSnapPipe = m_flagPipeline;
++                        fvSnapMac = m_state.mac;
++                        fvSnapStatus = m_state.status;
++                        fvSnapClip = m_state.clip;
++                        fvSnapWorking = m_workingClip;
++                        PipeTrack &fvPipe = pipeFor(this);
++                        fvSnapMask = fvPipe.flag;
++                        // Reuse the existing per-insertion recorders to capture the event stream
++                        // production actually queues (values are already covered by the BLOCKVERIFY
++                        // flag check; what is under test here is their SCHEDULING).
++                        g_ccActive = true;
++                        g_fcActive = true;
++                        g_ccN = 0;
++                        g_fcN = 0;
++                    }
 +                    // ★ Replay each CLIP's queueClip at its own issue cycle, in pair order --
 +                    // m_workingClip shifts, so order is load-bearing.
 +                    if (blk->clipCount != 0u)
@@ -2946,7 +3082,8 @@ index bd75bba..080d11b 100644
 +                            std::memcpy(vs, vu1jit::blockBuffer(unitIdx).resultSlot(cw.slot), 16);
 +                            std::memcpy(vt, vu1jit::blockBuffer(unitIdx).resultSlot(cw.slot + 1u), 16);
 +                            m_cycle = entry + dynIssue[cw.pair];
-+                            retireDueFlagEntries(); // cont.216: free the slots due by now
++                            if (s_vu1FlagMutate != 1)
++                                retireDueFlagEntries(); // cont.216: free the slots due by now
 +                            queueClip(vuClipFlagsFrom(vs, vt));
 +                        }
 +                        m_cycle = saveCycle;
@@ -2957,18 +3094,180 @@ index bd75bba..080d11b 100644
 +                    if (blk->emitsFlags && blk->flagCount != 0u)
 +                    {
 +                        const uint64_t saveCycle = m_cycle;
-+                        for (uint32_t k = 0; k < blk->flagCount; ++k)
++                        // PS2X_VU1_FLAGMUTATE (default 0) injects defects here; see the flag.
++                        const uint32_t fmN = (s_vu1FlagMutate == 2 && blk->flagCount != 0u)
++                                                 ? blk->flagCount - 1u
++                                                 : blk->flagCount;
++                        for (uint32_t i = 0; i < fmN; ++i)
 +                        {
++                            const uint32_t k = (s_vu1FlagMutate == 3) ? (fmN - 1u - i) : i;
 +                            const auto &fw = blk->flagWrites[k];
 +                            float res[4];
 +                            std::memcpy(res, vu1jit::blockBuffer(unitIdx).resultSlot(fw.slot), 16);
 +                            uint8_t laneFlags[4]{};
 +                            vuNormResultQuad(res, fw.dest, laneFlags);
-+                            m_cycle = entry + dynIssue[fw.pair];
-+                            retireDueFlagEntries(); // cont.216: free the slots due by now
++                            m_cycle = entry + dynIssue[fw.pair] + (s_vu1FlagMutate == 4 ? 1u : 0u);
++                            if (s_vu1FlagMutate != 1)
++                                retireDueFlagEntries(); // cont.216: free the slots due by now
 +                            updateFmacFlags(laneFlags, fw.dest, 0u);
 +                        }
 +                        m_cycle = saveCycle;
++                    }
++                    // ---- cont.217 FLAGVERIFY: replay the same events the interpreter's way -----
++                    if (fvOn)
++                    {
++                        g_ccActive = false;
++                        g_fcActive = false;
++                        ++g_fvChecked;
++                        // Capture what production produced, then rewind to the snapshot.
++                        // Two copies: one to drain to the checkpoint for the comparison, one
++                        // pristine, because verification must never alter execution.
++                        fvProdPipe = m_flagPipeline;
++                        fvKeepPipe = m_flagPipeline;
++                        fvProdMac = m_state.mac;
++                        fvProdStatus = m_state.status;
++                        fvProdClip = m_state.clip;
++                        fvProdWorking = m_workingClip;
++                        fvKeepMac = m_state.mac;
++                        fvKeepStatus = m_state.status;
++                        fvKeepClip = m_state.clip;
++
++                        // ★★ cont.217 mutation-test finding: building the reference's event list
++                        // from the RECORDERS made it inherit production's own count and cycles, so
++                        // "drop an event" and "issue it a cycle late" both SURVIVED. The count and
++                        // the cycles must come from the BLOCK's own description instead; only the
++                        // VALUES are taken from the recorders (those are already covered by the
++                        // BLOCKVERIFY flag/clip checks). Same gap cont.194 found in the JIT
++                        // self-tests: calling the producer directly proves nothing about which
++                        // field feeds which argument.
++                        const uint32_t fvExpClip = blk->clipCount;
++                        const uint32_t fvExpMac = blk->emitsFlags ? blk->flagCount : 0u;
++                        const bool countOk = (g_ccN == fvExpClip) && (g_fcN == fvExpMac);
++                        bool cycleOk = true;
++                        uint32_t n = 0;
++                        for (uint32_t k = 0; k < fvExpClip && n < 64u; ++k)
++                        {
++                            const uint64_t derived = entry + dynIssue[blk->clipWrites[k].pair];
++                            if (k < g_ccN && g_ccIssue[k] != derived)
++                                cycleOk = false;
++                            fvEv[n++] = FvEvent{derived, k < g_ccN ? g_ccClip[k] : 0u, 0u, true};
++                        }
++                        for (uint32_t k = 0; k < fvExpMac && n < 64u; ++k)
++                        {
++                            const uint64_t derived = entry + dynIssue[blk->flagWrites[k].pair];
++                            if (k < g_fcN && g_fcIssue[k] != derived)
++                                cycleOk = false;
++                            fvEv[n++] = FvEvent{derived, k < g_fcN ? g_fcMac[k] : 0u,
++                                                k < g_fcN ? g_fcStatus[k] : 0u, false};
++                        }
++                        g_fvEvents += n;
++                        // Ascending issue cycle == the order the interpreter issues pairs in. A
++                        // pair has ONE upper, so a clip and a MAC event can never share a cycle and
++                        // the order is total. Insertion sort; n <= 64.
++                        for (uint32_t i = 1; i < n; ++i)
++                        {
++                            const FvEvent key = fvEv[i];
++                            int32_t j = int32_t(i) - 1;
++                            while (j >= 0 && fvEv[j].cycle > key.cycle)
++                            {
++                                fvEv[j + 1] = fvEv[j];
++                                --j;
++                            }
++                            fvEv[j + 1] = key;
++                        }
++
++                        fvRefPipe = fvSnapPipe;
++                        uint32_t rMac = fvSnapMac, rStatus = fvSnapStatus, rClip = fvSnapClip;
++                        uint32_t rWorking = fvSnapWorking;
++                        bool overflow = false;
++                        for (uint32_t k = 0; k < n; ++k)
++                        {
++                            const FvEvent &ev = fvEv[k];
++                            // Retire by FULL linear scan, ascending slot -- no mask, no ctz.
++                            for (uint32_t i = 0; i < kMaxFlagEntries; ++i)
++                            {
++                                if (!fvRefPipe[i].valid || fvRefPipe[i].readyCycle > ev.cycle)
++                                    continue;
++                                fvApply(fvRefPipe[i], rMac, rStatus, rClip);
++                                fvRefPipe[i] = {};
++                            }
++                            uint32_t slot = kMaxFlagEntries;
++                            for (uint32_t i = 0; i < kMaxFlagEntries; ++i)
++                                if (!fvRefPipe[i].valid) { slot = i; break; }
++                            if (slot == kMaxFlagEntries) { overflow = true; break; }
++                            FlagPipelineEntry &e = fvRefPipe[slot];
++                            e = {};
++                            e.valid = true;
++                            e.issueCycle = ev.cycle;
++                            e.readyCycle = ev.cycle + kFmacLatency;
++                            if (ev.isClip)
++                            {
++                                // Independently recompute the shift chain from the RAW clip bits.
++                                rWorking = ((rWorking << 6) | (ev.a & 0x3Fu)) & 0xFFFFFFu;
++                                e.clip = rWorking;
++                                e.writesClip = true;
++                            }
++                            else
++                            {
++                                e.mac = ev.a;
++                                e.status = ev.b;
++                                e.writesMac = true;
++                                e.writesStatus = true;
++                            }
++                        }
++
++                        // Count the pre-checkpoint difference separately: it is production's
++                        // legitimate deferral, and worth knowing the rate of, but it is not a fault.
++                        static FlagPipelineEntry fvLiveP[kMaxFlagEntries], fvLiveR[kMaxFlagEntries];
++                        if (fvLive(fvProdPipe, fvLiveP) != fvLive(fvRefPipe, fvLiveR) ||
++                            rMac != fvProdMac || rStatus != fvProdStatus || rClip != fvProdClip)
++                            ++g_fvDeferred;
++                        // Both sides to the same checkpoint: the commit the next loop iteration
++                        // performs at m_cycle = entry + dynCycles.
++                        const uint64_t fvCheckpoint = entry + dynCycles;
++                        fvDrainDue(fvProdPipe, fvProdMac, fvProdStatus, fvProdClip, fvCheckpoint);
++                        fvDrainDue(fvRefPipe, rMac, rStatus, rClip, fvCheckpoint);
++                        const uint32_t np = fvLive(fvProdPipe, fvLiveP);
++                        const uint32_t nr = fvLive(fvRefPipe, fvLiveR);
++                        bool same = !overflow && countOk && cycleOk && np == nr &&
++                                    rMac == fvProdMac && rStatus == fvProdStatus &&
++                                    rClip == fvProdClip && rWorking == fvProdWorking;
++                        for (uint32_t i = 0; same && i < np; ++i)
++                            same = fvLiveP[i].issueCycle == fvLiveR[i].issueCycle &&
++                                   fvLiveP[i].readyCycle == fvLiveR[i].readyCycle &&
++                                   fvLiveP[i].mac == fvLiveR[i].mac &&
++                                   fvLiveP[i].status == fvLiveR[i].status &&
++                                   fvLiveP[i].clip == fvLiveR[i].clip &&
++                                   fvLiveP[i].writesMac == fvLiveR[i].writesMac &&
++                                   fvLiveP[i].writesStatus == fvLiveR[i].writesStatus &&
++                                   fvLiveP[i].writesClip == fvLiveR[i].writesClip;
++                        if (overflow)
++                            ++g_fvOverflow;
++                        // Periodic, because a timeout-killed run never reaches the exit summary --
++                        // and "0 mismatches" is worthless without knowing how much was checked.
++                        if ((g_fvChecked % 100000ull) == 1ull)
++                            std::fprintf(stderr,
++                                         "[vu1:flagverify] progress checked=%llu events=%llu"
++                                         " mismatches=%llu overflow=%llu deferred=%llu\n",
++                                         g_fvChecked, g_fvEvents, g_fvBad, g_fvOverflow,
++                                         g_fvDeferred);
++                        if (!same && ++g_fvBad <= 8ull)
++                            std::fprintf(stderr,
++                                         "[vu%u:flagverify] MISMATCH #%llu pc=0x%x pairs=%u ev=%u"
++                                         " (clip=%u/%u mac=%u/%u) overflow=%d count=%d cycle=%d"
++                                         " live=%u/%u mac=%d status=%d clip=%d working=%d\n",
++                                         unitIdx, g_fvBad, m_state.pc, blk->pairs, n,
++                                         g_ccN, fvExpClip, g_fcN, fvExpMac,
++                                         overflow ? 1 : 0, !countOk, !cycleOk, np, nr,
++                                         rMac != fvProdMac, rStatus != fvProdStatus,
++                                         rClip != fvProdClip, rWorking != fvProdWorking);
++                        // Verification must never alter execution: the PRISTINE production
++                        // result stands (fvProdPipe was drained for the comparison).
++                        m_flagPipeline = fvKeepPipe;
++                        m_state.mac = fvKeepMac;
++                        m_state.status = fvKeepStatus;
++                        m_state.clip = fvKeepClip;
++                        m_workingClip = fvProdWorking;
 +                    }
 +                    m_cycle += dynCycles;
 +                    m_state.cycles = m_cycle;
@@ -3394,7 +3693,7 @@ index bd75bba..080d11b 100644
          while (readyCycle > m_cycle)
          {
              if (readyCycle >= budgetEnd)
-@@ -1656,20 +4084,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1656,20 +4378,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              }
              advanceTo(readyCycle);
              readyCycle = calculatePairReadyCycle(decoded);
@@ -3421,7 +3720,7 @@ index bd75bba..080d11b 100644
          }
  
          const VfAccess upperWrite = decoded.upperUsage.vfWrite;
-@@ -1677,12 +4104,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1677,12 +4398,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
          const bool hasUpperWrite = upperWrite.reg != 0u;
          const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
          const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
@@ -3452,7 +3751,7 @@ index bd75bba..080d11b 100644
          if (hasUpperWrite)
              std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
          if (hasDistinctLowerWrite)
-@@ -1819,7 +4258,256 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1819,7 +4552,256 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              m_pendingHaltT = tHalt;
          }
  
@@ -3709,7 +4008,7 @@ index bd75bba..080d11b 100644
          if (programEnded)
              break;
      }
-@@ -1835,4 +4523,294 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1835,4 +4817,299 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      m_state.cycles = m_cycle;
      if (useVuRounding && previousRoundingMode != -1)
          std::fesetround(previousRoundingMode);
@@ -3793,6 +4092,11 @@ index bd75bba..080d11b 100644
 +                if (s_vu1ReadyVerify)
 +                    std::fprintf(stderr, "[vu1:readyverify] checked=%llu mismatches=%llu\n",
 +                                 g_rvChecked, g_rvBad);
++                if (s_vu1FlagVerify)
++                    std::fprintf(stderr,
++                                 "[vu1:flagverify] checked=%llu events=%llu mismatches=%llu"
++                                 " overflow=%llu deferred=%llu\n",
++                                 g_fvChecked, g_fvEvents, g_fvBad, g_fvOverflow, g_fvDeferred);
 +                if (s_vu1BlockProf && g_bpEntries)
 +                {
 +                    const double e = double(g_bpEntries);
