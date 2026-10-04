@@ -232,6 +232,62 @@ Every phase is env-gated, independently testable, and leaves the CPU path defaul
    which is the only trustworthy speed metric here.
 4. **Real hardware / a human look** for anything perceptual, per the standing rule.
 
+## 4b. The 2D/HUD aspect correction — DESIGNED, NOT BUILT
+
+A **game-agnostic** renderer feature, written down here rather than in a game repo because nothing
+in it is specific to one title.
+
+### The problem it solves
+Anamorphic widescreen renders a wider frustum into the game's **own** raster and stretches the frame
+at presentation. The 3D world comes out correct because it was pre-compressed; **2D does not**,
+because it never was. A circular HUD badge becomes an ellipse, text gets fat.
+
+### The correction, and why it is inert by default
+```
+counterScale = naturalAspect / presentedAspect
+p.x = 0.5 + (p.x - 0.5) * counterScale        // about the screen centre, in the vertex path
+```
+`naturalAspect` is what `ps2xGsPresentAspect()` already derives from the **DISPLAY registers**
+(PCSX2 `GSState.cpp` VideoModeOffsets / VideoModeDividers). No 4:3 is hardcoded anywhere.
+
+| situation | scale | effect |
+|---|---|---|
+| aspect unset (derived) | natural == presented -> **1.0** | **no-op, on any game** |
+| 4:3 title forced to 1.7778 | 1.333/1.778 = **0.75** | HUD corrected |
+| natively-16:9 title at 16:9 | **1.0** | no-op |
+
+★ **It self-disables.** The default is identity on every title, so it cannot regress a game nobody
+has tested it on. ★ And deriving from the PRESENTED aspect — rather than from a game-side widescreen
+flag — makes drift structurally impossible: the correction is the exact inverse of the stretch being
+applied, by construction. A separate flag stating the same ratio a third time is how these get out
+of step.
+
+### Classifying 2D: hardware, with heuristic edges
+- ✔ **`FST` is a GS hardware flag** (UV texel coords, no perspective) — the PS2's own 2D/3D
+  distinction, not a per-game convention. Universal.
+- ⚠ **Full-screen 2D must be EXCLUDED** or a fade/blit/composite gets side bars. The principle is
+  universal; the test is a heuristic (`width < ~0.9 * raster`) and should be a knob, because a game
+  whose HUD legitimately spans the full width would be wrongly excluded.
+- ⚠ A game drawing 2D with `FST=0` and `q=1` would be missed. Not observed so far.
+
+**Measured once** (LOTR, one gameplay frame, 16,077 draws / 9 states): `FST=1 && width < raster`
+isolated the text/HUD layer (164 draws, 3-28 px) while the only other `FST=1` state was a 512 px
+full-screen composite (`tgt=1`), excluded by width exactly as intended. ⚠ That is **one frame of one
+level** — it shows the predicate separates 2D from full-screen passes, not that every HUD element in
+every game is `FST=1` and narrow.
+
+### ⚠ The derivation is not infallible
+cont.332d found the register formula **fail on a real title**: that game's DISPLAY carries
+`MAGH=0 DW+1=512`, which reads as an aspect of 0.27. `ps2xGsPresentAspect()` now uses the raster
+fraction only when the CRTC genuinely magnifies and otherwise falls back to the SD raster's 4:3. The
+correction inherits that fallback — one implementation and one set of bugs, which is right, but a
+new title should be sanity-checked rather than trusted.
+
+### Where the code goes
+The vertex path in `gs_gpu_device.cpp` — roughly five lines behind the predicate. **Not** a guest
+hook: a game-side `mods/` folder can document and gate it, but it cannot implement it, because the
+draws are classified from GS state after the guest has emitted them.
+
 ## 5. What would make this fail
 
 Recorded up front so a later cycle does not rediscover them:
