@@ -320,6 +320,19 @@ generated `.cpp`.
 
 ---
 
+- **An IOP module may not speak SIF RPC at all.** rotk USA's DirtySock (DRTYSCKF.IRX) talks to the EE through
+  SIF *command* 7 + DMA rings + a FourCC member table, behind ONE EE gateway function; our runtime's
+  `sceSifSendCmd` answers nothing, so the module looks dead with no "unhandled sid" line anywhere. Before writing
+  an RPC handler, check the IRX's imports (`sifcmd` vs `sifrpc`) and grep the EE client for BindRpc/CallRpc.
+  Replacing such a module at its EE gateway (a hook per member, run synchronously) was far less work than
+  emulating the mailbox (rotk progress.md usa-7).
+- **The SDK patches the kernel at boot, and some patches are code we cannot run.** ps2sdk's LoadExecPS2 support
+  copies kernel code to 0x80075000 and points syscalls 0x5A/0x5B/0x54-0x59 at it. A syscall override whose
+  handler is not recompiled code must fall back to the runtime's built-in syscall (fork row 251), or every one of
+  those calls fails silently for the whole session (rotk: GetEntryAddress = -1, the event-flag calls broken).
+- **PS2 file-open access mode is a 2-bit VALUE** (1 read, 2 write, 3 both), not two flag bits: `flags & RDWR`
+  turns every read-only open into a write and fails on read-only disc copies (fork row 250; PCSX2 `IopBios.cpp`).
+
 ## Discipline
 
 - **Comment every hook** with the address, what it replaces, *why* it's needed, and how you
