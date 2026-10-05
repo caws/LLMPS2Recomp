@@ -213,3 +213,26 @@ Two gotchas it handles, both learned the hard way:
   (~500 B). The script scores each shot by **mean brightness** (`fx:mean`>0.0005) and flags the ones
   with something on screen. Textures **flicker** (on screen only a few frames), so always take a burst
   and check the flagged frames.
+
+## 6. Corrupted guest data — finding who wrote it
+
+A wrong texel, a wrong table entry, a value that "can't" be there: when both renderers (or both code
+paths) agree on the wrong result, the DATA is wrong. Work backwards to the byte, then to the writer.
+
+1. **Find the bytes.** Dump what the consumer reads (a texture set, a table) from guest RAM with a
+   one-shot probe, and diff it against **PCSX2's `eeMemory.bin`** from any savestate of the same game
+   (`.p2s` = zip of zstd members; slice the member and pipe to `zstd -d`). Assets loaded from disc sit at
+   the same guest address run to run, so a byte diff names the exact corrupted range. (rotk:
+   188,416 bytes of a HUD texture set, 64 differed -- a 64-byte-aligned run of zeros.)
+2. **`PS2X_WRITE_WATCH=<addr> PS2X_WRITE_WATCH_LEN=<n>`** logs every recompiled guest store into the range
+   with pc/ra. ⚠ It only sees stores emitted by the recompiler (`ps2TraceGuestWrite`); DMA, disc reads and
+   runtime/HLE code write RAM directly and are invisible to it. ⚠ It stops printing after a few hits, so
+   a repeating writer shows once.
+3. **For a writer it cannot see**, poll the bytes from a host thread (every ~20 µs) and log each change;
+   the surrounding log lines place it in time. Prefer this to a gdb hardware watchpoint across a level
+   load -- under gdb the rotk load stalled for 900 s and the write never happened.
+4. **Read the watch line's GUEST ADDRESS, not just the masked one.** The log prints the address the code
+   used. rotk's corrupting store was `sq $zero, 0x1100C840` -- VU1 DATA memory -- landing in RAM at
+   `0x0100C840` because the runtime's special-address test did not cover that range (fixed in the fork,
+   `ps2_address.h`: the EE maps all four VU memories, `0x11000000..0x1100FFFF`, PCSX2
+   `memMapVUmicro`). Any address with bits above the 32 MB RAM mask set is a mapping question first.
