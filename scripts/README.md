@@ -1,11 +1,14 @@
 # `scripts/` — the build/run pipeline
 
-These live **only in this engine repo**. Always invoke them from the engine directory and
-point them *at* a game dir; never `cd` into the game repo first (it has no `scripts/`):
+These scripts live only in the engine repo. Call them by absolute path (or `scripts/…` from the
+engine cwd) and point them *at* a game dir. A game repo has only `scripts/build.sh` / `run.sh`
+wrappers (dropped in by `00_bootstrap_game.sh`) that forward here via `$PS2RECOMP_ENGINE`:
 
-```sh
+```
 scripts/03_build_game.sh /abs/path/to/<game-repo>        #  ✅
 cd <game-repo> && scripts/03_build_game.sh .             #  ❌ No such file or directory
+<game-repo>/scripts/build.sh --skip-regen --changed-recomp #  ✅ from a game-repo session (PS2RECOMP_ENGINE set)
+scripts/00_bootstrap_game.sh /abs/path/to/<game-repo>    #  once per new game: CLAUDE.md, hooks, wrappers, symlinks
 ```
 
 **Numbered** scripts are pipeline steps you run in order. **Unnumbered** ones are helpers

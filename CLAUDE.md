@@ -21,6 +21,10 @@ first disc/file read, fixing crashes/stalls one frontier at a time. Readability 
 ```
 <game-repo>/
   <ELF>            # the PS2 executable; its path is declared in recomp/config.toml `input`
+  CLAUDE.md        # agent guide for sessions opened FROM the game repo (bootstrapped from templates/game/)
+  .claude/         # SessionStart hook + settings.local.json (env, permissions, shared memory; gitignored)
+                   #   + skills/, workflows/ = SYMLINKS to this engine's (so /frontier etc. work there)
+  scripts/         # build.sh / run.sh WRAPPERS that forward to this engine via $PS2RECOMP_ENGINE
   recomp/          # PROVIDED inputs: config.toml + functions.csv
   src/             # OUR work, THE FAITHFUL BASE GAME: register_overrides.cpp (the control plane:
                    #   the one PS2_REGISTER_GAME_OVERRIDE + every registerFunction call, in order)
@@ -39,14 +43,14 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `mods/` + `docs/
 
 ## Hard constraints (do not violate)
 
-- **ALWAYS run `scripts/…` from THIS engine repo, pointed AT the game dir — never from the
-  game repo.** `scripts/` exists ONLY here (`LLMPS2Recomp/`); the game repo (`rotk_recomp/`,
-  etc.) has **no `scripts/`**. Invoke as `scripts/03_build_game.sh <ABSOLUTE-game-dir> …` from
-  the default cwd (this engine dir). **Never `cd <game_dir>` first** and never run the scripts
-  while cwd is the game repo — `cd <game_dir> && scripts/03_build_game.sh …` fails with
-  `No such file or directory`. The Bash tool cwd resets to this engine dir between calls, so a
-  plain `scripts/…` from a fresh call is correct; pass **absolute** `<game_dir>` + log paths.
-  (Full detail under "Build / run" below.)
+- **The engine's `scripts/` live ONLY here; call them by ABSOLUTE path or via the game's wrappers.**
+  Two session models exist: cwd = this engine (`scripts/03_build_game.sh <ABSOLUTE-game-dir> …`)
+  or cwd = the game repo, the **preferred "oracle" model** (`scripts/build.sh …` / `scripts/run.sh …`
+  there forward to this engine through `PS2RECOMP_ENGINE`, set in the game's `.claude/settings.local.json`;
+  `scripts/00_bootstrap_game.sh <game_dir>` creates that setup). A relative `scripts/03_…` from the game
+  cwd, or a relative `scripts/build.sh` from the engine cwd, fails with `No such file or directory` —
+  the Bash tool cwd resets to the session dir between calls, so **never `cd` to the other repo first**;
+  pass **absolute** `<game_dir>` + log paths. (Full detail under "Build / run" below.)
 - **`tools/<game>/PS2Recomp/` is a clone of OUR PRIVATE FORK of PS2Recomp**
   (`https://github.com/caws/PS2Recomp.git`, branch **`lotr`**; upstream `ran-j/PS2Recomp` is the
   `upstream` remote, merged in periodically with `git merge upstream/main`). Runtime/recompiler
@@ -111,6 +115,12 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `mods/` + `docs/
 
 ## Engine layout
 
+- `scripts/00_bootstrap_game.sh <game_dir> [--force]` — make a game repo self-hosting for Claude sessions
+  (the oracle model): `CLAUDE.md`, `.claude/settings.json` hook, gitignored `settings.local.json`
+  (`PS2RECOMP_ENGINE`/`PS2RECOMP_GAME`, permissions on this engine, `autoMemoryDirectory` = this engine's
+  memory so lessons are shared), `.claude/{skills,workflows}` symlinks, `scripts/build.sh`+`run.sh`
+  wrappers. Templates in `templates/game/`. **New-game process:** run this + `01_setup.sh` from here once,
+  then open Claude sessions **from the game repo**.
 - `scripts/01_setup.sh <game_dir> [--upstream]` — clone our fork (branch `lotr`, or what
   `<game_dir>/recomp/runtime.lock` names) + build `ps2_recomp` (gcc-13, SSE4.1) into that game's
   own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`), add the
@@ -138,14 +148,12 @@ scripts/03_build_game.sh <game_dir> --skip-regen --changed-recomp # fast: overri
 timeout 20 scripts/04_run_game.sh <game_dir> run.txt               # run → log at <game_dir>/tmp/run.txt (no log arg = console, interactive only)
 ```
 
-**Invocation gotcha — run from the ENGINE repo dir, not the game dir.** `scripts/` lives in
-this engine repo (the tool's default working dir), NOT in `<game_dir>` (which has no
-`scripts/`). So invoke `scripts/03_build_game.sh <game_dir> …` from the engine dir; do **not**
-`cd <game_dir>` first — `cd <game_dir> && scripts/03_build_game.sh …` fails with
-`scripts/03_build_game.sh: No such file or directory`. Because the Bash tool's cwd **resets to
-the engine dir between calls**, also pass an **absolute** log path when backgrounding
-(`> <game_dir>/tmp/build.log`), and prefer absolute `<game_dir>` over relative paths. Canonical
-launch + verify (override-only fast path):
+**Invocation gotcha — know which cwd the session has.** The engine's `scripts/` are only here; the
+game's `scripts/build.sh` / `run.sh` are only there. From the engine cwd use `scripts/03_build_game.sh
+<game_dir> …`; from the game cwd use `scripts/build.sh …` (same flags; log to `tmp/build.log`) or the
+engine script by absolute path. Do **not** `cd` across repos inside a command — the Bash tool's cwd
+**resets to the session dir between calls** — and pass **absolute** `<game_dir>` + log paths when
+backgrounding. Canonical launch + verify (override-only fast path):
 
 ```
 # from the engine dir (default cwd); background, ~110s for an override-only change

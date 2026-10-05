@@ -12,7 +12,7 @@ do not mass-rewrite `functions.csv`.
 
 Everything below operates on a `<game_dir>` (e.g. the LOTR game at
 `~/Documents/projects/decompilations/rotk_recomp`). The engine scripts take the game
-dir; the game repo also has `scripts/build.sh` / `scripts/run.sh` wrappers.
+dir; the game repo has `scripts/build.sh` / `scripts/run.sh` wrappers (use those when the session cwd is the game repo).
 
 ## Hard rules (do not violate)
 

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '%s' 'BINDING FIRST STEP (@GAME@, a PS2Recomp game repo): this project follows the LLMPS2Recomp engine (PS2RECOMP_ENGINE, usually the sibling folder @ENGINE_REL@; ask the user if it is not there). Before ANY work, read the engine docs/operating-manual.md and docs/working-rules.md, then the engine CLAUDE.md, this repo CLAUDE.md and docs/NEXT.md. Do NOT act until you have read them; they are binding doctrine. Key rules: ground truth = generated C++ AND disasm together (cross-check BOTH, co-equal), then validate load-bearing claims with gdb; ONE frontier per cycle; build via scripts/build.sh in the background and run via timeout N scripts/run.sh run.txt (always log to a file); bump BUILD_TAG and confirm it in tmp/run.txt after every build; all game behavior goes through override hooks in src/ (mods in mods/); never edit generated runner files; runtime/recompiler fixes are committed in the fork clone under the engine tools/ dir, never pushed; game findings go in this repo docs/, generic lessons in the engine; touch only this repo, the engine and the fork clone.'"
+          }
+        ]
+      }
+    ]
+  }
+}
