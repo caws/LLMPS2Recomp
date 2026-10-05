@@ -85,6 +85,12 @@ fi
 # Wrap the invocation in `timeout` to cap a spin:
 #   timeout 20 scripts/04_run_game.sh <game_dir> run.txt
 mkdir -p "$GAME_DIR/tmp"
+# The pre-game launcher waits for a person. With NO TERMINAL on stdin nobody is there (an automated
+# run), so skip it; a player's terminal run -- logged or not -- shows it. An explicit PS2X_LAUNCHER wins.
+# (Deciding by "is there a log file" was wrong: play.sh logs, and is interactive.)
+if [[ -z "${PS2X_LAUNCHER:-}" && ! -t 0 ]]; then
+    export PS2X_LAUNCHER=0
+fi
 # Game-side overrides (e.g. DBCMAN HLE serving) read gamefiles/ from this env var, so the
 # path is never hardcoded and survives a game-folder rename.
 export PS2_GAMEFILES="$GAME_DIR/gamefiles"
@@ -101,9 +107,7 @@ if [[ -n "$RUN_LOG" ]]; then
     # for the current run, hiding a fresh binary's output).
     rm -f "$RUN_LOG"
     echo "log: $RUN_LOG"
-    # A logged run is an automated one: never block on the pre-game launcher window (the console
-    # form below is the player's, and shows it). PS2X_LAUNCHER=1 in the environment still wins.
-    exec env PS2X_LAUNCHER="${PS2X_LAUNCHER:-0}" "$RUNNER" "$ELF" > "$RUN_LOG" 2>&1
+    exec "$RUNNER" "$ELF" > "$RUN_LOG" 2>&1
 else
     # Interactive/console mode: output streams to the terminal. NB a spinning runner can emit
     # hundreds of MB/s — automated invocations should always pass a log file instead.
