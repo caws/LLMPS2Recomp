@@ -302,6 +302,14 @@ generated `.cpp`.
   registers, set `ra = 0`, call, then `while (ctx->pc != 0) runtime->lookupFunction(ctx->pc)(…)` inside
   a host-pump scope (`ps2xBeginHostPump()`/`ps2xEndHostPump()`), and restore. LOTR's
   `mods/fourplayer` `callGuest()` is a complete implementation.
+- **⚠ …but a host pump cannot drive guest code that WAITS.** A blocking syscall/stub (`sceGsSyncV` →
+  `EeScheduler::waitVSync`, any `[[noreturn]]` `blockCurrent`) unwinds the host stack to the scheduler and later
+  resumes the thread at its return address — the pump's C++ frame and its sentinel `ra = 0` are gone, and the
+  thread runs off into pc 0 or hangs (LOTR: a render replay hung inside the flip). Drive such a
+  sequence as GUEST control flow instead: enter each step with `ra = K`, where K is an unused address inside the
+  dense function table (e.g. the padding nop after a function's `jr ra`) whose registered hook starts the next
+  step; the last step restores the caller's `ra`. Waits then behave exactly as in the original. LOTR's
+  `mods/interp` is a complete implementation.
 - **An env var derived with `setenv()` during registration is invisible to a namespace-scope
   `static` reader** — it initialised before. Read flags in function-local statics, and let the
   settings layer (which applies the file and re-executes before start-up) carry player options.
