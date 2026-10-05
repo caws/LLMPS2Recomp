@@ -46,11 +46,13 @@ with a `regions/<r>/` game dir per disc — see "Multi-region game repo" below. 
 
 Two releases of one game share almost all code but relocate everything (function/data addresses, gp
 offsets, generated symbol names). Instead of one repo per disc, ONE repo holds a shared, region-neutral
-`src/` + `mods/` and a `regions/<r>/` per disc (`recomp/` committed; `gamefiles/`, `tmp/`, the binary
-and a STAGED copy of `src/`+`mods/` ignored). The game's `scripts/build.sh` picks the region from the
-disc (`--iso`: SYSTEM.CNF BOOT2) or `--region`, stages the shared tree into `regions/<r>/` (variant
-files `<name>.<r>.<ext>`, a generated region header) and runs the fork's `ps2x-build-game.sh` on that
-folder unchanged — the toolchain still sees an ordinary single-disc game dir. Shared code names guest
+`src/` + `mods/` and a `regions/<r>/` per disc (`recomp/` committed; `gamefiles/`, `tmp/`, the binary,
+`config/` ignored). The game's `scripts/build.sh` picks the region from the disc (`--iso`: SYSTEM.CNF
+BOOT2) or `--region`, generates the disc's headers into `tmp/<r>/region/`, and runs the fork's
+`ps2x-build-game.sh` on `regions/<r>/` with `PS2X_GAME_SRC_ROOTS=src:mods:tmp/<r>/region` (fork row
+244): the shared sources compile IN PLACE, nothing is copied. Region-only code is guarded inside the
+files (`#if ROTK_REGION(USA)`, whole files included); `regions/<r>/mods` is a symlink to the shared
+`mods/` because the runtime reads `<exe dir>/mods` (Mods screen, HD pack). Shared code names guest
 addresses by ONE region's values (the first one brought up: its docs cite them), wrapped in
 compile-time lookups (`RA()`/`RGP()`/`RG()`) whose table — a CSV with one column per disc
 (`regions/addresses.csv`), turned into headers by the build — was harvested by token-aligning the two
