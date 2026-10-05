@@ -14,6 +14,30 @@ the current critical path.
 
 ---
 
+## 0. The fork's branch model (user decision) — ★ read first
+
+**Target model** — adopted when the first game's (LotR's) recompilation is DONE, not before:
+
+| branch | role |
+|---|---|
+| `main` | the SHARED line: upstream + every validated game's runtime work. **Kept current with `upstream/main`** (§1-4 per sync). Every NEW game starts here (`runtime.lock branch=main`). |
+| `<game>` | a game's own branch, created only **when that game needs runtime changes** (named after it, like today's `lotr`). The game's lock points at it. |
+| `upstream/main` | the clean upstream reference (remote-tracking; `git fetch upstream`). A local clean copy of upstream is NOT needed. |
+
+**Lifecycle:** game starts on `main` → needs a runtime change → branch `<game>` → the game's
+recompilation is done → **evaluate merging `<game>` into `main`** (separate the general-purpose work
+from game-specific traces first) → `main` absorbs it and stays synced with upstream.
+
+**Now: POSTPONED.** LotR keeps working on `lotr` (270 commits on upstream `14b1e5c`).
+`main` in the fork is still the untouched upstream copy, and the pending upstream pull
+(`75d729c`, §6) waits. When LotR is done: merge `upstream/main` into `lotr` on a branch (§4 landing
+sequence), then fast-forward `main` to it and switch LotR's lock to `main`.
+
+**Not part of this model, and the user's call alone:** anything public -- pushing `main` (it is the
+fork's default branch, so it changes what visitors see), publishing the fork, or contributing
+general-purpose changes back to `ran-j/PS2Recomp` as pull requests. The merge brings upstream's work
+to us; only those public routes bring ours to other people.
+
 ## 1. Decide whether to pull at all
 
 Upstream and this project diverge by *purpose*: upstream is a general recompiler + runtime; we are one
