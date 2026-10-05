@@ -19,3 +19,6 @@
 sccache.log
 /.claude/skills/ps2recomp-fix-next-crash/__*
 __pycache__/
+
+# Dear ImGui window layout, written by debug tools run from here
+imgui.ini

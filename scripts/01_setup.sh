@@ -11,7 +11,7 @@ set -euo pipefail
 # Each game gets its OWN clone at tools/<game>/PS2Recomp (game = basename of <game_dir>), so
 # builds never collide between games and each clone can be re-pulled independently.
 #
-# ★ The toolchain is OUR FORK of PS2Recomp (private repo, branch `lotr`), not upstream plus a
+# ★ The toolchain is OUR FORK of PS2Recomp (github.com/caws/PS2Recomp, a public GitHub fork, branch `lotr`), not upstream plus a
 # patch stack (the patches/*.patch mechanism was retired, cont.230; its change log
 # lives in the fork as docs/llmps2recomp-patches.md). Runtime/recompiler changes are made IN
 # the clone and COMMITTED there (pushed only with the user's approval). Upstream is kept as the `upstream` remote so it can

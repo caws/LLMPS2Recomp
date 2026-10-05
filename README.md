@@ -1,119 +1,83 @@
-# PS2Recomp engine
+# LLMPS2Recomp
 
-A **stateless engine** for statically recompiling PlayStation 2 games to native
-executables. It recompiles an EE MIPS R5900 ELF into C++ with
-[`ps2_recomp`](https://github.com/ran-j/PS2Recomp) and runs it on `ps2xRuntime`
-(which emulates the EE kernel, GS, SIF/IOP, threading).
+An **LLM-assisted workflow** for porting PlayStation 2 games to PC with
+[PS2Recomp](https://github.com/ran-j/PS2Recomp). It is not a recompiler and contains no game:
+it is the method, the tooling and the AI-agent setup that drive PS2Recomp through the long
+work of getting a game to boot, play and stay faithful.
 
-The engine contains **no game**. You point it at a separate **per-game repo**, and
-it builds a runnable binary from that game's inputs. Static recompilation means
-**one game per built binary** — building a game produces that game's own runner.
+It was built while porting *The Lord of the Rings: The Return of the King*
+([`caws/rotk_recomp`](https://github.com/caws/rotk_recomp)), with
+[Claude Code](https://claude.com/claude-code) doing much of the work under the rules written
+down here. The docs and tools are game-agnostic; that game is the worked example throughout.
 
-> **You must supply your own game.** This engine ships no copyrighted material. You
-> provide a legally-obtained ELF and disc data for any game you build.
+## Where this sits
 
-## Prerequisites
+| Repository | What it is | Who needs it |
+| --- | --- | --- |
+| [PS2Recomp](https://github.com/ran-j/PS2Recomp) (our fork: [`caws/PS2Recomp`](https://github.com/caws/PS2Recomp), branch `lotr`) | The **toolchain**: `ps2_recomp` translates the game's MIPS R5900 code to C++, and `ps2xRuntime` provides the PS2 hardware it runs on (EE kernel, GS, VU, SIF/IOP, audio, pads). | Everyone. A game repo's build clones it at a pinned commit. |
+| A **game repo**, e.g. [`rotk_recomp`](https://github.com/caws/rotk_recomp) | One game: the recompiler inputs (`config.toml`, `functions.csv`), its override hooks and mods, its build/run scripts and notes. | Players and contributors of that game. It builds on its own. |
+| **LLMPS2Recomp** (this repo) | How the work is done: methodology docs, Claude Code skills and workflows, reverse-engineering helpers, and the scripts that set up a toolchain clone per game and drive builds and runs. | Anyone doing the porting work, especially with an AI agent. **Players don't need it.** |
 
-- `git`, `cmake`
-- `g++-13` (the toolchain builds with GCC 13 + SSE4.1)
+> **No game content.** Nothing here comes from a game disc. Every game repo built with it
+> requires the player's own, legally obtained copy.
 
-Check your environment any time with `scripts/02_verify_setup.sh`.
+## What's inside
 
-## Setup (once)
+- **`docs/`**: the reusable methodology. Start at [`docs/README.md`](docs/README.md).
+  - [`operating-manual.md`](docs/operating-manual.md) and [`working-rules.md`](docs/working-rules.md): the
+    loop (find the frontier, verify against disassembly and generated code, fix, build, test) and the
+    rules that keep it honest.
+  - [`functions-csv.md`](docs/functions-csv.md): the function-table bug classes (truncated, missing,
+    swallowed functions) and how to find and fix them.
+  - [`overrides.md`](docs/overrides.md): override hooks and HLE patterns, with their pitfalls.
+  - [`debugging.md`](docs/debugging.md): debugging a hung or crashing runner, gdb under a parent process,
+    RAM diffs against PCSX2.
+  - Design notes: [`gl-renderer.md`](docs/gl-renderer.md), [`vu1-jit.md`](docs/vu1-jit.md),
+    [`native-lift.md`](docs/native-lift.md), [`upstream-merge.md`](docs/upstream-merge.md).
+- **`.claude/`**: the Claude Code setup.
+  - Skills: `ps2recomp-fix-next-crash` (diagnose and fix the next crash or stall),
+    `ps2recomp-toolchain-migration` (move a fork onto a newer upstream).
+  - The `re-fanout` workflow: read-only parallel reverse-engineering for architecture questions.
+  - Helper tools in `.claude/skills/ps2recomp-fix-next-crash/`: `funcs.py` (disassemble and look up
+    functions), `find_missing.py` / `find_swallowed.py` (function-table bugs), `xmap.py` (map addresses
+    between two releases of a game), `check_registrations.py` (audit a game's hook registrations), and
+    GS/VU1 inspection tools.
+- **`scripts/`**: set up and drive a game repo, see [`scripts/README.md`](scripts/README.md).
+  - `00_bootstrap_game.sh <game_dir>`: wire a game repo for agent sessions opened from it (its
+    `CLAUDE.md`, hooks, skill symlinks, build/run wrappers).
+  - `01_setup.sh <game_dir>`: clone the PS2Recomp fork for that game, at the commit its
+    `recomp/runtime.lock` pins, into `tools/<game>/PS2Recomp`, and build the recompiler.
+  - `02_verify_setup.sh`, `03_build_game.sh`, `04_run_game.sh`, `verify_disc.sh`: check, build and run
+    a single-disc game repo (they forward to the scripts in the toolchain clone).
+  - `05_screenshot.sh`, `06_sendkey.py`, `build_progress.sh`: capture frames, inject input, follow a
+    build.
+- **`templates/game/`**: the starting `CLAUDE.md`, README and wrappers for a new game repo.
+- **`CLAUDE.md`**: the agent guide for sessions opened in this repo.
+
+## Using it
+
+Requirements: Linux, `git`, `cmake`, GCC 13; [Claude Code](https://claude.com/claude-code) for the
+agent workflow (the docs and tools also work by hand).
 
 ```bash
-scripts/01_setup.sh        # clones + builds the PS2Recomp toolchain into tools/
-scripts/02_verify_setup.sh # confirms prerequisites + toolchain are ready
+git clone https://github.com/caws/LLMPS2Recomp.git
+git clone https://github.com/caws/rotk_recomp.git        # or your own game repo, next to it
+LLMPS2Recomp/scripts/00_bootstrap_game.sh "$PWD/rotk_recomp"   # agent wiring for the game repo
+LLMPS2Recomp/scripts/01_setup.sh "$PWD/rotk_recomp"            # its toolchain clone
+export PS2RECOMP_ENGINE="$PWD/LLMPS2Recomp"              # the game's scripts then use that clone
 ```
 
-## A per-game repo
+Then work from the game repo: its `README.md` and `CONTRIBUTING.md` say how it builds and runs
+(`rotk_recomp`: `scripts/build.sh --iso <disc>`), and a Claude Code session opened there follows its
+`CLAUDE.md`, which points back to the docs here. With `PS2RECOMP_ENGINE` set, a game repo builds
+against the clone in `tools/<game>/PS2Recomp`, where toolchain changes are made and committed;
+without it, it clones the pinned fork commit itself, as a player's build does.
 
-Each game is its own repository with this layout:
-
-```
-<game-repo>/
-  <ELF>            # the PS2 executable; its path is declared in recomp/config.toml `input`
-  recomp/          # config.toml + functions.csv   (the recompiler inputs)
-  src/             # register_overrides.cpp (+ .h)  (game-specific override hooks)
-  scripts/         # build.sh + run.sh wrappers     (call the engine via $PS2RECOMP_ENGINE)
-  docs/            # human notes (static facts, progress journal)
-  tmp/             # build outputs: generated/, the runner binary, run.txt  (gitignored)
-  gamefiles/       # disc/CD data                   (gitignored; you provide it)
-```
-
-Committed in a game repo: `recomp/`, `src/`, `docs/`. Not committed (you provide):
-the ELF and `gamefiles/`. Generated: everything under `tmp/`.
-
-To build a new game you need its `recomp/config.toml` + `recomp/functions.csv`
-(produced upstream by Ghidra + analysis), your ELF dropped in at the path the
-config's `input` declares, and any overrides in `src/`.
-
-## Build & run a game
-
-From the **engine**, pass the game dir:
-
-```bash
-scripts/03_build_game.sh <game_dir>            # regen -> install -> build
-timeout 20 scripts/04_run_game.sh <game_dir>   # run; output -> <game_dir>/tmp/run.txt
-```
-
-Or from inside the **game repo**, using its own wrappers (point `PS2RECOMP_ENGINE` at
-this engine once):
-
-```bash
-export PS2RECOMP_ENGINE=/path/to/this/engine   # e.g. in ~/.bashrc
-cd <game_dir>
-scripts/build.sh                               # passes flags through to the engine
-timeout 20 scripts/run.sh                       # run; output -> tmp/run.txt
-```
-
-Always wrap runs in `timeout` — an unfinished game can spin and emit output very
-fast. The runner writes to `<game_dir>/tmp/run.txt`, not your terminal; read that
-file afterwards.
-
-Everything per-game is derived from `<game_dir>/recomp/config.toml`; nothing about a
-game is hardcoded in the engine. The built runner is placed at
-`<game_dir>/tmp/ps2EntryRunner`, so different games never clash.
-
-### Useful flags (`03_build_game.sh`)
-
-| Flag | Effect |
-|------|--------|
-| _(none)_ | Full: regenerate C++ from the CSV, install, build. **Required after any `functions.csv` change.** |
-| `--skip-regen` | Reuse the game's existing `tmp/generated/` (skip `ps2_recomp`). |
-| `--changed-recomp` | Install only changed files so cmake recompiles fewer translation units (fast for override-only changes). |
-| `--release` | Full LTO `Release` build (slow link) instead of the default `RelWithDebInfo`. |
-| `--skip-build` | Regenerate + install but don't run cmake. |
-
-Builds can take many minutes (the recompiled C++ is large). The first build of a
-game compiles everything; later override-only builds are much faster with
-`--skip-regen --changed-recomp`.
-
-## How a game gets worked on
-
-Game-specific behavior is added **only** through override hooks in the game repo's
-`src/register_overrides.cpp` — `PS2_REGISTER_GAME_OVERRIDE(...)` plus
-`runtime.registerFunction(addr, lambda)`. The generated runner code under
-`tools/PS2Recomp/` is regenerated on every build and must never be hand-edited.
-
-The common bring-up bug is truncated/missing functions in `functions.csv` (a
-function sized to only its first instruction leaks the stack and corrupts the
-return address). Fixes go in the game repo's `recomp/functions.csv`, followed by a
-full rebuild.
-
-The **reusable, game-agnostic methodology** for pushing a decomp forward — the
-diagnostic loop, debugging a hung runner with **gdb-under-parent**, the three
-`functions.csv` bug classes and their fixes, and the HLE override patterns — is in
-**[`docs/`](docs/README.md)**. Start there (and at `CLAUDE.md`) when bringing up a
-new game.
-
-## Layout (engine)
-
-- `scripts/` — `01_setup`, `02_verify_setup`, `03_build_game`, `04_run_game`
-- `tools/PS2Recomp/` — the toolchain + runtime (cloned by setup; not tracked here)
-- `tmp/` — engine scratch (build logs)
+**A new game** needs its recompiler inputs first (`recomp/config.toml` and `recomp/functions.csv`,
+from PS2Recomp's analyzer and/or Ghidra); start from `templates/game/` and
+[`docs/README.md`](docs/README.md).
 
 ## License
 
-[MIT](LICENSE). This covers the engine's own scripts, tools, docs and templates. The PS2Recomp
-toolchain it clones into `tools/` is a separate project under its own licence (GPL-3.0).
+[MIT](LICENSE). This covers the scripts, tools, docs and templates here. PS2Recomp, which
+`01_setup.sh` clones into `tools/`, is a separate project under its own licence (GPL-3.0).
