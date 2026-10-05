@@ -101,7 +101,9 @@ if [[ -n "$RUN_LOG" ]]; then
     # for the current run, hiding a fresh binary's output).
     rm -f "$RUN_LOG"
     echo "log: $RUN_LOG"
-    exec "$RUNNER" "$ELF" > "$RUN_LOG" 2>&1
+    # A logged run is an automated one: never block on the pre-game launcher window (the console
+    # form below is the player's, and shows it). PS2X_LAUNCHER=1 in the environment still wins.
+    exec env PS2X_LAUNCHER="${PS2X_LAUNCHER:-0}" "$RUNNER" "$ELF" > "$RUN_LOG" 2>&1
 else
     # Interactive/console mode: output streams to the terminal. NB a spinning runner can emit
     # hundreds of MB/s — automated invocations should always pass a log file instead.
