@@ -38,8 +38,26 @@ first disc/file read, fixing crashes/stalls one frontier at a time. Readability 
 
 `config.toml`, `functions.csv`, the ELF, and `gamefiles/` are **provided per game** — never
 generate them. Committed in the game repo: `recomp/` + `src/` + `mods/` + `docs/`. Ignored: the ELF
-(copyright), `gamefiles/`, `tmp/`. The example game lives at
+(copyright), `gamefiles/`, `tmp/`. A game with SEVERAL DISCS (regional releases) keeps one repo
+with a `regions/<r>/` game dir per disc — see "Multi-region game repo" below. The example game lives at
 `~/Documents/projects/decompilations/rotk_recomp`.
+
+## Multi-region game repo (rotk_recomp)
+
+Two releases of one game share almost all code but relocate everything (function/data addresses, gp
+offsets, generated symbol names). Instead of one repo per disc, ONE repo holds a shared, region-neutral
+`src/` + `mods/` and a `regions/<r>/` per disc (`recomp/` committed; `gamefiles/`, `tmp/`, the binary
+and a STAGED copy of `src/`+`mods/` ignored). The game's `scripts/build.sh` picks the region from the
+disc (`--iso`: SYSTEM.CNF BOOT2) or `--region`, stages the shared tree into `regions/<r>/` (variant
+files `<name>.<r>.<ext>`, a generated region header) and runs the fork's `ps2x-build-game.sh` on that
+folder unchanged — the toolchain still sees an ordinary single-disc game dir. Shared code names guest
+addresses by ONE region's values (the first one brought up: its docs cite them), wrapped in
+compile-time lookups (`RA()`/`RGP()`/`RG()`) whose table — a CSV with one column per disc
+(`regions/addresses.csv`), turned into headers by the build — was harvested by token-aligning the two
+pre-merge trees and checked with `xmap.py`. Engine consequences: point the ELF tools (`funcs.py`,
+`xmap.py`) at a REGION dir; point `check_registrations.py` at the repo; do NOT run `03_build_game.sh` /
+`04_run_game.sh` on such a repo (they know no regions; use the game's wrappers). The game repo's
+`CLAUDE.md` and `src/region/region.h` hold the rules.
 
 ## Hard constraints (do not violate)
 
@@ -106,8 +124,11 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `mods/` + `docs/
   it yourself. Inside the two allowed folders, still prefer surfacing over deleting anything you
   did not create (see the `.bak` runner binaries).
 - **★ REPO SCOPE: touch ONLY the repos the user has explicitly allowed** — currently this engine
-  repo (`LLMPS2Recomp/`) and the game repos `rotk_recomp/` (EUR, remote `caws/rotk_recomp`) and
-  `rotk_recomp_usa/` (USA SLUS_207.70, allowed). Every other
+  repo (`LLMPS2Recomp/`) and the game repo `rotk_recomp/` (remote `caws/rotk_recomp`; since
+ ONE repo for both discs, EUR SLES_520.17 + USA SLUS_207.70 — see "Multi-region game
+  repo" below), plus the two pre-merge repos it was formed from, `rotk_recomp_eur/` (the EUR repo,
+  renamed by the user) and `rotk_recomp_usa/` — no longer worked in (their discs moved to
+  `rotk_recomp/regions/`). Every other
   repo or folder (`rotk_decomp_usa/`, `PS2AIRecomp/`, the archived `caws/rotk_decomp`, sibling
   projects, the home dir) is **off limits for any mutation**: no edits, no git commands, no remotes,
   no deletes. If a task appears to need another repo, stop and ask (user directive).
