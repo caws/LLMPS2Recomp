@@ -112,3 +112,8 @@ new game.
 - `scripts/` — `01_setup`, `02_verify_setup`, `03_build_game`, `04_run_game`
 - `tools/PS2Recomp/` — the toolchain + runtime (cloned by setup; not tracked here)
 - `tmp/` — engine scratch (build logs)
+
+## License
+
+[MIT](LICENSE). This covers the engine's own scripts, tools, docs and templates. The PS2Recomp
+toolchain it clones into `tools/` is a separate project under its own licence (GPL-3.0).
