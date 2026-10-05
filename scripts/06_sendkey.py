@@ -22,12 +22,16 @@ GOTCHAS:
     game. Tap F1 before screenshotting or it covers the framebuffer.
 """
 import sys
+import os
 import time
 
 from Xlib import X, XK, display, protocol
 from Xlib.ext import xtest
 
-WIN_TITLE_MATCH = "PS2-Recomp"
+# The runner's window title: "PS2-Recomp | <ELF>" by default, or the game's own name once it registers
+# one (ps2_launcher.h -- rotk: "The Lord of the Rings: The Return of the King"). Set PS2X_WIN_TITLE to
+# match another title; both are tried.
+WIN_TITLE_MATCHES = [t for t in (os.environ.get("PS2X_WIN_TITLE"), "PS2-Recomp") if t]
 
 
 def find_win(win):
@@ -35,7 +39,7 @@ def find_win(win):
         name = win.get_wm_name()
     except Exception:
         name = None
-    if name and WIN_TITLE_MATCH in name:
+    if name and any(t in name for t in WIN_TITLE_MATCHES):
         return win
     try:
         for child in win.query_tree().children:
@@ -104,7 +108,7 @@ def main():
     d = display.Display()
     win = find_win(d.screen().root)
     if not win:
-        print("ERROR: no window titled '%s*' (is the runner running?)" % WIN_TITLE_MATCH)
+        print("ERROR: no window titled any of %s (is the runner running? set PS2X_WIN_TITLE)" % WIN_TITLE_MATCHES)
         return 1
     print("window id=0x%x name=%r" % (win.id, win.get_wm_name()))
 

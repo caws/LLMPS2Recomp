@@ -48,10 +48,23 @@ if [[ "$LAUNCH" == "1" ]]; then
     sleep 1
 fi
 
-# Find the game window id by title (xwininfo -tree lists every window: `0xID "title": ...`).
-find_win() { xwininfo -root -tree 2>/dev/null | grep -F "\"$WIN_TITLE_MATCH" | grep -oE '0x[0-9a-f]+' | head -1; }
+# Find the game window. By the RUNNER'S PID first (_NET_WM_PID, set by SDL/GLFW): the title is not
+# stable -- a game that registers its name (ps2_launcher.h) replaces "PS2-Recomp | <ELF>". The runner
+# process is named after the game dir. Fallback: the old title prefix.
+find_win() {
+    local pid id
+    pid="$(pgrep -x "$(basename "$GAME_DIR")" | head -1)"
+    if [[ -n "$pid" ]] && command -v xprop >/dev/null; then
+        for id in $(xwininfo -root -tree 2>/dev/null | grep -E '^ +0x[0-9a-f]+ "[^"]+"' | grep -oE '0x[0-9a-f]+'); do
+            if [[ "$(xprop -id "$id" _NET_WM_PID 2>/dev/null | grep -oE '[0-9]+$')" == "$pid" ]]; then
+                echo "$id"; return 0
+            fi
+        done
+    fi
+    xwininfo -root -tree 2>/dev/null | grep -F "\"$WIN_TITLE_MATCH" | grep -oE '0x[0-9a-f]+' | head -1
+}
 WIN_ID="$(find_win || true)"
-[[ -n "$WIN_ID" ]] || { echo "ERROR: no window titled '$WIN_TITLE_MATCH*' on $DISPLAY (is the runner running?)"; exit 1; }
+[[ -n "$WIN_ID" ]] || { echo "ERROR: no window of the '$(basename "$GAME_DIR")' runner (nor titled '$WIN_TITLE_MATCH*') on $DISPLAY (is it running?)"; exit 1; }
 
 # Best-effort raise so the crop sees the game, not an overlapping window (no-op if tool absent).
 command -v wmctrl  >/dev/null && wmctrl -ia "$WIN_ID" 2>/dev/null || true
