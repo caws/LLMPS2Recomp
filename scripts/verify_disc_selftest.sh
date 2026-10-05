@@ -13,10 +13,14 @@ set -uo pipefail
 # stat sizing a link instead of its target, and `set -e` swallowing the exit code.
 
 E="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-V="$E/scripts/verify_disc.sh"
 REAL="${1:-}"
 [[ -n "$REAL" && -d "$REAL" ]] || { echo "Usage: verify_disc_selftest.sh <game_dir>" >&2; exit 64; }
 REAL="$(cd "$REAL" && pwd)"
+# The checker lives in the game's toolchain clone (fork scripts/ps2x-verify-disc.sh).
+# Call it DIRECTLY: the engine's verify_disc.sh wrapper locates the clone by the game dir's name, and
+# the broken copies below live in a temp dir that has no clone.
+V="$E/tools/$(basename "$REAL")/PS2Recomp/scripts/ps2x-verify-disc.sh"
+[[ -x "$V" ]] || { echo "Checker not found: $V (run scripts/01_setup.sh $REAL)" >&2; exit 1; }
 [[ -f "$REAL/recomp/disc.manifest" ]] || { echo "No recomp/disc.manifest in $REAL" >&2; exit 64; }
 
 ELF_REL="$(awk '$1=="elf"{print $4; exit}' "$REAL/recomp/disc.manifest")"

@@ -109,16 +109,8 @@ if [[ -n "$(git -C "$PS2RECOMP_DIR" status --porcelain --untracked-files=no)" ]]
     echo "          Commit them in the clone (push only with approval); a re-clone would lose them."
 fi
 
-echo "[4/5] Configuring PS2Recomp..."
-cmake -B "$PS2RECOMP_DIR/out/build" -S "$PS2RECOMP_DIR" \
-  -DCMAKE_C_COMPILER=/usr/bin/gcc-13 \
-  -DCMAKE_CXX_COMPILER=/usr/bin/g++-13 \
-  -DCMAKE_EXE_LINKER_FLAGS="-pthread" \
-  -DCMAKE_CXX_FLAGS="-msse4.1"
-
-echo "[5/5] Building ps2_recomp + ps2_analyzer..."
-cmake --build "$PS2RECOMP_DIR/out/build" --target ps2_recomp -j"$(nproc)"
-cmake --build "$PS2RECOMP_DIR/out/build" --target ps2_analyzer -j"$(nproc)"
+echo "[4/5] Configuring + [5/5] building ps2_recomp (the fork's scripts/ps2x-setup.sh)..."
+"$PS2RECOMP_DIR/scripts/ps2x-setup.sh"
 
 echo
 echo "Setup complete for $GAME."
