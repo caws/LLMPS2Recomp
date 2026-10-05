@@ -160,3 +160,20 @@ neighboring functions** (they vanish from the build) and masks generated-code gr
 Full regen + rebuild, run again, and confirm: the old warning is gone, the frontier
 advanced (new log activity), and no new monster unit appeared. Then record it in the game
 repo's `docs/progress.md`. Keep `functions.csv.bak*` backups until the change is proven.
+
+## Porting a CSV (and overrides) from another region: `xmap.py`
+
+When a second regional build of the same game needs bringing up, port the working repo instead of
+re-deriving it. `.claude/skills/ps2recomp-fix-next-crash/xmap.py --src <game_dir> --dst <game_dir>`:
+
+- `map HEX…` — code address -> target, by a relocation-insensitive signature (jal targets, lui halves
+  and gp offsets masked; `$zero`/`$sp`-relative immediates kept), with forward-window and
+  neighbour-anchor fallbacks. Only UNIQUE matches are accepted; ambiguity is reported, never guessed.
+- `csv [--prefix gapfix,boundfix] [--emit]` — maps the source's fix rows; `--emit` prints rows absent
+  from the target. Insert them; never rewrite existing rows (Ghidra's `Size` is not `End-Start`).
+- `xlate HEX…` — any address, code OR data: data pairs come from the relocated operands of every
+  function whose normalized body matches exactly in both ELFs.
+
+Validate the map on an independent fact before trusting it (EUR->USA: the three jump
+tables `ps2_analyzer` finds in each ELF mapped exactly). Region code can be restructured: a mapped
+address is not mapped semantics. Worked example: the USA game repo's `docs/progress.md` (usa-1).

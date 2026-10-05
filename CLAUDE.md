@@ -106,7 +106,8 @@ generate them. Committed in the game repo: `recomp/` + `src/` + `mods/` + `docs/
   it yourself. Inside the two allowed folders, still prefer surfacing over deleting anything you
   did not create (see the `.bak` runner binaries).
 - **★ REPO SCOPE: touch ONLY the repos the user has explicitly allowed** — currently this engine
-  repo (`LLMPS2Recomp/`) and the game repo (`rotk_recomp/`, remote `caws/rotk_recomp`). Every other
+  repo (`LLMPS2Recomp/`) and the game repos `rotk_recomp/` (EUR, remote `caws/rotk_recomp`) and
+  `rotk_recomp_usa/` (USA SLUS_207.70, allowed). Every other
   repo or folder (`rotk_decomp_usa/`, `PS2AIRecomp/`, the archived `caws/rotk_decomp`, sibling
   projects, the home dir) is **off limits for any mutation**: no edits, no git commands, no remotes,
   no deletes. If a task appears to need another repo, stop and ask (user directive).
