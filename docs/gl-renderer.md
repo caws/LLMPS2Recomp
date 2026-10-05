@@ -268,13 +268,83 @@ of step.
 - ⚠ **Full-screen 2D must be EXCLUDED** or a fade/blit/composite gets side bars. The principle is
   universal; the test is a heuristic (`width < ~0.9 * raster`) and should be a knob, because a game
   whose HUD legitimately spans the full width would be wrongly excluded.
-- ⚠ A game drawing 2D with `FST=0` and `q=1` would be missed. Not observed so far.
+- ★★★★★ **A game drawing 2D with `FST=0` would be missed — and LOTR DOES (cont.356).**
+  This was filed here as "not observed so far". It is observed now, and it sinks `FST` as the sole
+  test: see below.
 
 **Measured once** (LOTR, one gameplay frame, 16,077 draws / 9 states): `FST=1 && width < raster`
 isolated the text/HUD layer (164 draws, 3-28 px) while the only other `FST=1` state was a 512 px
 full-screen composite (`tgt=1`), excluded by width exactly as intended. ⚠ That is **one frame of one
 level** — it shows the predicate separates 2D from full-screen passes, not that every HUD element in
 every game is `FST=1` and narrow.
+
+**Re-measured on a rich HUD, and the predicate FAILED** (LOTR Helm's Deep, cont.356).
+Two complete windows — 115,186 draws / 20 states, and 1,799,501 draws / 21 states — each contained
+**exactly two `FST=1` states**: the text glyph sprites (7-13 px, 5-12 px) and the full-screen
+composite. `FST=1 && width < 0.9*raster` selected **0.1% of draws in both: the text, and nothing
+else.** The same windows' texture inventory holds the portrait, both button badges, both bars, the
+sword, ring, gauge and star icons — so the pictorial HUD *is* drawn there, `FST=0`. Correcting only
+the text while the bars and portrait stay stretched pulls the HUD apart; it is worse than shipping
+nothing.
+
+★ **So `FST` alone is not a sufficient 2D test, on any game.** `FST=1` is *sufficient* evidence of
+2D but not *necessary* — a title can emit screen-space geometry through STQ. The discriminator that
+survives is **`q`**: a screen-space draw has `q == 1` exactly, a depth-placed billboard does not
+(LOTR's fire and falling-rock sprites share the HUD's draw states, `ZTST=ALWAYS` and widths, and are
+separable only this way). Any implementation should classify on `(FST=1 || q==1) && width <
+frac*raster` — and should be **measured on the target game before it is enabled**, which is what
+this section now exists to force.
+
+### ★★★★★ WHAT SHIPPED, and the boundary it settled on (cont.356a-o)
+
+Built and in use on LOTR. The arc is worth reading before designing this for another title, because
+the shape of the answer was not the shape of the plan.
+
+**Two corrections, at two different stages.**
+
+| | applies to | where | default |
+|---|---|---|---|
+| **HUD counter-scale** | narrow 2D draws | the GL **vertex path** | ON, and inert unless an aspect is forced |
+| **2D-screen pillarbox** | a whole flat screen | the **presenter** | OFF |
+
+The second one exists because a draw-level fix **cannot reach a menu/title screen at all**: that art
+is uploaded into the framebuffer once and merely PRESENTED from there, so no draw repaints it and
+there is nothing to scale. Such a frame is instead presented at its natural aspect — pillarboxed —
+and the per-draw correction is suppressed for it, or the same pixels are corrected twice.
+
+**★ The engine holds NO per-game policy.** The game declares what it is showing
+(`ps2xGsDeclareScreen`), from a table in its own repo. The frame-level heuristic that can infer it
+is demoted to `PS2X_GS_HUD_ASPECT_FULL=auto`, a **bring-up tool** for a title with no table yet.
+That is not fastidiousness: the heuristic's thresholds are measurements of ONE game (“a 2D screen
+draws ≥ 8 narrow screen-space sprites” holds only because these menus are glyph sprites), and a
+title whose menus are a few large textured quads scores 0 and never classifies — **silently**.
+Per-game knowledge does not stop being per-game by being written as a threshold; it only moves
+somewhere harder to see and harder to fix.
+
+**Declarations are gated on evidence, and that gate earns its keep.** A declared-2D screen is
+corrected only on frames that draw no perspective geometry, so a MIXED screen is safe to declare and
+a mis-curated entry self-corrects within a frame. A `Strict` kind skips the gate, for a flat screen
+that renders decorative geometry through a perspective projection — use it only where someone has
+looked, because it removes the safety net.
+
+**Handovers need a rule in BOTH directions.** A screen is requested a few flips before the previous
+one stops drawing. So a 2D screen keeps its correction briefly after its declaration turns 3D
+(`_HOLD`), and a strict entry waits before engaging (`_ONDELAY`) — otherwise each one corrects the
+*outgoing* screen.
+
+### ⚠ How to judge any of this, learned the expensive way
+- **CHECK THE WINDOW'S OWN ASPECT FIRST.** `PS2X_WINDOW_ASPECT` fits the frame *inside* the window;
+  it never resizes it. In a 4:3 window a corrected frame FILLS it and an uncorrected one
+  LETTERBOXES, so both look wrong in different ways and no screenshot means anything. Two user
+  reports and one reverted-correct-change were spent before this was noticed. **Run maximised**, and
+  A/B the feature on vs off at the SAME window size.
+- **A percentage does not classify a screen — where the exceptions fall does.** A screen at 94%
+  zero-perspective was 2D (its exceptions were the transition tail); one at 67% was not (its
+  exceptions were mid-era and rising). Cluster first, then judge.
+- **“I cannot see 3D” is not “no perspective geometry is drawn”**, and the converse bites too: a
+  background drawing ~282 perspective primitives turned out to be a 4:3 asset the FOV hook never
+  widens — provable only by measuring at 16:9 (background 1346 vs 1794 px, ratio 0.750 exactly,
+  while the text was identical in both).
 
 ### ⚠ The derivation is not infallible
 cont.332d found the register formula **fail on a real title**: that game's DISPLAY carries
