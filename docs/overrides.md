@@ -279,6 +279,39 @@ generated `.cpp`.
 
 ---
 
+## Pitfalls (each one cost a bad build or worse)
+
+- **A hook only sees callers that go through dispatch.** `jal`/`jalr`, returns and thread/interrupt
+  entries look the address up (`dispatchGuestBranch` → the function table), so a hook fires. A
+  **tail jump** (`j <fn>` ending another function) and a **thunk** (a lone `j <fn>` at its own
+  address) are emitted as a *direct C++ call* to the target's generated body — the hook never sees
+  them (LOTR: ~400 tail jumps + 66 thunks; the thunk 0x1B5BE0 → 0x1B5810 bypassed a mod and froze a
+  level). A hook calling a generated body directly is equally invisible to other hooks.
+  Census every function you hook:
+  `grep -l "<generated symbol>(rdram, ctx, runtime)" <game_dir>/tmp/generated/*.cpp` — every file but
+  its own is a path the hook misses; hook that caller too (the thunk's address) or note the gap.
+- **Chain to an existing hook, not to the generated body.** Last registration wins; if the address
+  already has a hook, a later one that calls `FUN_…` directly silently drops the earlier fix. Call
+  that hook's `hook_…` function instead (`check_registrations.py --list` shows who registers it).
+- **Read the args before calling the original.** The generated body clobbers a0..a3 (and v0/v1,
+  ra); anything the wrapper needs afterwards must be saved first.
+- **The caller resumes at `jal` + 8**, not + 4 (the delay slot already ran). A hook that returns by
+  hand sets `ctx->pc = ra`; a guard that matches a caller's "return address" must use + 8.
+- **Calling another guest function from a hook must pump it to completion.** The generated code can
+  return to the host mid-chain at a scheduler checkpoint, so one call runs only part of it. Save the
+  registers, set `ra = 0`, call, then `while (ctx->pc != 0) runtime->lookupFunction(ctx->pc)(…)` inside
+  a host-pump scope (`ps2xBeginHostPump()`/`ps2xEndHostPump()`), and restore. LOTR's
+  `mods/fourplayer` `callGuest()` is a complete implementation.
+- **An env var derived with `setenv()` during registration is invisible to a namespace-scope
+  `static` reader** — it initialised before. Read flags in function-local statics, and let the
+  settings layer (which applies the file and re-executes before start-up) carry player options.
+- **A missing branch target ends the run** (fork row 241: `[runtime:fatal]`, exit 3;
+  `PS2X_MISSING_TARGET=continue` = the old log-and-continue, debugging only). It is either a
+  `functions.csv` gap (the target is real code: add the row) or corrupt guest state (it is not: find
+  the writer). Before row 241 the default resumed the caller, i.e. silently skipped the call.
+
+---
+
 ## Discipline
 
 - **Comment every hook** with the address, what it replaces, *why* it's needed, and how you
