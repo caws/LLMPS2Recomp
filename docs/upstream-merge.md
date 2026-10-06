@@ -267,3 +267,58 @@ full regen and a hash re-verify, so fold it into a cycle that is already regener
 **Also noted:** upstream independently disabled the MMIO hint address and rewrote the analyzer's
 constant-producing backward scan — the same two conclusions we reached in cont.247, which is why two
 of the conflicts resolve trivially as "keep ours" (ours carries the diagnosis, theirs carries a TODO).
+
+## 7. Re-evaluation 2026-10-06 — upstream `2c5fbb9` (75d729c + c5a9d02 + a5d3049 + 2c5fbb9) onto the squashed `lotr`
+
+`lotr` is now upstream `14b1e5c` + one squash commit `1e4126e` (+ `70afe64`, `d71e4da`); the pull is the same `75d729c`
+plus three small commits. Measured read-only (merge-tree): **30 hunks in 9 files** (§6's 8 + `FileIO.cpp`, our row 250,
+which upstream moved onto `PS2Vfs::hostMode` — take theirs). The §6 resolutions still hold (keep ours on the rasterizer,
+VIF1 PATH2 carry, analyzer; no-op `LoadClut` on `GSCpuBackend`). §6's `g_fileDescriptors` break was a false alarm: that
+debug-panel code is base code upstream rewrote itself.
+
+**Silent merge outcomes (fix by hand; no conflict marker shows them):**
+- `ps2_gs_memory.h`: upstream's `Read(..., const u8*, ..., TexturePageCache*)` lands on our `ReadAt(u8*)` body — compile error.
+- `ee_scheduler.h`: we inlined `accountCycles`, so upstream's `advanceIopEeCycles(elapsed)` is lost — the IOP emulator never
+  ticks. Restoring it puts the IOP interpreter on the EE thread (1 IOP cycle per 8 EE cycles): a cost to measure.
+- `GetRomName` (call-list removal): keep our `System.cpp` body + call-list row (§6).
+- **`entry_points` (formerly `untracked_stubs`) is LOAD-BEARING -- keep it, under the new key.** ⚠ The first reading
+  ("a trap: rename it away") was WRONG, and the run proved it: the new recompiler stops bodies at the CSV end and registers
+  only evidenced resume points, so a function swallowed by a gapfix row is dispatchable only through this list. With it
+  renamed away, rotk died at its first level load on `missing branch target 0x112BE0` (a pointer call into `gapfix_1129c0`).
+- **Generated names change:** `<csv name>_0x<addr>` (`ps2_` prefix for a CSV name starting with `_`), e.g.
+  `sub_001C9AA0_0x1c9aa0` -> `FUN_001c9aa0_0x1c9aa0`. Every override that calls a generated function by name breaks at
+  compile time; the rename is mechanical from the game's `functions.csv`.
+- **BIOS-resident RPC sids:** upstream binds only routed or IRX-registered sids (the old runtime faked a server for every
+  sid). LOADFILE / FILEIO / IOP heap are registered by the BIOS on hardware, so a game binding them before any module load
+  loops forever (rotk USA). Fork row 264 binds those three.
+
+**Running real IRX on upstream's IOP (rotk experiment, `LOTR_IOP_LLE=1`):** all of a game's disc IRX can load and start,
+but (1) upstream's IOP RAM was two bump arenas (images < 0x120000, heap above) -- a large module exhausts the heap while
+the image arena's tail sits unused; fork row 267 makes it one first-fit pool, as the IOP's sysmem keeps it; (2) the IOP
+side of `sifcmd` is stubbed (ordinals 4-11 return 0: no SIF registers, no command handlers) and the EE `sceSifSendCmd`
+delivers nothing, so any driver fed by SIF COMMANDS (not RPC) -- rotk's AUDIOPF -- starts and then waits forever on its
+SET_SREG handshake; (3) no SPU2/SIO2 behind the drivers. A static census of each IRX's import stubs (magic 0x41E00000,
+then `jr ra; addiu zero,zero,<ordinal>` pairs) against the emulator's handled ordinals sizes this before any run.
+
+**Landed 2026-10-06 on `chore/merge_upstream`** (fork rows 263-267, PR into `lotr`; rotk PR into `main`):
+deterministic replays on BOTH discs bit-identical to the pre-merge binaries (EUR fresh-card fight 10,186 flips, EUR
+saved-card Min02 2,998-3,006 flips, USA saved-card Min02 3,334 flips). Process lessons: the auto-merge silently DROPPED a
+line from one of our lambdas and spliced upstream's tag walk into our VIF1 function -- read the merged result of every
+both-sides file, not just the conflict hunks; and a dev-mode game build must rebuild `ps2_recomp` when the clone moves,
+or the regen uses the old recompiler.
+
+**Small commits:** `a5d3049` (standalone `entry_*` resume points) applies cleanly, no output change today (no `entry_*`
+rows) but interacts with the trap above. `2c5fbb9` (syscalls 0x79/0x7A) merges cleanly, inert for rotk (`sceSifInitCmd` is
+stubbed). `c5a9d02` is README only. `SET_GPR_ZE32` (LWU zero-extension) comes in with `75d729c` — a real correctness fix.
+
+**Can the game fake less by running its real IRXs on upstream's IOP?** Not with upstream as it is. The IOP emulator is an
+R3000A interpreter with HLE'd kernel libraries (thbase/thsema/thevent/sysmem/intrman/timrman/vblank/cdvdman/sysclib) and
+**no hardware model**: no SPU2 (no voices, no output — a DMA start only raises the IRQ), no SIO2 (pads, cards), no
+DEV9/SMAP, `dmacman` all-zero. `sifcmd` on the IOP side cannot receive EE→IOP commands (`AddCmdHandler` is a no-op), RPC
+servers run synchronously on the EE thread, vblank is fixed NTSC 59.94. Every module rotk uses (SIO2MAN, SIO2D, DS2U_D,
+DBCMAN, MCMAN, MCSERV, LIBSD, AUDIOPF; + the USA network stack) is on the disc and needs exactly the missing pieces.
+rotk is insulated today because the game fakes each IRX load at its own EE helper (`0x154AB0`) and answers DBCMAN/cdvd binds
+before the transport. What running the real modules would take, by payoff: (1) SPU2 (port PCSX2 `SPU2/`) + EE→IOP SIF
+commands + PAL vblank → real LIBSD + AUDIOPF, retiring the ~4.5k-line AUDIOPF port and its reply/priming/shortcut bugs; (2)
+SIO2 + pad + memcard (+ multitap for 4 players) → real SIO2MAN/DS2U_D/DBCMAN/MCMAN; (3) DEV9/SMAP: not worth it (USA netplay
+hooks the EE gateway).
