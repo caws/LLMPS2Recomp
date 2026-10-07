@@ -236,3 +236,70 @@ paths) agree on the wrong result, the DATA is wrong. Work backwards to the byte,
    `0x0100C840` because the runtime's special-address test did not cover that range (fixed in the fork,
    `ps2_address.h`: the EE maps all four VU memories, `0x11000000..0x1100FFFF`, PCSX2
    `memMapVUmicro`). Any address with bits above the 32 MB RAM mask set is a mapping question first.
+
+## 7. A probe toolbox: techniques that answered real questions
+
+Distilled from ~250 rotk cycles of default-OFF probes (the per-switch catalogue, with the questions each answered, is the
+game repo's `docs/diagnostic_tools.md`). Each technique below is game-independent; the rotk example says what it found.
+Gate every probe behind an env switch, default OFF, and delete it once the question is answered -- the catalogue plus
+`git log -S'<SWITCH>'` keeps it findable.
+
+**Running guest code from a hook**
+- **Pump to completion.** A bare call to a recompiled function runs only its first segment: every cross-unit call sets
+  `ctx->pc` and returns to the dispatcher. Save pc/ra/args, set `ra = 0`, call it, then dispatch `lookupFunction(pc)`
+  until `pc == 0`, and restore. A probe that reads state after a bare call reads it BEFORE the callee ran (rotk: a
+  "record ABSENT" verdict that was only an unrun memcpy).
+- **Act only when the wrapped call is really done**: check `ctx->pc == saved ra` before trusting v0 (rotk: 40 false
+  clamps per run from reading v0 mid-function).
+- **Chain, don't shadow.** For one guest address the LAST `registerFunction` wins, silently. A later probe or mod must
+  wrap and call the hook it replaces; audit with `check_registrations.py` (rotk: a mod on the same address quietly
+  disabled a default-ON fix for weeks).
+
+**Locating where something stops**
+- **Counters along a call chain**, one per stage; the first zero is the break (rotk: the text path, five functions
+  deep; the audio boot chain, with log-only pass-through hooks).
+- **ENTER/EXIT pairs** around a per-frame body: ENTER without EXIT = stuck inside; neither = never driven.
+- **Stack scrape at an exit stub**: at `_Exit` / `ExitDeleteThread`, log ra and every stack word that points into code --
+  a call trail without a debugger.
+- **Credit work to one call**: read a global counter before and after it.
+- **One log line whose fields decide between the hypotheses** (rotk: never queued / produced nothing / present but not
+  armed; registry empty / name miss / bad header version). Log a decision's INPUTS with its outcome, on change only.
+- **Prove the path with a known input** first (rotk: a fixed string pushed into empty widgets showed the whole text
+  draw path worked; the data was missing).
+
+**Watching state**
+- **Log on change of a packed key**: pack the ~15 variables that matter into one key, log when it changes. For a
+  per-frame RPC, log a payload the first time and then only when it differs.
+- **Snapshot and diff** a set of objects over N ticks: is it clocked at all?
+- **Memory writers**: section 6 (`PS2X_WRITE_WATCH` for guest stores; a host-thread poll for DMA/HLE/disc writers).
+- **Pointer census over all RAM**: every word pointing into a pool names the owner of an object; words equal to a
+  class's vtable/type pointers find every instance (rotk: all player objects for the 4-player mod).
+- **Scan RAM for the names** a level should hold: "never delivered" vs "delivered but inert".
+- **Count everything, never a capped sample.** A log capped at N reads as "nothing else arrives" (rotk: three separate
+  misreads, incl. 11,550 calls vs 12 seen, and a dump cap that skipped the longest sound).
+
+**Testing a hypothesis by changing one thing**
+- **Force one gate**, either direction, per caller, to prove it is the gate that matters. Know what the gate IS first
+  (rotk: forcing what was taken for a pad callback -- it was the memory-card check -- hid the first-run path).
+- **Timing-only tests**: drop or delay one message and re-issue it when its precondition holds; hold one read's
+  completion N frames. Either proves or disproves "only the timing is wrong".
+- **Defer and replay**: skip a step that runs before its inputs exist; re-run it once they do.
+- **Restore a known-good source every pass** to prove which side corrupts it.
+- **Give a dead queue real memory** so the traffic it would carry becomes visible (rotk: decoding an IOP module's
+  command protocol from the EE side).
+
+**Graphics, DMA, VRAM**
+- **Check each DMA tag as it is appended**; flag a null ADDR with the caller's ra. Dump a VIF1 chain by following its
+  ref tags.
+- **Dump framebuffers straight from GS VRAM** with the LIVE FBW, never a hardcoded stride.
+- **Read VRAM back two ways** (native format + raw words): splits "the upload never landed" from "the swizzled read is
+  broken". Dump a submitted packet's GIF tag and register setup for a draw that submits but never shows.
+- **Record the game's own library parameters** (e.g. `sceGsExecLoadImage`) to check the runtime's conversion of them.
+
+**Audio**
+- **Record at the output stage**: every frame handed to the device, underrun silence included. A correct buffer can still
+  sound wrong (rotk: the "stutter" was the stereo layout, not data loss).
+- **Give a human the waveforms**: each distinct sample played, as .wav. Ears identify sounds faster than spectra.
+- **Dump the whole bank**, not just what played: absent from playback is not "never selected".
+- **Tap a read request and inspect the previous request's buffer** once it has filled.
+- **Check ADPCM structurally** (per-block flag 0-7, shift <= 12); RMS/spectra flatter noise into signal.

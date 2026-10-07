@@ -41,7 +41,9 @@ mass-rewrite the inputs.**
   and a quick index of the bug/fix taxonomy.
 - **[debugging.md](debugging.md)** — diagnosing a frontier: run-log triage, the
   **gdb-under-parent** recipe (the only reliable way to backtrace a hung runner on a
-  `ptrace_scope=1` box), one-shot override probes, and profiling a silent spin.
+  `ptrace_scope=1` box), one-shot override probes, profiling a silent spin, finding who wrote corrupted
+  data, and a **probe toolbox** (techniques that answered real questions: pump-to-completion, chain-don't-shadow,
+  counters along a chain, timing-only A/Bs, VRAM/DMA/audio capture).
 - **[functions-csv.md](functions-csv.md)** — the three `functions.csv` bug classes
   (**truncated**, **missing / CSV-gap**, **over-bound**) and their fixes, plus
   **disasm-as-ground-truth** validation (the game ELF is typically stripped — there are no
