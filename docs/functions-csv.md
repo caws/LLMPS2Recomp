@@ -153,6 +153,25 @@ neighboring functions** (they vanish from the build) and masks generated-code gr
   authoritative again, so the row is emitted at its declared size and its swallowed
   neighbors reappear. (The address-based dispatch is unaffected by the rename.)
 
+## Class 4 — Swallowed (a curated row's END runs over the NEXT function)
+
+A hand-added `gapfix` row whose end overshoots covers the next function, which then has no
+entry: ps2_recomp registers only a row's start (plus evidenced resume points), so a `jalr` to
+the swallowed function is a `missing branch target` (fatal under the runner). `find_missing.py`
+cannot see it (the space is "covered"). Find it with **`find_swallowed.py --min 130000`**, and
+**also run `--jonly`**: a `j` trampoline followed by another trampoline or a `jr ra` stub is
+common in vtables and only `--jonly` splits after a `j` (review those by disasm). Fix: split the
+row, full regen.
+
+**Cross-check with POINTERS, not just terminators.** A function the game reaches only through a
+vtable / callback is exactly what the CSV lacks, and the game holds its address: as a data word,
+or built in code by `lui`+`addiu`. List every such code address that is not a CSV start; one
+that is not covered by any row is Class 2, one that sits inside a row right after a `jr ra`/`j`
++ delay slot is Class 4. (rotk 2026-10-08: this found 6 swallowed vtable methods per disc and
+5 uncovered USA-only callbacks, and exposed that `find_swallowed.py`'s start filter rejected
+leaves opening with an FPU/VU0 op -- `lwc1`, `mtc1` -- now accepted. Jump tables point inside
+functions too: skip targets whose neighbouring data words point into the same row.)
+
 ---
 
 ## After any change

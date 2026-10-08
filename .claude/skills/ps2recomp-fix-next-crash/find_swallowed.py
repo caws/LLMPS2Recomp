@@ -87,6 +87,11 @@ def plausible_start(w):
     # leaf functions commonly open with an immediate load, a move, a load, or a branch
     if op in (0x08, 0x09, 0x0F, 0x23, 0x24, 0x25, 0x2B, 0x0C, 0x0D, 0x0E, 0x30, 0x37):
         return True
+    # float / vector leaves open with an FPU or VU0 op: lwc1 (0x31), lq (0x1E), COP1 (0x11, e.g. mtc1),
+    # COP2 (0x12). rotk USA 2026-10-08: two vtable methods opening `lwc1 $f1,0xA8(a0)` (0x1DA970) and
+    # `mtc1 zero,$f0` (0x1E3480) were swallowed and this filter rejected both.
+    if op in (0x31, 0x1E, 0x11, 0x12):
+        return True
     if op == 0 and (w & 0x3F) in (0x08, 0x09, 0x21, 0x25, 0x2D, 0x00):
         return True
     if op in BRANCH_OPS or op == 0x02:
