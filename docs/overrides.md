@@ -310,6 +310,17 @@ generated `.cpp`.
   dense function table (e.g. the padding nop after a function's `jr ra`) whose registered hook starts the next
   step; the last step restores the caller's `ra`. Waits then behave exactly as in the original. LOTR's
   `mods/interp` is a complete implementation.
+- **A hook that REPLACES a function and makes its call (`ra = <jal + 8>`, `lookupFunction(callee)`) must
+  check that the call finished: `ctx->pc == <jal + 8>`.** Even a trivial callee can be abandoned at a checkpoint
+  if it makes any guest call (LOTR's vsync getter calls DI/EI, which handlers can interrupt; an emulated IOP
+  raises EE interrupts inside the cycle accounting, so under IOP LLE this happens during loads). The abandoned
+  callee's frame is still on the stack. A hook that carries on and sets `ctx->pc = ra` returns to its caller
+  with `sp` too low, the caller's epilogue loads its saved registers from the callee's frame, and the
+  `jr ra` lands on a saved s-register (LOTR: `missing branch target 0x3`, `s1` = the callee's saved `ra`). The fix
+  is to build the original's own frame (`addiu sp` / `sd ra`), return with `ctx->pc` untouched if it is not
+  `<jal + 8>`, register the same hook at `<jal + 8>` (registering the entry does not cover the function's resume
+  slots), and do the rest plus the original epilogue there. Prove it with a test lever that leaves the call in
+  flight on demand. The real abandonment is rare. LOTR's `mods/framerate` `hook_154110_framerate` is the example.
 - **An env var derived with `setenv()` during registration is invisible to a namespace-scope
   `static` reader** — it initialised before. Read flags in function-local statics, and let the
   settings layer (which applies the file and re-executes before start-up) carry player options.
