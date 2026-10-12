@@ -39,6 +39,10 @@ infrastructure — a renderer, audio, ffmpeg, a window/input library — like an
   with `registerFunction` / `lookupFunction` at `:344-347`.
 - **⇒ A hook at any address intercepts every caller, from anywhere.** Full replacement needs no
   new dispatch machinery. This is the single fact that makes the arc possible at all.
+  ⚠ **Correction (measured 2026-10-12, first lift spike):** one exception — a **static tail `j`** to
+  another function compiles to a DIRECT C++ call (`FUN_x(rdram, ctx, runtime); return;`), with no table
+  lookup and no cycle charge. A hook at the `j` target does not see that path; lift the thunk with its
+  target, or hook the thunk too. `jal` and `jalr` do go through the table.
 - **Scale is per game and must be measured, not assumed** — generated function count and line
   count vs the game's current real (non-diagnostic) hook count. Record it in that game's
   `docs/platform-plan.md`; it is the honest denominator for every progress claim, and for a
@@ -135,6 +139,26 @@ a "reached the top" event delivered late by a 60 Hz vblank
 (see the game repo's `docs/progress.md` on the PAL vblank rate and the `pc=0x3` scheduler race).
 
 So the single subsystem that most needs proof is the one this technique cannot provide it for.
+
+**Measured on the first lift spike (2026-10-12; the example game's `docs/spike_recomp.md`):**
+
+- **The oracle is cheap to build in-process.** Per checked call: copy the register file and the whole
+  32 MB of RAM, run the generated twin to completion under a host-pump scope (no checkpoint may abandon
+  it), rewind, run the lift, compare (return registers, callee-saved registers, pc, all RAM except the
+  twin's own stack frame below the entry sp), then **keep the twin's result** so a wrong lift never
+  steers the run. Sample (every call at first, then 1 in N): three 32 MB copies per check are affordable.
+  No dirty tracking was needed for a hardware-free subsystem.
+- **★ The cycle contract.** Under `PS2X_VIRTUAL_TIME` the scheduler's clock advances only where the
+  generated code charges it: `eeCheckpointDue()` (32 cycles) on each taken backward branch to a resumable
+  label, `dispatchGuestBranch` (8) on each `jal`/`jalr`, nothing on `jr ra`, nothing on a static tail `j`.
+  A lift that does identical memory work but skips those charges shifts every later deadline and the
+  replay diverges. So during the bridge a lift **mirrors the charges** (accumulate, charge at return);
+  a native build drops them along with the scheduler.
+- **Both halves were shown to fail on a wrong lift** (a mutation switch): dropping the charges diverged
+  the replay; a semantic bug was flagged per call. Validate any new check the same way before trusting
+  a green result.
+- Not covered yet: functions with irreversible side effects (above), and per-call checking of the
+  cycle contract (the scheduler exposes no cycle getter; the replay checks it end to end).
 `lib/Kernel` therefore needs a **separately designed** validation approach — recorded timing traces
 and replay divergence against `PS2X_VIRTUAL_TIME` (row 93: two runs identical over 788 events),
 not re-execution diffing. Design it before lifting the kernel, not during.

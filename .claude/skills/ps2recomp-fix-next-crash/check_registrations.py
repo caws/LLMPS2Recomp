@@ -152,7 +152,10 @@ def scan_function(control, fname, bodies, origin, where):
         i = control.index('(', s)
         e = match_block(control, mask, i, '(', ')')
         call = control[s:e + 1]
-        addr = re.search(r'\(\s*(0x[0-9A-Fa-f]+)', call).group(1).lower()
+        lit = re.search(r'\(\s*(0x[0-9A-Fa-f]+)', call)
+        # A DYNAMIC registration (an address computed at run time, e.g. a census wrapping a list read from a
+        # file) has no literal to check: it is listed as <dyn:expr>, keyed by the expression's text.
+        addr = lit.group(1).lower() if lit else '<dyn:' + call[call.index('(') + 1:].split(',')[0].strip() + '>'
         d = 0
         for k in range(fi, s):
             if not mask[k]:
