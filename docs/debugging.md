@@ -125,7 +125,7 @@ function was entered at top-level via the guest PC (its own caller already retur
 ### Cross-referencing the generated C++
 
 When raw disasm is hard to follow, **read the generated recompiled C++** —
-`tools/<game>/PS2Recomp/ps2xRuntime/src/runner/FUN_<ADDR>_0x<addr>.cpp` (wiped + regenerated
+`<game_dir>/.toolchain/PS2Recomp/ps2xRuntime/src/runner/FUN_<ADDR>_0x<addr>.cpp` (wiped + regenerated
 every build, so read the freshly-built copy). It is the third ground-truth source alongside
 disasm and gdb, and is often the clearest:
 

@@ -8,7 +8,8 @@
 #   scripts/00_bootstrap_game.sh <game_dir> [--force]
 #
 # Existing files are left alone unless --force is given (settings.local.json is always
-# rewritten: it holds machine-specific absolute paths). Run 01_setup.sh afterwards for a new game.
+# rewritten: it holds machine-specific absolute paths). Run 01_setup.sh afterwards for a new game:
+# it clones the toolchain into <game_dir>/.toolchain/PS2Recomp (gitignored here).
 set -euo pipefail
 
 ENGINE_ABS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,5 +51,6 @@ done
 [[ -e "$GAME_ABS/docs/NEXT.md" ]] || { printf '# NEXT — resume here\n\n(nothing yet: run 01_setup.sh, then 03_build_game.sh, and record the first frontier)\n' > "$GAME_ABS/docs/NEXT.md"; echo "wrote   $GAME_ABS/docs/NEXT.md"; }
 GI="$GAME_ABS/.gitignore"; touch "$GI"
 grep -q '^\.claude/settings\.local\.json$' "$GI" || { printf '\n# Claude Code: machine-specific env/permissions (scripts/00_bootstrap_game.sh regenerates it)\n.claude/settings.local.json\n' >> "$GI"; echo "updated $GI"; }
+grep -q '^/\.toolchain/$' "$GI" || { printf '\n# This game'"'"'s PS2Recomp fork clone (scripts/01_setup.sh; its own git repo)\n/.toolchain/\n' >> "$GI"; echo "updated $GI"; }
 [[ -d "$MEMORY_DIR" ]] || echo "note: memory dir $MEMORY_DIR does not exist yet (created by the first engine session)"
 echo "done. Open a session with: cd $GAME_ABS && claude"

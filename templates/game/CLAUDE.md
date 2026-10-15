@@ -11,8 +11,8 @@
 This repo is the **per-game repo** for *@GAME@*: the ELF, `recomp/` (config + functions.csv),
 `src/` (the faithful base game: control plane + override hook bodies), `mods/`, `docs/`. The
 **engine** holds the recompiler scripts, the doctrine (`docs/`), the skills (`/frontier`,
-`/ps2recomp-fix-next-crash`, …) and, under `tools/@GAME@/PS2Recomp`, this game's clone of the
-private PS2Recomp fork. This repo follows the engine's `CLAUDE.md` in full; the notes below only
+`/ps2recomp-fix-next-crash`, …). This game's clone of the private PS2Recomp fork lives HERE, in
+`.toolchain/PS2Recomp` (gitignored; made by the engine's `scripts/01_setup.sh`). This repo follows the engine's `CLAUDE.md` in full; the notes below only
 say how it applies **when the session's cwd is this repo**.
 
 ## Working from this repo
@@ -35,10 +35,12 @@ say how it applies **when the session's cwd is this repo**.
 - **Skills** (`/frontier`, `/ps2recomp-fix-next-crash`, `/ps2recomp-toolchain-migration`) and the
   re-fanout workflow are the engine's; `.claude/skills` and `.claude/workflows` here are symlinks to
   them, so they work as usual.
-- **Recompiler / runtime changes** are made in the fork clone
-  `$PS2RECOMP_ENGINE/tools/@GAME@/PS2Recomp` (its own git repo): one focused commit there with a
-  PCSX2 citation and a row in its `docs/llmps2recomp-patches.md`; bump `recomp/runtime.lock` here
-  in the same change. **Never push.** Engine changes (scripts, docs, skills) are edited and
+- **Recompiler / runtime changes** are made in the fork clone `.toolchain/PS2Recomp` (its own git
+  repo, on this game's branch `@GAME@`, cut from `lotr`): one focused commit there with a PCSX2
+  citation and a row in its `docs/llmps2recomp-patches.md`; bump `recomp/runtime.lock` here in the
+  same change. A fix that is correct PS2 behaviour for ANY game lands on `lotr` and is merged into
+  `@GAME@` (never the reverse), so games do not drift apart; only game-only work stays on `@GAME@`.
+  **Never push.** Engine changes (scripts, docs, skills) are edited and
   committed in the engine repo the same way, by path.
 - **Where findings go.** Game facts, frontiers, and the resume pointer: this repo's `docs/`
   (`NEXT.md` = the single resume entry, overwritten each cycle; `progress.md` = the journal;

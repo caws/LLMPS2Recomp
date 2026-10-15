@@ -8,14 +8,15 @@ set -euo pipefail
 #   --upstream    Clone BARE upstream (ran-j/PS2Recomp, branch main) instead of our fork.
 #                 Use to establish a clean-upstream baseline for A/B or bisecting.
 #
-# Each game gets its OWN clone at tools/<game>/PS2Recomp (game = basename of <game_dir>), so
+# Each game gets its OWN clone at <game_dir>/.toolchain/PS2Recomp (gitignored in the game repo;
+# an older clone at the legacy tools/<game>/PS2Recomp is still used, see _toolchain.sh), so
 # builds never collide between games and each clone can be re-pulled independently.
 #
 # ★ The toolchain is OUR FORK of PS2Recomp (github.com/caws/PS2Recomp, a public GitHub fork, branch `lotr`), not upstream plus a
 # patch stack (the patches/*.patch mechanism was retired, cont.230; its change log
 # lives in the fork as docs/llmps2recomp-patches.md). Runtime/recompiler changes are made IN
 # the clone and COMMITTED there (pushed only with the user's approval). Upstream is kept as the `upstream` remote so it can
-# be merged periodically:  git -C tools/<game>/PS2Recomp fetch upstream && git merge upstream/main
+# be merged periodically:  git -C <game_dir>/.toolchain/PS2Recomp fetch upstream && git merge upstream/main
 #
 # The game records the exact toolchain commit it was built against in
 # <game_dir>/recomp/runtime.lock (keys: repo=, branch=, commit=). This script honours it:
@@ -47,7 +48,8 @@ done
 GAME_DIR="$(cd "$GAME_DIR" && pwd)"
 GAME="$(basename "$GAME_DIR")"
 
-PS2RECOMP_DIR="$ROOT_DIR/tools/$GAME/PS2Recomp"
+source "$ROOT_DIR/scripts/_toolchain.sh"
+PS2RECOMP_DIR="$(toolchain_dir "$GAME_DIR")"
 LOCK="$GAME_DIR/recomp/runtime.lock"
 
 # Resolve what to clone: env overrides > lock file > defaults.

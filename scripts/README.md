@@ -16,7 +16,7 @@ that the numbered scripts also call.
 
 | Script | What it does |
 | --- | --- |
-| `01_setup.sh <game_dir> [--upstream]` | Clone our PS2Recomp fork at the commit `<game_dir>/recomp/runtime.lock` pins and build `ps2_recomp`, into that game's own `tools/<game>/PS2Recomp`. |
+| `01_setup.sh <game_dir> [--upstream]` | Clone our PS2Recomp fork at the commit `<game_dir>/recomp/runtime.lock` pins and build `ps2_recomp`, into that game's own `<game_dir>/.toolchain/PS2Recomp`. |
 | `02_verify_setup.sh [game_dir] [--deep]` | Check host prerequisites, the toolchain, the game's provided inputs, and the player's disc copy. Run this before reporting a problem. |
 | `03_build_game.sh <game_dir> [flags]` | regen → install → cmake build. `--skip-regen --changed-recomp` is the ~110 s override-only path; **any `functions.csv` change needs a full regen**. |
 | `04_run_game.sh <game_dir> [run_log]` | Run the last-built runner. With a log argument it writes there; with none it streams to the console. Automated callers must pass a log — a spinning runner emits hundreds of MB/s. |

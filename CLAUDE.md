@@ -72,15 +72,22 @@ pre-merge trees and checked with `xmap.py`. Engine consequences: point the ELF t
   cwd, or a relative `scripts/build.sh` from the engine cwd, fails with `No such file or directory` —
   the Bash tool cwd resets to the session dir between calls, so **never `cd` to the other repo first**;
   pass **absolute** `<game_dir>` + log paths. (Full detail under "Build / run" below.)
-- **`tools/<game>/PS2Recomp/` is a clone of OUR PRIVATE FORK of PS2Recomp**
+- **`<game_dir>/.toolchain/PS2Recomp/` is a clone of OUR PRIVATE FORK of PS2Recomp**
   (`https://github.com/caws/PS2Recomp.git`, branch **`lotr`**; upstream `ran-j/PS2Recomp` is the
-  `upstream` remote, merged in periodically with `git merge upstream/main`). Runtime/recompiler
+  `upstream` remote, merged in periodically with `git merge upstream/main`). **The toolchain lives IN
+  the game repo** (gitignored `/.toolchain/`, not part of its code): the game carries its own ~6 GB
+  clone, so removing a game removes it, and this engine stays stateless. One resolver states the rule
+  (`scripts/_toolchain.sh`); a LEGACY clone at `tools/<game>/PS2Recomp` in this engine still wins
+  where it exists (`rotk_recomp`'s does). **Each game works on a fork branch named after it, cut from
+  `lotr`** (`amo_recomp`, …): a fix that is correct PS2 behaviour for any game lands on `lotr` and is
+  merged `lotr → <game>` (never the reverse), so games do not drift; only game-only work stays on the
+  game's branch. Runtime/recompiler
   changes are made **in that clone and COMMITTED there** — one focused commit per change (★ **never push** — the user pushes, or approves each push explicitly),
   PCSX2 citation in the message, and a row in the fork's `docs/llmps2recomp-patches.md` (the
   former `patches/README.md`). The `patches/*.patch` stack was **retired (cont.230)**;
   never reintroduce it. The game pins the toolchain commit it was verified against in
   `<game_dir>/recomp/runtime.lock` (`01_setup.sh` warns on a mismatch) — update the lock in the
-  same change that moves the branch. `tools/<game>/PS2Recomp/ps2xRuntime/src/runner/` is still
+  same change that moves the branch. `<game_dir>/.toolchain/PS2Recomp/ps2xRuntime/src/runner/` is still
   **wiped and regenerated on every build**; never hand-edit it, and never commit it (the build
   also drops the game's override headers into `ps2xRuntime/include/`; leave those untracked).
 - **All game-specific behavior goes through override hooks** in the game repo's `src/` — never
@@ -148,7 +155,7 @@ pre-merge trees and checked with `xmap.py`. Engine consequences: point the ELF t
   then open Claude sessions **from the game repo**.
 - `scripts/01_setup.sh <game_dir> [--upstream]` — clone our fork (branch `lotr`, or what
   `<game_dir>/recomp/runtime.lock` names) + build `ps2_recomp` (gcc-13, SSE4.1) into that game's
-  own toolchain dir `tools/<game>/PS2Recomp` (`<game>` = basename of `<game_dir>`), add the
+  own toolchain dir `<game_dir>/.toolchain/PS2Recomp` (gitignored; legacy `tools/<game>/PS2Recomp` if present), add the
   `upstream` remote, and warn if the clone is not at the lock's commit. `--upstream` clones bare
   `ran-j/PS2Recomp` for a baseline build. Commit toolchain fixes in the clone (push only with approval), or a
   re-clone loses them.
@@ -158,9 +165,10 @@ pre-merge trees and checked with `xmap.py`. Engine consequences: point the ELF t
   window only** (crops the composited root by the window geometry; `import -window <id>` is black for
   this GL window). Textures FLICKER, so it takes a burst and flags frames with content by mean
   brightness (file size is NOT reliable — a small blob on black compresses as tiny as pure black).
-- `tools/<game>/PS2Recomp/` — that game's own toolchain + runtime clone (separate repo,
+- `<game_dir>/.toolchain/PS2Recomp/` — that game's own toolchain + runtime clone (separate repo,
   read-only to us; cloned per game so builds never collide and each can be re-pulled
-  independently). The example game's clone is `tools/rotk_recomp/PS2Recomp/`.
+  independently). The example game's clone is the legacy `tools/rotk_recomp/PS2Recomp/` (its
+  `.toolchain/` holds only a stale player clone); `amo_recomp` is the first game under the rule.
 
 Everything per-game (ELF, config, functions.csv, overrides, generated output) is derived
 from `<game_dir>` and its `recomp/config.toml`; nothing about a game is hardcoded here.

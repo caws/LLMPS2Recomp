@@ -46,7 +46,7 @@ down here. The docs and tools are game-agnostic; that game is the worked example
   - `00_bootstrap_game.sh <game_dir>`: wire a game repo for agent sessions opened from it (its
     `CLAUDE.md`, hooks, skill symlinks, build/run wrappers).
   - `01_setup.sh <game_dir>`: clone the PS2Recomp fork for that game, at the commit its
-    `recomp/runtime.lock` pins, into `tools/<game>/PS2Recomp`, and build the recompiler.
+    `recomp/runtime.lock` pins, into `<game_dir>/.toolchain/PS2Recomp`, and build the recompiler.
   - `02_verify_setup.sh`, `03_build_game.sh`, `04_run_game.sh`, `verify_disc.sh`: check, build and run
     a single-disc game repo (they forward to the scripts in the toolchain clone).
   - `05_screenshot.sh`, `06_sendkey.py`, `build_progress.sh`: capture frames, inject input, follow a
@@ -69,9 +69,10 @@ export PS2RECOMP_ENGINE="$PWD/LLMPS2Recomp"              # the game's scripts th
 
 Then work from the game repo: its `README.md` and `CONTRIBUTING.md` say how it builds and runs
 (`rotk_recomp`: `scripts/build.sh --iso <disc>`), and a Claude Code session opened there follows its
-`CLAUDE.md`, which points back to the docs here. With `PS2RECOMP_ENGINE` set, a game repo builds
-against the clone in `tools/<game>/PS2Recomp`, where toolchain changes are made and committed;
-without it, it clones the pinned fork commit itself, as a player's build does.
+`CLAUDE.md`, which points back to the docs here. A game repo builds against its own toolchain clone,
+`<game_dir>/.toolchain/PS2Recomp` (gitignored there), on a fork branch named after the game, where
+toolchain changes are made and committed; a player's build clones the pinned fork commit into the same
+place. (`rotk_recomp` predates this and develops against a legacy clone in this engine's `tools/`.)
 
 **A new game** needs its recompiler inputs first (`recomp/config.toml` and `recomp/functions.csv`,
 from PS2Recomp's analyzer and/or Ghidra); start from `templates/game/` and

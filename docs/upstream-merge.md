@@ -1,6 +1,6 @@
 # Pulling upstream into the fork — evaluation + landing checklist
 
-`tools/<game>/PS2Recomp` is a clone of **our private fork** (`caws/PS2Recomp`, branch `lotr`);
+`<game_dir>/.toolchain/PS2Recomp` is a clone of **our private fork** (`caws/PS2Recomp`, branch `lotr`);
 `ran-j/PS2Recomp` is the `upstream` remote. Upstream pushes land as **squashed PR commits**, so a
 pull is never a stream of small changes — it is one architectural drop that has to be evaluated as a
 whole. This document is the reusable procedure: **how to decide whether to pull, how to measure what
@@ -54,7 +54,7 @@ Ask, in order:
 3. **Is there a cheaper subset?** Upstream squashes to `main`, but the unsquashed commits usually
    survive on the feature branch (`git log --oneline upstream/main..upstream/<branch>`), so a
    self-contained fix can be cherry-picked without the architecture it shipped with.
-4. **Could it wait for the next game?** `tools/<game>/PS2Recomp` is **per game**. A new game can clone
+4. **Could it wait for the next game?** `<game_dir>/.toolchain/PS2Recomp` is **per game**. A new game can clone
    `upstream/main` fresh while the current game stays pinned. For anything whose value is mostly
    "a better starting position" (new HLE frameworks, exporters, entry discovery), this is usually the
    right answer.

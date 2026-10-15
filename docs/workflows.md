@@ -13,7 +13,7 @@ the architecture is the blocker, not a truncated CSV row.
 
 ## The hard rule: sub-agents are READ-ONLY; only the main agent builds
 
-A build regenerates `tools/<game>/PS2Recomp/ps2xRuntime/src/runner/` and the per-game
+A build regenerates `<game_dir>/.toolchain/PS2Recomp/ps2xRuntime/src/runner/` and the per-game
 `tmp/generated/` — **two concurrent builds collide** (and a run reads a half-installed
 binary). So workflow sub-agents get **static RE tools only**:
 

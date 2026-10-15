@@ -44,17 +44,19 @@ check_cmd cmake  "cmake"
 check_cmd g++-13 "g++-13 (C++ compiler)"
 check_cmd sha256sum "sha256sum (disc verification)"
 
-# The toolchain is cloned and built PER GAME, at tools/<game>/PS2Recomp, so that builds
-# for different games never collide and each clone can be re-pulled independently.
+# The toolchain is cloned and built PER GAME, at <game_dir>/.toolchain/PS2Recomp (legacy:
+# tools/<game>/PS2Recomp, see _toolchain.sh), so that builds for different games never collide
+# and each clone can be re-pulled independently.
+source "$ROOT_DIR/scripts/_toolchain.sh"
 echo
 if [[ -n "$GAME_DIR" ]]; then
     GAME="$(basename "${GAME_DIR%/}")"
-    PS2RECOMP_ROOT="$ROOT_DIR/tools/$GAME/PS2Recomp"
+    PS2RECOMP_ROOT=""; [[ -d "$GAME_DIR" ]] && PS2RECOMP_ROOT="$(toolchain_dir "$GAME_DIR")"
     echo "Toolchain for '$GAME' (built by scripts/01_setup.sh $GAME_DIR):"
-    check "$PS2RECOMP_ROOT"                                          "tools/$GAME/PS2Recomp cloned"
-    check "$PS2RECOMP_ROOT/out/build/ps2xRecomp/ps2_recomp"          "ps2_recomp executable built"
+    check "${PS2RECOMP_ROOT:-/nonexistent}"                          "toolchain cloned (${PS2RECOMP_ROOT:-no game dir})"
+    check "${PS2RECOMP_ROOT:-/nonexistent}/out/build/ps2xRecomp/ps2_recomp" "ps2_recomp executable built"
 else
-    echo "Toolchains built so far (one per game, from scripts/01_setup.sh):"
+    echo "Legacy toolchains under tools/ (new ones live in each game repo's .toolchain/; pass a game_dir to check one):"
     found=0
     for d in "$ROOT_DIR"/tools/*/PS2Recomp; do
         [[ -d "$d" ]] || continue
@@ -102,7 +104,7 @@ if [[ $FAIL -eq 0 ]]; then
     exit 0
 else
     echo "Verification failed ($FAIL failure(s), $PASS pass(es))."
-    if [[ -n "$GAME_DIR" ]] && [[ ! -x "$ROOT_DIR/tools/$(basename "${GAME_DIR%/}")/PS2Recomp/out/build/ps2xRecomp/ps2_recomp" ]]; then
+    if [[ -n "$GAME_DIR" ]] && [[ ! -x "${PS2RECOMP_ROOT:-/nonexistent}/out/build/ps2xRecomp/ps2_recomp" ]]; then
         echo "  -> run scripts/01_setup.sh $GAME_DIR to build the toolchain."
     fi
     exit 1

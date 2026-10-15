@@ -5,7 +5,7 @@ Handoff document for the **VU1 interpreter → JIT** work. It records *why* the 
 two steps with their verified design inputs.
 
 Game-agnostic: the VU1 interpreter lives in the toolchain clone
-(`tools/<game>/PS2Recomp/ps2xRuntime/src/lib/vu/`), committed on our fork's `lotr` branch (the
+(`<game_dir>/.toolchain/PS2Recomp/ps2xRuntime/src/lib/vu/`), committed on our fork's `lotr` branch (the
 former engine patches 16/17/19/24/25; write-ups in the fork's `docs/llmps2recomp-patches.md`). The
 *measurements* below come from the LOTR
 bring-up (`rotk_recomp`, level era) and live in that game's `docs/progress.md` cont.175–176.
@@ -1136,7 +1136,7 @@ it; 7% of pairs interpreted at ~700 cycles, 83% of them DIV). The example game n
 all-in for 30 fps (5.17 M pairs per frame), i.e. a whole-program compiler in PCSX2's microVU shape:
 blocks keyed by a compile-time pipeline state and linked directly, a static stall model, a 4-instance
 lazy flag ring, Q/P as pipelined lanes, XGKICK as a deferred call. Design note and the microVU survey
-live in the fork: `tools/<game>/PS2Recomp/docs/vu1-program-compiler.md` and `docs/microvu-survey.md`.
+live in the fork: `<game_dir>/.toolchain/PS2Recomp/docs/vu1-program-compiler.md` and `docs/microvu-survey.md`.
 
 **(cont.230, later the same day): the program compiler arrived by PORT, not by design.**
 PS2Recomp is GPLv3 like PCSX2, so PCSX2's microVU was imported verbatim (fork

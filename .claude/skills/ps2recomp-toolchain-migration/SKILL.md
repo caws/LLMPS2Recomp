@@ -1,20 +1,20 @@
 ---
 name: ps2recomp-toolchain-migration
-description: Migrate a game's PS2Recomp toolchain clone to a newer upstream commit (git pull) while preserving our local patches + game overrides. Use when upstream ran-j/PS2Recomp has meaningful changes to adopt (bug fixes, refactors) and `tools/<game>/PS2Recomp` needs updating. Covers the bare-baseline method, fixing game overrides against removed/changed APIs, and re-introducing engine patches verify-then-apply. Distilled from the ee14958 "IOP refactor" migration.
+description: Migrate a game's PS2Recomp toolchain clone to a newer upstream commit (git pull) while preserving our local patches + game overrides. Use when upstream ran-j/PS2Recomp has meaningful changes to adopt (bug fixes, refactors) and `<game_dir>/.toolchain/PS2Recomp` needs updating. Covers the bare-baseline method, fixing game overrides against removed/changed APIs, and re-introducing engine patches verify-then-apply. Distilled from the ee14958 "IOP refactor" migration.
 ---
 
 # Migrate the PS2Recomp toolchain to a newer upstream
 
-> **★ (cont.230): the patch stack is RETIRED.** The clone at `tools/<game>/PS2Recomp`
+> **★ (cont.230): the patch stack is RETIRED.** The clone at `<game_dir>/.toolchain/PS2Recomp`
 > is now our private fork (`caws/PS2Recomp`, branch `lotr`) with the former patches as commits and
 > upstream as the `upstream` remote. A migration is therefore a git merge:
-> `git -C tools/<game>/PS2Recomp fetch upstream && git merge upstream/main`, resolve conflicts per
+> `git -C <game_dir>/.toolchain/PS2Recomp fetch upstream && git merge upstream/main`, resolve conflicts per
 > file, rebuild (FULL regen if `ps2xRecomp/` changed), verify the boot per the method below, commit (push only with the user's approval),
 > and bump `<game_dir>/recomp/runtime.lock`. The bare-baseline / re-apply-patches steps below are
 > the historical method; the *verification* discipline (what to check, in what order) still applies.
 
 Upstream `ran-j/PS2Recomp` (the recompiler `ps2xRecomp/` + runtime `ps2xRuntime/` + now
-`ps2xIOP/`) evolves. Our setup keeps a **per-game clone** at `tools/<game>/PS2Recomp` with our
+`ps2xIOP/`) evolves. Our setup keeps a **per-game clone** at `<game_dir>/.toolchain/PS2Recomp` with our
 local correctness fixes (formerly **`patches/*.patch`**, now commits on the fork) and all
 game-specific behavior in the **game repo's `src/` overrides**. A migration = move the clone to a
 newer upstream commit and get our fixes + overrides working on it again — **without regressing

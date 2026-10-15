@@ -20,7 +20,7 @@ override, and cite the file/function you mirrored.
 > a sign to go read PCSX2's actual code for that exact path, not as a stopping point.
 
 > ★ **BINDING: whenever you CHANGE the runtime, sanity-check the change against PCSX2's source before
-> committing it.** Any edit to `tools/<game>/PS2Recomp/ps2xRuntime/` (i.e. any commit on the fork's
+> committing it.** Any edit to `<game_dir>/.toolchain/PS2Recomp/ps2xRuntime/` (i.e. any commit on the fork's
 > `lotr` branch) is a change to how we model PS2 hardware — so before you commit,
 > read the corresponding PCSX2 subsystem code and confirm your change matches how PCSX2 handles that
 > case: table **sizing**, **fallbacks** for undefined/edge values, and the exact command/mode path.

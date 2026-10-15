@@ -16,7 +16,7 @@ Subagents are **read-only investigators** (see §6) — they never build or run.
 
 Non-negotiable constraints (from `CLAUDE.md`; repeated here because they shape every action):
 
-- **Never edit `tools/<game>/PS2Recomp/`** — separate upstream repo, and its `runner/` is wiped
+- **Never edit `<game_dir>/.toolchain/PS2Recomp/`** — separate upstream repo, and its `runner/` is wiped
   and regenerated every build. All game behavior goes through override hooks in the game repo's
   `src/register_overrides.cpp` (`runtime.registerFunction(addr, lambda)` / `PS2_REGISTER_GAME_OVERRIDE`).
 - **Inputs are provided per game** — `config.toml`, `functions.csv`, the ELF, `gamefiles/`. Never

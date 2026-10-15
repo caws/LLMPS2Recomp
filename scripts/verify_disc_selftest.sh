@@ -19,7 +19,8 @@ REAL="$(cd "$REAL" && pwd)"
 # The checker lives in the game's toolchain clone (fork scripts/ps2x-verify-disc.sh).
 # Call it DIRECTLY: the engine's verify_disc.sh wrapper locates the clone by the game dir's name, and
 # the broken copies below live in a temp dir that has no clone.
-V="$E/tools/$(basename "$REAL")/PS2Recomp/scripts/ps2x-verify-disc.sh"
+source "$E/scripts/_toolchain.sh"
+V="$(toolchain_dir "$REAL")/scripts/ps2x-verify-disc.sh"
 [[ -x "$V" ]] || { echo "Checker not found: $V (run scripts/01_setup.sh $REAL)" >&2; exit 1; }
 [[ -f "$REAL/recomp/disc.manifest" ]] || { echo "No recomp/disc.manifest in $REAL" >&2; exit 64; }
 
