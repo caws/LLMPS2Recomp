@@ -36,10 +36,11 @@ say how it applies **when the session's cwd is this repo**.
   re-fanout workflow are the engine's; `.claude/skills` and `.claude/workflows` here are symlinks to
   them, so they work as usual.
 - **Recompiler / runtime changes** are made in the fork clone `.toolchain/PS2Recomp` (its own git
-  repo, on this game's branch `@GAME@`, cut from `lotr`): one focused commit there with a PCSX2
-  citation and a row in its `docs/llmps2recomp-patches.md`; bump `recomp/runtime.lock` here in the
-  same change. A fix that is correct PS2 behaviour for ANY game lands on `lotr` and is merged into
-  `@GAME@` (never the reverse), so games do not drift apart; only game-only work stays on `@GAME@`.
+  repo, on branch `lotr` — games have no fork branch of their own): one focused commit there with a
+  PCSX2 citation and a row in its `docs/llmps2recomp-patches.md`; bump `recomp/runtime.lock` here in
+  the same change. A fix that is correct PS2 behaviour for any game lands on `lotr`; a game-only
+  branch is created only when a game-only runtime change actually needs one, and that is discussed
+  with the user first.
   **Never push.** Engine changes (scripts, docs, skills) are edited and
   committed in the engine repo the same way, by path.
 - **Where findings go.** Game facts, frontiers, and the resume pointer: this repo's `docs/`

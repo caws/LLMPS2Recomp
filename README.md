@@ -70,8 +70,8 @@ export PS2RECOMP_ENGINE="$PWD/LLMPS2Recomp"              # the game's scripts th
 Then work from the game repo: its `README.md` and `CONTRIBUTING.md` say how it builds and runs
 (`rotk_recomp`: `scripts/build.sh --iso <disc>`), and a Claude Code session opened there follows its
 `CLAUDE.md`, which points back to the docs here. A game repo builds against its own toolchain clone,
-`<game_dir>/.toolchain/PS2Recomp` (gitignored there), on a fork branch named after the game, where
-toolchain changes are made and committed; a player's build clones the pinned fork commit into the same
+`<game_dir>/.toolchain/PS2Recomp` (gitignored there), tracking the fork's shared `lotr` branch, where
+toolchain changes are made and committed (a game-only branch only when a game-only change needs one); a player's build clones the pinned fork commit into the same
 place. (`rotk_recomp` predates this and develops against a legacy clone in this engine's `tools/`.)
 
 **A new game** needs its recompiler inputs first (`recomp/config.toml` and `recomp/functions.csv`,

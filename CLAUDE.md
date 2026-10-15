@@ -78,10 +78,10 @@ pre-merge trees and checked with `xmap.py`. Engine consequences: point the ELF t
   the game repo** (gitignored `/.toolchain/`, not part of its code): the game carries its own ~6 GB
   clone, so removing a game removes it, and this engine stays stateless. One resolver states the rule
   (`scripts/_toolchain.sh`); a LEGACY clone at `tools/<game>/PS2Recomp` in this engine still wins
-  where it exists (`rotk_recomp`'s does). **Each game works on a fork branch named after it, cut from
-  `lotr`** (`amo_recomp`, …): a fix that is correct PS2 behaviour for any game lands on `lotr` and is
-  merged `lotr → <game>` (never the reverse), so games do not drift; only game-only work stays on the
-  game's branch. Runtime/recompiler
+  where it exists (`rotk_recomp`'s does). **Games track the fork's `lotr` branch directly** (`recomp/runtime.lock`
+  `branch=lotr`): a fix that is correct PS2 behaviour for any game lands on `lotr`, so games do not drift. A
+  game-only branch is created only when a game-only runtime change actually needs one, and that is
+  discussed with the user first (user, 2026-10-15). Runtime/recompiler
   changes are made **in that clone and COMMITTED there** — one focused commit per change (★ **never push** — the user pushes, or approves each push explicitly),
   PCSX2 citation in the message, and a row in the fork's `docs/llmps2recomp-patches.md` (the
   former `patches/README.md`). The `patches/*.patch` stack was **retired (cont.230)**;
