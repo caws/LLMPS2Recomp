@@ -29,7 +29,15 @@ Exit code 1 if the diff shows a change (so it can gate a refactor).
 import argparse, collections, glob, hashlib, os, re, subprocess, sys
 
 CONTROL = "src/register_overrides.cpp"
-APPLY = "applyLOTROverrides"
+# The control-plane function is the one the game's PS2_REGISTER_GAME_OVERRIDE(..., &fn) descriptor
+# names (applyLOTROverrides in rotk, applyAMOverrides in amo_recomp); apply_name() reads it per game.
+APPLY_DEFAULT = "applyLOTROverrides"
+APPLY_DESCRIPTOR = re.compile(r'PS2_REGISTER_GAME_OVERRIDE\s*\([^;]*?&\s*(\w+)\s*\)')
+
+
+def apply_name(control):
+    m = APPLY_DESCRIPTOR.search(control)
+    return m.group(1) if m else APPLY_DEFAULT
 
 # The MODS TAIL. The control plane's list continues in a second TU: applyLOTROverrides() calls
 # registerMods() as its last statement, and mods register there so that adding one touches no file
@@ -39,7 +47,7 @@ APPLY = "applyLOTROverrides"
 # of invisible-registration bug this checker exists to catch.
 MODS = "mods/register_mods.cpp"
 MODS_APPLY = "registerMods"
-MODS_CALL = re.compile(r'(?:lotr::)?mods::' + MODS_APPLY + r'\s*\(')
+MODS_CALL = re.compile(r'(?:\w+::)?mods::' + MODS_APPLY + r'\s*\(')
 
 
 # ---------- a C++-aware scanner: a naive paren/brace match walks straight through a format
@@ -121,8 +129,11 @@ def hook_bodies(files):
     out = {}
     for path, t in files.items():
         mask = code_mask(t)
-        for m in re.finditer(r'\nvoid (hook_\w+)\s*\(', t):
-            i = t.index('{', m.end())
+        for m in re.finditer(r'\n[ \t]*void (hook_\w+)\s*\(', t):
+            # bodies may be indented inside a namespace; a declaration (`;` before any `{`) has none
+            i, semi = t.find('{', m.end()), t.find(';', m.end())
+            if i < 0 or (0 <= semi < i):
+                continue
             out[m.group(1)] = t[i:match_block(t, mask, i, '{', '}') + 1]
     return out
 
@@ -195,7 +206,7 @@ def mods_call_site(control):
     so the tail's rows inherit this depth and #if state rather than reporting their own in isolation.
     """
     mask = code_mask(control)
-    span = func_span(control, APPLY)
+    span = func_span(control, apply_name(control))
     if not span:
         return None
     fi, fj = span
@@ -212,7 +223,7 @@ def mods_call_site(control):
     if not hits:
         return None
     if len(hits) > 1:
-        print(f"!! {MODS_APPLY}() is called {len(hits)} times in {APPLY}() — the tail must be installed once")
+        print(f"!! {MODS_APPLY}() is called {len(hits)} times in {apply_name(control)}() — the tail must be installed once")
     s = hits[0]
     d = 0
     for k in range(fi, s):
@@ -228,7 +239,7 @@ def mods_call_site(control):
 def registrations(files, bodies):
     """The ONE ordered list: the control plane, with the mods tail spliced in at its call site."""
     control = files[CONTROL]
-    out = scan_function(control, APPLY, bodies, CONTROL, 'base')
+    out = scan_function(control, apply_name(control), bodies, CONTROL, 'base')
 
     call = mods_call_site(control)
     if call is None:
@@ -237,7 +248,7 @@ def registrations(files, bodies):
     if MODS not in files:
         # Loud, not silent: the list continues somewhere this tool cannot read, so every mod
         # registration is invisible to the audit.
-        print(f"!! {APPLY}() calls {MODS_APPLY}() but {MODS} was not found — mods are NOT being checked")
+        print(f"!! {apply_name(control)}() calls {MODS_APPLY}() but {MODS} was not found — mods are NOT being checked")
         return out
     tail = scan_function(files[MODS], MODS_APPLY, bodies, MODS, 'mods')
     for r in tail:
